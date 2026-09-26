@@ -12,7 +12,6 @@
 #include "src/system/streaming/tidalcache.h"
 #include "src/system/streaming/radio.h"
 #include "src/system/audio/replaygain.h"
-#include "src/system/lastfm/lastfm.h"
 #include "src/system/device/system.h"
 
 #include <pthread.h>
@@ -491,18 +490,10 @@ static void load_and_play_at(const char *filepath, double position) {
 		}
 	}
 
-	int play_result;
 	if (position > 0) {
-		play_result = audio_play_at(current_metadata_file, position);
+		audio_play_at(current_metadata_file, position);
 	} else {
-		play_result = audio_play(current_metadata_file);
-	}
-
-	// The audio facade accepted the new track. Last.fm is notified only here,
-	// after prepare callbacks have succeeded, so a delayed Qobuz/Tidal download
-	// cannot create a phantom now-playing event.
-	if (play_result == 0) {
-		lastfm_on_track_started(&current_metadata);
+		audio_play(current_metadata_file);
 	}
 
 	// Any track load supersedes the note: it belongs to the one press that
@@ -722,10 +713,7 @@ void device_state_play_file_at(const char *filepath, double position) {
 	// not also played at 1.5x.
 	audio_set_speed(audiobook_is_playing() ? audiobook_speed() : 1.0);
 
-	int play_result = audio_play_at(current_metadata_file, position);
-	if (play_result == 0) {
-		lastfm_on_track_started(&current_metadata);
-	}
+	audio_play_at(current_metadata_file, position);
 
 	queue_persist();
 }

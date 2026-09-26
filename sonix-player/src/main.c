@@ -33,7 +33,6 @@
 #include "src/system/bluetooth/btplayer.h"
 #include "src/system/device/clock.h"
 #include "src/system/core/config.h"
-#include "src/system/lastfm/lastfm.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/led.h"
 #include "src/system/audio/eq.h"
@@ -2071,11 +2070,6 @@ int main(int argc, char **argv) {
 	sonixlink_init();
 
 	gui_init(&gui_cfg);
-
-	// Last.fm owns its own worker thread. Starting it after gui_init guarantees
-	// that completed authentication can safely post its result onto the UI
-	// thread, while still being early enough to observe remembered playback.
-	lastfm_init();
 
 	// "Rotate screen", as it was left. After gui_init so there are screens to
 	// redraw, and before the first frame the user sees.
