@@ -562,31 +562,41 @@ jobs:
       # Every beta build gets its own release.
       # The release title and notes contain Indian Standard Time.
       # ============================================================
-      - name: Publish Beta Release
+            # ============================================================
+      # PUBLISH / UPDATE LATEST BETA RELEASE
+      #
+      # Every successful beta build updates the same release:
+      #
+      #     Latest R1 Beta Firmware
+      #
+      # Release tag:
+      #
+      #     beta-latest
+      #
+      # Assets are replaced on every build.
+      # ============================================================
+      - name: Publish Latest Beta Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          TAG="beta-latest"
+          TITLE="Latest R1 Beta Firmware"
+
           # --------------------------------------------------------
-          # Indian Standard Time (Asia/Kolkata)
+          # Indian Standard Time
           # --------------------------------------------------------
           IST_TIME=$(TZ=Asia/Kolkata date '+%Y-%m-%d %I:%M:%S %p IST')
-          IST_TAG=$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M%S')
-
-          # Run number guarantees uniqueness even if two builds
-          # somehow happen at the same second.
-          TAG="beta-releases-${IST_TAG}-run${GITHUB_RUN_NUMBER}"
-
-          TITLE="Sonix Player R1 - Beta Build #${GITHUB_RUN_NUMBER} - ${IST_TIME}"
 
           NOTES=$(cat <<EOF
-          # Sonix Player for HiBy R1 — Beta Build
+          # Sonix Player for HiBy R1 — Latest Beta
 
-          This is an automated beta build from the **beta-releases** branch.
+          Automatically generated from the latest successful
+          \`beta-releases\` branch build.
 
-          ## Build information
+          ## Build Information
 
           - Branch: \`beta-releases\`
           - Commit: \`${GITHUB_SHA}\`
@@ -597,7 +607,7 @@ jobs:
 
           ## Files
 
-          - \`r1.upt\` — HiBy R1 beta firmware
+          - \`r1.upt\` — latest HiBy R1 beta firmware
           - \`sonix_player\` — Sonix Player executable
           - \`SHA256SUMS\` — SHA-256 checksums
 
@@ -606,27 +616,61 @@ jobs:
           )
 
           echo "============================================"
-          echo "PUBLISHING BETA RELEASE"
+          echo "PUBLISHING LATEST BETA RELEASE"
           echo "============================================"
-          echo "Indian time: $IST_TIME"
           echo "Tag:         $TAG"
           echo "Title:       $TITLE"
+          echo "Indian time: $IST_TIME"
 
-          gh release create \
-            "$TAG" \
-            release/r1.upt \
-            release/sonix_player \
-            release/SHA256SUMS \
+          # --------------------------------------------------------
+          # Create the release if it doesn't exist.
+          # Otherwise update the existing release.
+          # --------------------------------------------------------
+          if gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE" \
-            --notes "$NOTES" \
-            --prerelease \
-            --target "$GITHUB_SHA"
+            >/dev/null 2>&1
+          then
+            echo ""
+            echo "Existing beta release found."
+            echo "Replacing release assets..."
+
+            gh release upload \
+              "$TAG" \
+              release/r1.upt \
+              release/sonix_player \
+              release/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+
+            gh release edit \
+              "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+
+          else
+            echo ""
+            echo "Creating beta release..."
+
+            gh release create \
+              "$TAG" \
+              release/r1.upt \
+              release/sonix_player \
+              release/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
 
           echo ""
-          echo "Beta release published successfully."
-          echo "Release: $TITLE"
-
+          echo "============================================"
+          echo "LATEST BETA RELEASE PUBLISHED"
+          echo "============================================"
+          echo "Release tag: $TAG"
+          echo "Build time:  $IST_TIME"
+          
       # ============================================================
       # FAILURE DIAGNOSTICS
       # ============================================================
