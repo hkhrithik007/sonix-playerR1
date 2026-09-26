@@ -556,6 +556,12 @@ jobs:
       # ============================================================
       # CREATE BETA RELEASE
       # ============================================================
+            # ============================================================
+      # CREATE BETA RELEASE
+      #
+      # Every beta build gets its own release.
+      # The release title and notes contain Indian Standard Time.
+      # ============================================================
       - name: Publish Beta Release
         shell: bash
         env:
@@ -563,9 +569,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Every push to beta-releases gets its own immutable tag.
-          TAG="beta-releases-${GITHUB_RUN_NUMBER}"
-          TITLE="Sonix Player R1 - Beta Build #${GITHUB_RUN_NUMBER}"
+          # --------------------------------------------------------
+          # Indian Standard Time (Asia/Kolkata)
+          # --------------------------------------------------------
+          IST_TIME=$(TZ=Asia/Kolkata date '+%Y-%m-%d %I:%M:%S %p IST')
+          IST_TAG=$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M%S')
+
+          # Run number guarantees uniqueness even if two builds
+          # somehow happen at the same second.
+          TAG="beta-releases-${IST_TAG}-run${GITHUB_RUN_NUMBER}"
+
+          TITLE="Sonix Player R1 - Beta Build #${GITHUB_RUN_NUMBER} - ${IST_TIME}"
 
           NOTES=$(cat <<EOF
           # Sonix Player for HiBy R1 — Beta Build
@@ -578,6 +592,7 @@ jobs:
           - Commit: \`${GITHUB_SHA}\`
           - Workflow run: \`${GITHUB_RUN_NUMBER}\`
           - Run ID: \`${GITHUB_RUN_ID}\`
+          - Build time: \`${IST_TIME}\`
           - Base firmware: Official HiBy R1 Firmware V1.6
 
           ## Files
@@ -593,8 +608,9 @@ jobs:
           echo "============================================"
           echo "PUBLISHING BETA RELEASE"
           echo "============================================"
-          echo "Tag: $TAG"
-          echo "Title: $TITLE"
+          echo "Indian time: $IST_TIME"
+          echo "Tag:         $TAG"
+          echo "Title:       $TITLE"
 
           gh release create \
             "$TAG" \
@@ -607,7 +623,9 @@ jobs:
             --prerelease \
             --target "$GITHUB_SHA"
 
-          echo "Beta release published: $TAG"
+          echo ""
+          echo "Beta release published successfully."
+          echo "Release: $TITLE"
 
       # ============================================================
       # FAILURE DIAGNOSTICS
