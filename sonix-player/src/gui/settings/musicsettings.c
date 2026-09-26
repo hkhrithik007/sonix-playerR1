@@ -31,6 +31,7 @@
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/library/library.h"
+#include "src/gui/settings/lastfmsettings.h"
 
 lv_obj_t *musicsettings_screen;
 
@@ -1457,6 +1458,11 @@ static void build_playback_page(gui_config_t *cfg) {
 	if (device_state_folder_chaining()) {
 		lv_obj_add_state(folder_chain_switch, LV_STATE_CHECKED);
 	}
+
+	// Native Last.fm integration lives with playback options, matching where the
+	// old plugin exposed its settings, but it is now part of Sonix Player itself.
+	lastfmsettings_init(cfg);
+	settingsrow_add(container, "Last.fm", NULL, switch_screen_cb, lastfmsettings_screen());
 
 	// What survives the power switch: the loaded track and the volume level.
 	settingsrow_toggle(container, "musicsettings_remember_track", &remember_track_switch, remember_track_cb);

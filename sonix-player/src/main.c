@@ -33,6 +33,7 @@
 #include "src/system/bluetooth/btplayer.h"
 #include "src/system/device/clock.h"
 #include "src/system/core/config.h"
+#include "src/system/lastfm/lastfm.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/led.h"
 #include "src/system/audio/eq.h"
@@ -1766,6 +1767,9 @@ int main(int argc, char **argv) {
 	}
 #endif
 	config_init(config_file);
+	// Native Last.fm starts its worker after persistent configuration exists.
+	// It never performs network I/O on this thread and never touches LVGL.
+	lastfm_init();
 
 	// The reader's own file, beside the settings. SONIX_EBOOK_CONFIG moves it for
 	// the host build the same way SONIX_CONFIG moves the other one; with neither

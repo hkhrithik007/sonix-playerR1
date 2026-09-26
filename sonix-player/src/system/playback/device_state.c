@@ -12,6 +12,7 @@
 #include "src/system/streaming/tidalcache.h"
 #include "src/system/streaming/radio.h"
 #include "src/system/audio/replaygain.h"
+#include "src/system/lastfm/lastfm.h"
 #include "src/system/device/system.h"
 
 #include <pthread.h>
@@ -495,6 +496,10 @@ static void load_and_play_at(const char *filepath, double position) {
 	} else {
 		audio_play(current_metadata_file);
 	}
+	// The audio path has now accepted the track. Record Last.fm's native
+	// track-start event only after the real play request, so a delayed remote
+	// download that aborts above cannot create a phantom now-playing/scrobble.
+	lastfm_on_track_started(&current_metadata);
 
 	// Any track load supersedes the note: it belongs to the one press that
 	// follows the storage coming back.
@@ -714,6 +719,7 @@ void device_state_play_file_at(const char *filepath, double position) {
 	audio_set_speed(audiobook_is_playing() ? audiobook_speed() : 1.0);
 
 	audio_play_at(current_metadata_file, position);
+	lastfm_on_track_started(&current_metadata);
 
 	queue_persist();
 }
