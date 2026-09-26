@@ -491,15 +491,19 @@ static void load_and_play_at(const char *filepath, double position) {
 		}
 	}
 
+	int play_result;
 	if (position > 0) {
-		audio_play_at(current_metadata_file, position);
+		play_result = audio_play_at(current_metadata_file, position);
 	} else {
-		audio_play(current_metadata_file);
+		play_result = audio_play(current_metadata_file);
 	}
-	// The audio path has now accepted the track. Record Last.fm's native
-	// track-start event only after the real play request, so a delayed remote
-	// download that aborts above cannot create a phantom now-playing/scrobble.
-	lastfm_on_track_started(&current_metadata);
+
+	// The audio facade accepted the new track. Last.fm is notified only here,
+	// after prepare callbacks have succeeded, so a delayed Qobuz/Tidal download
+	// cannot create a phantom now-playing event.
+	if (play_result == 0) {
+		lastfm_on_track_started(&current_metadata);
+	}
 
 	// Any track load supersedes the note: it belongs to the one press that
 	// follows the storage coming back.
@@ -718,8 +722,10 @@ void device_state_play_file_at(const char *filepath, double position) {
 	// not also played at 1.5x.
 	audio_set_speed(audiobook_is_playing() ? audiobook_speed() : 1.0);
 
-	audio_play_at(current_metadata_file, position);
-	lastfm_on_track_started(&current_metadata);
+	int play_result = audio_play_at(current_metadata_file, position);
+	if (play_result == 0) {
+		lastfm_on_track_started(&current_metadata);
+	}
 
 	queue_persist();
 }

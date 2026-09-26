@@ -1768,9 +1768,6 @@ int main(int argc, char **argv) {
 	}
 #endif
 	config_init(config_file);
-	// Native Last.fm starts its worker after persistent configuration exists.
-	// It never performs network I/O on this thread and never touches LVGL.
-	lastfm_init();
 
 	// The reader's own file, beside the settings. SONIX_EBOOK_CONFIG moves it for
 	// the host build the same way SONIX_CONFIG moves the other one; with neither
@@ -2074,6 +2071,11 @@ int main(int argc, char **argv) {
 	sonixlink_init();
 
 	gui_init(&gui_cfg);
+
+	// Last.fm owns its own worker thread. Starting it after gui_init guarantees
+	// that completed authentication can safely post its result onto the UI
+	// thread, while still being early enough to observe remembered playback.
+	lastfm_init();
 
 	// "Rotate screen", as it was left. After gui_init so there are screens to
 	// redraw, and before the first frame the user sees.

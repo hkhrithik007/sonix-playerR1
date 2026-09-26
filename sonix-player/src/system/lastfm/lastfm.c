@@ -2,59 +2,78 @@
 
 #include "lastfm.h"
 
+#include "src/gui/shell/gui.h"
 #include "src/system/audio/audio.h"
 #include "src/system/core/config.h"
 #include "src/system/core/md5.h"
+#include "src/system/device/system.h"
 #include "src/system/net/http.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define LASTFM_API_URL "https://ws.audioscrobbler.com/2.0/"
 #define LASTFM_QUEUE_MAX_AGE (13LL * 24LL * 60LL * 60LL)
 #define LASTFM_POLL_SECONDS 15
 #define LASTFM_HTTP_TIMEOUT_SECONDS 15
 #define LASTFM_BODY_LIMIT (256U * 1024U)
-#define LASTFM_USER_AGENT "SonixPlayer/1.0 (Last.fm native scrobbler)"
 
 #define LASTFM_TEXT_MAX 256
 #define LASTFM_SESSION_MAX 128
 #define LASTFM_API_KEY_MAX 128
 #define LASTFM_API_SECRET_MAX 128
-#define LASTFM_QUEUE_LINE_MAX 4096
-#define LASTFM_SIGNATURE_MAX 4096
-#define LASTFM_FORM_MAX 8192
 
 #define LASTFM_CONFIG_SECTION "lastfm"
-
 #define CFG_ENABLED "enabled"
 #define CFG_API_KEY "api_key"
 #define CFG_API_SECRET "api_secret"
 #define CFG_SESSION_KEY "session_key"
 #define CFG_USERNAME "username"
 
-// ---------------------------------------------------------------------------
-// Track state and worker state
-// ---------------------------------------------------------------------------
+#define LASTFM_QUEUE_DIR ".plugins"
+#define LASTFM_QUEUE_NAME ".lastfm_scrobbler_queue"
+#define LASTFM_QUEUE_TMP_NAME ".lastfm_scrobbler_queue.tmp"
 
 typedef struct {
-	time_t timestamp;
-	int duration;
-	char artist[LASTFM_TEXT_MAX];
-	char title[LASTFM_TEXT_MAX];
-	char album[LASTFM_TEXT_MAX];
+    time_t timestamp;
+    double duration;
+    char artist[LASTFM_TEXT_MAX];
+    char title[LASTFM_TEXT_MAX];
+    char album[LASTFM_TEXT_MAX];
 } lastfm_track_t;
 
 typedef enum {
-	JOB_NONE = 0,
-	JOB_LOGIN,
-	JOB_NOW_PLAYING,
-	JOB_SCROBBLE,
-	JOB_SYNC_QUEUE,
-} worker_job_kind_t;
+    JOB_NONE = 0,
+    JOB_LOGIN,
+    JOB_NOW_PLAYING,
+    JOB_SCROBBLE,
+    JOB_SYNC_QUEUE,
+} worker_job_t;
+
+typedef struct {
+    worker_job_t kind;
+    lastfm_track_t track;
+    unsigned generation;
+    char username[LASTFM_TEXT_MAX];
+    char password[LASTFM_TEXT_MAX];
+} job_t;
+
+typedef struct {
+    char text[192];
+    bool persist_login;
+    bool persist_logout;
+    char session_key[LASTFM_SESSION_MAX];
+    char username[LASTFM_TEXT_MAX];
+} ui_result_t;
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t state_cond = PTHREAD_COND_INITIALIZER;
@@ -69,946 +88,949 @@ static char api_secret[LASTFM_API_SECRET_MAX];
 static char session_key[LASTFM_SESSION_MAX];
 static char username[LASTFM_TEXT_MAX];
 
-static lastfm_track_t current_track;
-static bool current_track_valid;
-static bool scrobbled_this_track;
-static bool scrobble_pending;
-static bool scrobble_in_flight;
-static lastfm_track_t pending_scrobble_track;
-static uint64_t pending_scrobble_generation;
-static uint64_t track_generation;
-
-static bool now_playing_pending;
-static lastfm_track_t now_playing_track;
-static uint64_t now_playing_generation;
-
-static bool login_pending;
 static char login_username[LASTFM_TEXT_MAX];
 static char login_password[LASTFM_TEXT_MAX];
+static bool login_pending;
 
-static bool sync_pending;
-
-// UI-thread persistence bridge. The worker never touches config_store.
-static bool persist_session;
-static bool clear_persisted_session;
-
-static char last_message[192];
-static uint64_t message_serial;
-static uint64_t last_service_time;
+static lastfm_track_t current_track;
+static bool current_track_valid;
+static unsigned current_generation;
+static bool scrobbled_this_track;
+static bool scrobble_in_flight;
+static bool now_playing_sent;
 
 static char queue_path[512];
-static char queue_tmp_path[520];
+static char queue_tmp_path[512];
+
+static char last_message[192];
+static unsigned long long message_serial;
+
+/* ------------------------------------------------------------------------- */
+/* Small helpers                                                              */
+/* ------------------------------------------------------------------------- */
 
 static void set_message_locked(const char *message) {
-	if (!message) {
-		message = "";
-	}
-	snprintf(last_message, sizeof(last_message), "%s", message);
-	message_serial++;
+    snprintf(last_message, sizeof(last_message), "%s", message ? message : "");
+    message_serial++;
 }
 
-
-static void build_queue_paths(void) {
-	const char *config_file = getenv("SONIX_CONFIG");
-	if (!config_file || !config_file[0]) {
-#ifndef HOST_BUILD
-		config_file = "/usr/data/device_config.ini";
-#else
-		config_file = "./device_config.ini";
-#endif
-	}
-
-	char dir[512];
-	snprintf(dir, sizeof(dir), "%s", config_file);
-	char *slash = strrchr(dir, '/');
-	if (!slash) {
-		snprintf(queue_path, sizeof(queue_path), "%s", ".lastfm_scrobbler_queue");
-	} else {
-		*slash = '\0';
-		if (!dir[0]) {
-			snprintf(dir, sizeof(dir), "/");
-		}
-		snprintf(queue_path, sizeof(queue_path), "%s/.lastfm_scrobbler_queue", dir);
-	}
-	snprintf(queue_tmp_path, sizeof(queue_tmp_path), "%s.tmp", queue_path);
+static bool send_enabled_locked(void) {
+    return enabled && api_key[0] && api_secret[0] && session_key[0];
 }
 
-static void copy_track(lastfm_track_t *dst, const song_metadata_t *metadata, time_t timestamp, int duration) {
-	memset(dst, 0, sizeof(*dst));
-	dst->timestamp = timestamp;
-	dst->duration = duration > 0 ? duration : 0;
-	if (!metadata) {
-		return;
-	}
-	snprintf(dst->artist, sizeof(dst->artist), "%s", metadata->artist);
-	snprintf(dst->title, sizeof(dst->title), "%s", metadata->title);
-	snprintf(dst->album, sizeof(dst->album), "%s", metadata->album);
+static void copy_track(lastfm_track_t *dst, const song_metadata_t *m, time_t timestamp, double duration) {
+    memset(dst, 0, sizeof(*dst));
+    dst->timestamp = timestamp;
+    dst->duration = duration > 0 ? duration : 0;
+    snprintf(dst->artist, sizeof(dst->artist), "%s", m->artist);
+    snprintf(dst->title, sizeof(dst->title), "%s", m->title);
+    snprintf(dst->album, sizeof(dst->album), "%s", m->album);
 }
 
-// ---------------------------------------------------------------------------
-// Last.fm request signing and form encoding
-// ---------------------------------------------------------------------------
+/* Standard application/x-www-form-urlencoded encoding. */
+static size_t form_encode(const char *in, char *out, size_t out_size) {
+    static const char HEX[] = "0123456789ABCDEF";
+    size_t used = 0;
+    if (!in || !out || out_size == 0) {
+        return 0;
+    }
+
+    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+        unsigned char c = *p;
+        bool keep = isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~';
+        size_t need = keep ? 1 : 3;
+        if (used + need + 1 >= out_size) {
+            out[0] = '\0';
+            return 0;
+        }
+        if (keep) {
+            out[used++] = (char)c;
+        } else {
+            out[used++] = '%';
+            out[used++] = HEX[c >> 4];
+            out[used++] = HEX[c & 0x0F];
+        }
+    }
+
+    out[used] = '\0';
+    return used;
+}
 
 typedef struct {
-	const char *key;
-	const char *value;
-} sign_param_t;
+    const char *key;
+    const char *value;
+} param_t;
 
-static int sign_param_cmp(const void *a, const void *b) {
-	const sign_param_t *pa = a;
-	const sign_param_t *pb = b;
-	return strcmp(pa->key, pb->key);
+static int param_cmp(const void *a, const void *b) {
+    const param_t *pa = (const param_t *)a;
+    const param_t *pb = (const param_t *)b;
+    return strcmp(pa->key, pb->key);
 }
 
-static bool append_form_pair(char *out, size_t out_size, size_t *used, const char *key, const char *value,
-						 bool *first) {
-	if (!out || !used || !key || !value) {
-		return false;
-	}
-	char enc_key[1024];
-	char enc_value[2048];
-	http_url_encode(key, enc_key, sizeof(enc_key));
-	http_url_encode(value, enc_value, sizeof(enc_value));
+/*
+ * Last.fm's signature is:
+ *   sort params by key
+ *   concatenate key + value without separators
+ *   append shared secret
+ *   MD5
+ */
+static bool make_signature(const param_t *params, size_t count, const char *secret, char out[MD5_HEX_LEN]) {
+    param_t sorted[16];
+    if (count > sizeof(sorted) / sizeof(sorted[0])) {
+        return false;
+    }
 
-	int n = snprintf(out + *used, out_size - *used, "%s%s=%s", *first ? "" : "&", enc_key, enc_value);
-	if (n < 0 || (size_t)n >= out_size - *used) {
-		return false;
-	}
-	*used += (size_t)n;
-	*first = false;
-	return true;
+    memcpy(sorted, params, count * sizeof(sorted[0]));
+    qsort(sorted, count, sizeof(sorted[0]), param_cmp);
+
+    char concat[4096];
+    size_t used = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        size_t kl = strlen(sorted[i].key);
+        size_t vl = strlen(sorted[i].value);
+        if (used + kl + vl + strlen(secret) + 1 >= sizeof(concat)) {
+            return false;
+        }
+        memcpy(concat + used, sorted[i].key, kl);
+        used += kl;
+        memcpy(concat + used, sorted[i].value, vl);
+        used += vl;
+    }
+
+    size_t secret_len = strlen(secret);
+    memcpy(concat + used, secret, secret_len);
+    used += secret_len;
+    concat[used] = '\0';
+
+    md5_hex(concat, used, out);
+    return true;
 }
 
-static bool make_signature(const sign_param_t *params, size_t count, const char *secret, char out[MD5_HEX_LEN]) {
-	if (!params || !secret || !out || count == 0 || count > 32) {
-		return false;
-	}
+static bool build_form(const param_t *params, size_t count, char *out, size_t out_size) {
+    size_t used = 0;
+    char encoded[1024];
 
-	sign_param_t sorted[32];
-	memcpy(sorted, params, count * sizeof(sorted[0]));
-	qsort(sorted, count, sizeof(sorted[0]), sign_param_cmp);
+    for (size_t i = 0; i < count; ++i) {
+        if (i != 0) {
+            if (used + 1 >= out_size) {
+                return false;
+            }
+            out[used++] = '&';
+        }
 
-	char concat[LASTFM_SIGNATURE_MAX];
-	size_t used = 0;
-	for (size_t i = 0; i < count; i++) {
-		int n = snprintf(concat + used, sizeof(concat) - used, "%s%s", sorted[i].key, sorted[i].value);
-		if (n < 0 || (size_t)n >= sizeof(concat) - used) {
-			return false;
-		}
-		used += (size_t)n;
-	}
-	int n = snprintf(concat + used, sizeof(concat) - used, "%s", secret);
-	if (n < 0 || (size_t)n >= sizeof(concat) - used) {
-		return false;
-	}
-	used += (size_t)n;
+        if (used + strlen(params[i].key) + 1 >= out_size) {
+            return false;
+        }
+        memcpy(out + used, params[i].key, strlen(params[i].key));
+        used += strlen(params[i].key);
+        out[used++] = '=';
 
-	md5_hex(concat, used, out);
-	return true;
+        if (form_encode(params[i].value, encoded, sizeof(encoded)) == 0 && params[i].value[0]) {
+            return false;
+        }
+        size_t el = strlen(encoded);
+        if (used + el + 1 >= out_size) {
+            return false;
+        }
+        memcpy(out + used, encoded, el);
+        used += el;
+    }
+
+    out[used] = '\0';
+    return true;
 }
 
-static bool build_form(char *out, size_t out_size, const sign_param_t *params, size_t count, const char *signature) {
-	size_t used = 0;
-	bool first = true;
-	for (size_t i = 0; i < count; i++) {
-		if (!append_form_pair(out, out_size, &used, params[i].key, params[i].value, &first)) {
-			return false;
-		}
-	}
-	return append_form_pair(out, out_size, &used, "api_sig", signature, &first);
+static bool api_call(const char *key, const char *secret, const param_t *base_params, size_t base_count,
+                      char **body_out, int *status_out) {
+    param_t params[16];
+    if (!key || !secret || base_count + 2 > sizeof(params) / sizeof(params[0])) {
+        return false;
+    }
+
+    memcpy(params, base_params, base_count * sizeof(params[0]));
+    params[base_count++] = (param_t){"api_key", key};
+
+    char sig[MD5_HEX_LEN];
+    if (!make_signature(params, base_count, secret, sig)) {
+        return false;
+    }
+    params[base_count++] = (param_t){"api_sig", sig};
+
+    char form[8192];
+    if (!build_form(params, base_count, form, sizeof(form))) {
+        return false;
+    }
+
+    http_req_t req = {
+        .method = "POST",
+        .extra_headers = NULL,
+        .body = form,
+        .body_len = strlen(form),
+        .content_type = "application/x-www-form-urlencoded",
+        .want_error_body = true,
+        .allow_empty_body = false,
+    };
+
+    return http_request(LASTFM_API_URL, &req, body_out, NULL, LASTFM_BODY_LIMIT,
+                        LASTFM_HTTP_TIMEOUT_SECONDS, status_out);
 }
 
-static bool api_call_locked(const sign_param_t *method_params, size_t method_param_count, bool authenticated,
-						char **body_out, int *status_out) {
-	if (!body_out) {
-		return false;
-	}
-	*body_out = NULL;
-	if (status_out) {
-		*status_out = 0;
-	}
-
-	char api_key_copy[LASTFM_API_KEY_MAX];
-	char api_secret_copy[LASTFM_API_SECRET_MAX];
-	char session_copy[LASTFM_SESSION_MAX];
-	pthread_mutex_lock(&state_mutex);
-	snprintf(api_key_copy, sizeof(api_key_copy), "%s", api_key);
-	snprintf(api_secret_copy, sizeof(api_secret_copy), "%s", api_secret);
-	snprintf(session_copy, sizeof(session_copy), "%s", session_key);
-	pthread_mutex_unlock(&state_mutex);
-
-	if (!api_key_copy[0] || !api_secret_copy[0]) {
-		return false;
-	}
-	if (authenticated && !session_copy[0]) {
-		return false;
-	}
-
-	sign_param_t params[16];
-	size_t count = 0;
-	for (size_t i = 0; i < method_param_count; i++) {
-		params[count++] = method_params[i];
-	}
-	params[count++] = (sign_param_t){"api_key", api_key_copy};
-	if (authenticated) {
-		params[count++] = (sign_param_t){"sk", session_copy};
-	}
-
-	char signature[MD5_HEX_LEN];
-	if (!make_signature(params, count, api_secret_copy, signature)) {
-		return false;
-	}
-
-	char form[LASTFM_FORM_MAX];
-	if (!build_form(form, sizeof(form), params, count, signature)) {
-		return false;
-	}
-
-	http_req_t req = {
-		.method = "POST",
-		.extra_headers = "User-Agent: " LASTFM_USER_AGENT "\r\nAccept: application/xml\r\n",
-		.body = form,
-		.body_len = 0,
-		.content_type = "application/x-www-form-urlencoded",
-		.want_error_body = true,
-		.allow_empty_body = false,
-	};
-
-	return http_request(LASTFM_API_URL, &req, body_out, NULL, LASTFM_BODY_LIMIT, LASTFM_HTTP_TIMEOUT_SECONDS, status_out);
+static bool xml_ok(const char *body) {
+    return body && strstr(body, "status=\"ok\"") != NULL;
 }
 
-static bool response_ok(const char *body) {
-	return body && strstr(body, "<lfm status=\"ok\">") != NULL;
+static bool xml_error(const char *body, char *out, size_t out_size) {
+    if (!body || !out || out_size == 0) {
+        return false;
+    }
+
+    const char *start = strstr(body, "<error");
+    if (!start) {
+        return false;
+    }
+    start = strchr(start, '>');
+    if (!start) {
+        return false;
+    }
+    start++;
+
+    const char *end = strstr(start, "</error>");
+    if (!end || end <= start) {
+        return false;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
 }
 
-static void format_api_error(const char *body, int status, char *out, size_t out_size) {
-	if (!out || out_size == 0) {
-		return;
-	}
-	out[0] = '\0';
-	if (body) {
-		const char *start = strstr(body, "<error");
-		if (start) {
-			const char *code_start = strstr(start, "code=\"");
-			const char *text_start = strchr(start, '>');
-			const char *text_end = text_start ? strstr(text_start + 1, "</error>") : NULL;
-			char code[24] = {0};
-			char message[144] = {0};
-			if (code_start) {
-				code_start += 6;
-				const char *q = strchr(code_start, '\"');
-				if (q) {
-					size_t n = (size_t)(q - code_start);
-					if (n >= sizeof(code)) n = sizeof(code) - 1;
-					memcpy(code, code_start, n);
-					code[n] = '\0';
-				}
-			}
-			if (text_start && text_end && text_end > text_start + 1) {
-				size_t n = (size_t)(text_end - (text_start + 1));
-				if (n >= sizeof(message)) n = sizeof(message) - 1;
-				memcpy(message, text_start + 1, n);
-				message[n] = '\0';
-			}
-			if (code[0] && message[0]) {
-				snprintf(out, out_size, "Last.fm error %s: %s", code, message);
-				return;
-			}
-			if (message[0]) {
-				snprintf(out, out_size, "Last.fm: %s", message);
-				return;
-			}
-		}
-	}
-	const char *net_error = http_last_error();
-	if (net_error && net_error[0]) {
-		snprintf(out, out_size, "Last.fm: %s", net_error);
-		return;
-	}
-	if (status) {
-		snprintf(out, out_size, "Last.fm: HTTP %d", status);
-		return;
-	}
-	snprintf(out, out_size, "Last.fm request failed");
+static bool xml_key(const char *body, char *out, size_t out_size) {
+    if (!body || !out || out_size == 0) {
+        return false;
+    }
+    const char *start = strstr(body, "<key>");
+    if (!start) {
+        return false;
+    }
+    start += 5;
+    const char *end = strstr(start, "</key>");
+    if (!end || end <= start) {
+        return false;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out[0] != '\0';
 }
 
-// ---------------------------------------------------------------------------
-// Persistent queue. It is streamed line-by-line and never loaded wholesale.
-// ---------------------------------------------------------------------------
+static void queue_paths_init(void) {
+    queue_path[0] = '\0';
+    queue_tmp_path[0] = '\0';
 
-static char *queue_decode_field(const char *encoded, char *out, size_t out_size) {
-	size_t w = 0;
-	for (size_t i = 0; encoded && encoded[i] && w + 1 < out_size; i++) {
-		if (encoded[i] == '%' && encoded[i + 1] && encoded[i + 2]) {
-			char hex[3] = {encoded[i + 1], encoded[i + 2], '\0'};
-			char *end = NULL;
-			long v = strtol(hex, &end, 16);
-			if (end && *end == '\0') {
-				out[w++] = (char)v;
-				i += 2;
-				continue;
-			}
-		}
-		out[w++] = encoded[i];
-	}
-	out[w] = '\0';
-	return out;
+    const char *root = storage_sd_root();
+#ifdef HOST_BUILD
+    if ((!root || !root[0])) {
+        root = getenv("SONIX_SD_ROOT");
+    }
+#endif
+    if (!root || !root[0]) {
+        return;
+    }
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s", root, LASTFM_QUEUE_DIR);
+    mkdir(dir, 0755); /* okay if it already exists */
+
+    snprintf(queue_path, sizeof(queue_path), "%s/%s", dir, LASTFM_QUEUE_NAME);
+    snprintf(queue_tmp_path, sizeof(queue_tmp_path), "%s/%s", dir, LASTFM_QUEUE_TMP_NAME);
 }
 
-static bool parse_queue_line(const char *line, lastfm_track_t *out) {
-	if (!line || !out) {
-		return false;
-	}
-	char copy[LASTFM_QUEUE_LINE_MAX];
-	snprintf(copy, sizeof(copy), "%s", line);
-	char *fields[5] = {0};
-	char *save = NULL;
-	char *p = strtok_r(copy, "\t", &save);
-	int count = 0;
-	while (p && count < 5) {
-		fields[count++] = p;
-		p = strtok_r(NULL, "\t", &save);
-	}
-	if (count != 5 || !fields[0] || !fields[1]) {
-		return false;
-	}
+static bool queue_line_parse(const char *line, lastfm_track_t *out) {
+    if (!line || !out) {
+        return false;
+    }
 
-	char *end = NULL;
-	long long ts = strtoll(fields[0], &end, 10);
-	if (!end || *end || ts <= 0) {
-		return false;
-	}
-	long duration = strtol(fields[1], &end, 10);
-	if (!end || *end || duration < 0) {
-		duration = 0;
-	}
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", line);
 
-	memset(out, 0, sizeof(*out));
-	out->timestamp = (time_t)ts;
-	out->duration = (int)duration;
-	queue_decode_field(fields[2], out->artist, sizeof(out->artist));
-	queue_decode_field(fields[3], out->title, sizeof(out->title));
-	queue_decode_field(fields[4], out->album, sizeof(out->album));
-	return out->artist[0] && out->title[0];
+    char *fields[5] = {0};
+    char *p = tmp;
+    for (int i = 0; i < 5; ++i) {
+        fields[i] = p;
+        char *tab = strchr(p, '\t');
+        if (!tab) {
+            if (i == 4) {
+                break;
+            }
+            return false;
+        }
+        *tab = '\0';
+        p = tab + 1;
+    }
+
+    if (!fields[0] || !fields[1] || !fields[2] || !fields[3] || !fields[4]) {
+        return false;
+    }
+
+    char decoded[5][LASTFM_TEXT_MAX];
+    for (int i = 0; i < 3; ++i) {
+        /* Percent-decode the strings. */
+        size_t used = 0;
+        const char *src = fields[i + 2];
+        while (*src && used + 1 < sizeof(decoded[i])) {
+            if (src[0] == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
+                char h[3] = {src[1], src[2], '\0'};
+                decoded[i][used++] = (char)strtol(h, NULL, 16);
+                src += 3;
+            } else {
+                decoded[i][used++] = *src++;
+            }
+        }
+        decoded[i][used] = '\0';
+    }
+
+    char *endptr = NULL;
+    errno = 0;
+    long long ts = strtoll(fields[0], &endptr, 10);
+    if (errno != 0 || endptr == fields[0] || ts <= 0) {
+        return false;
+    }
+
+    errno = 0;
+    double duration = strtod(fields[1], &endptr);
+    if (errno != 0 || endptr == fields[1] || duration < 0) {
+        duration = 0;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->timestamp = (time_t)ts;
+    out->duration = duration;
+    snprintf(out->artist, sizeof(out->artist), "%s", decoded[0]);
+    snprintf(out->title, sizeof(out->title), "%s", decoded[1]);
+    snprintf(out->album, sizeof(out->album), "%s", decoded[2]);
+    return out->timestamp > 0 && out->artist[0] && out->title[0];
 }
 
-static bool queue_write_field(FILE *f, const char *value) {
-	char enc[2048];
-	http_url_encode(value ? value : "", enc, sizeof(enc));
-	return fputs(enc, f) >= 0;
+static bool queue_write_line(FILE *f, const lastfm_track_t *track) {
+    if (!f || !track) {
+        return false;
+    }
+
+    char artist[768], title[768], album[768];
+    if (form_encode(track->artist, artist, sizeof(artist)) == 0 && track->artist[0]) return false;
+    if (form_encode(track->title, title, sizeof(title)) == 0 && track->title[0]) return false;
+    if (form_encode(track->album, album, sizeof(album)) == 0 && track->album[0]) return false;
+
+    return fprintf(f, "%lld\t%.0f\t%s\t%s\t%s\n",
+                   (long long)track->timestamp, track->duration,
+                   artist, title, album) > 0;
 }
 
-static bool queue_write_item(FILE *f, const lastfm_track_t *item) {
-	if (!f || !item || !item->artist[0] || !item->title[0] || item->timestamp <= 0) {
-		return false;
-	}
-	if (fprintf(f, "%lld\t%d\t", (long long)item->timestamp, item->duration) < 0) {
-		return false;
-	}
-	if (!queue_write_field(f, item->artist) || fputc('\t', f) == EOF ||
-		!queue_write_field(f, item->title) || fputc('\t', f) == EOF ||
-		!queue_write_field(f, item->album) || fputc('\n', f) == EOF) {
-		return false;
-	}
-	return true;
+static bool queue_prune(void) {
+    if (!queue_path[0]) {
+        return false;
+    }
+
+    FILE *in = fopen(queue_path, "r");
+    if (!in) {
+        return true;
+    }
+    FILE *out = fopen(queue_tmp_path, "w");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    time_t cutoff = time(NULL) - (time_t)LASTFM_QUEUE_MAX_AGE;
+    char line[4096];
+
+    while (fgets(line, sizeof(line), in)) {
+        lastfm_track_t track;
+        if (queue_line_parse(line, &track) && track.timestamp >= cutoff) {
+            fputs(line, out);
+        }
+    }
+
+    fclose(in);
+    if (fclose(out) != 0) {
+        remove(queue_tmp_path);
+        return false;
+    }
+
+    if (rename(queue_tmp_path, queue_path) != 0) {
+        remove(queue_tmp_path);
+        return false;
+    }
+    return true;
 }
 
-static bool prune_queue(void) {
-	FILE *in = fopen(queue_path, "r");
-	if (!in) {
-		return true;
-	}
-	FILE *out = fopen(queue_tmp_path, "w");
-	if (!out) {
-		fclose(in);
-		return false;
-	}
+static bool queue_enqueue(const lastfm_track_t *track) {
+    if (!queue_path[0] || !track || !track->timestamp || !track->artist[0] || !track->title[0]) {
+        return false;
+    }
 
-	long long cutoff = (long long)time(NULL) - LASTFM_QUEUE_MAX_AGE;
-	char line[LASTFM_QUEUE_LINE_MAX];
-	while (fgets(line, sizeof(line), in)) {
-		lastfm_track_t item;
-		if (parse_queue_line(line, &item) && (long long)item.timestamp >= cutoff) {
-			if (!queue_write_item(out, &item)) {
-				fclose(in);
-				fclose(out);
-				remove(queue_tmp_path);
-				return false;
-			}
-		}
-	}
-	fclose(in);
-	if (fclose(out) != 0) {
-		remove(queue_tmp_path);
-		return false;
-	}
-	if (rename(queue_tmp_path, queue_path) != 0) {
-		remove(queue_tmp_path);
-		return false;
-	}
-	return true;
+    queue_prune();
+
+    FILE *f = fopen(queue_path, "a");
+    if (!f) {
+        return false;
+    }
+    bool ok = queue_write_line(f, track);
+    fflush(f);
+    fclose(f);
+    return ok;
 }
 
-static bool enqueue_scrobble(const lastfm_track_t *item) {
-	if (!item || !item->artist[0] || !item->title[0] || item->timestamp <= 0) {
-		return false;
-	}
-	prune_queue();
-	FILE *f = fopen(queue_path, "a");
-	if (!f) {
-		return false;
-	}
-	bool ok = queue_write_item(f, item);
-	fclose(f);
-	return ok;
+static bool queue_first(lastfm_track_t *out) {
+    if (!queue_path[0] || !out) return false;
+
+    FILE *f = fopen(queue_path, "r");
+    if (!f) return false;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (queue_line_parse(line, out)) {
+            fclose(f);
+            return true;
+        }
+    }
+    fclose(f);
+    return false;
 }
 
-static bool read_first_queued(lastfm_track_t *item) {
-	if (!item) {
-		return false;
-	}
-	FILE *f = fopen(queue_path, "r");
-	if (!f) {
-		return false;
-	}
-	char line[LASTFM_QUEUE_LINE_MAX];
-	while (fgets(line, sizeof(line), f)) {
-		if (parse_queue_line(line, item)) {
-			fclose(f);
-			return true;
-		}
-	}
-	fclose(f);
-	return false;
+static bool queue_remove_first(void) {
+    if (!queue_path[0]) return false;
+
+    FILE *in = fopen(queue_path, "r");
+    if (!in) return true;
+
+    FILE *out = fopen(queue_tmp_path, "w");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    char line[4096];
+    bool removed = false;
+    while (fgets(line, sizeof(line), in)) {
+        if (!removed) {
+            lastfm_track_t track;
+            if (queue_line_parse(line, &track)) {
+                removed = true;
+                continue;
+            }
+        }
+        fputs(line, out);
+    }
+
+    fclose(in);
+    if (fclose(out) != 0) {
+        remove(queue_tmp_path);
+        return false;
+    }
+
+    if (rename(queue_tmp_path, queue_path) != 0) {
+        remove(queue_tmp_path);
+        return false;
+    }
+    return true;
 }
 
-static bool remove_first_queued(void) {
-	FILE *in = fopen(queue_path, "r");
-	if (!in) {
-		return true;
-	}
-	FILE *out = fopen(queue_tmp_path, "w");
-	if (!out) {
-		fclose(in);
-		return false;
-	}
+/* ------------------------------------------------------------------------- */
+/* Worker -> UI                                                              */
+/* ------------------------------------------------------------------------- */
 
-	bool removed = false;
-	char line[LASTFM_QUEUE_LINE_MAX];
-	while (fgets(line, sizeof(line), in)) {
-		lastfm_track_t item;
-		if (!removed && parse_queue_line(line, &item)) {
-			removed = true;
-			continue;
-		}
-		if (fputs(line, out) == EOF) {
-			fclose(in);
-			fclose(out);
-			remove(queue_tmp_path);
-			return false;
-		}
-	}
-	fclose(in);
-	if (fclose(out) != 0) {
-		remove(queue_tmp_path);
-		return false;
-	}
-	if (rename(queue_tmp_path, queue_path) != 0) {
-		remove(queue_tmp_path);
-		return false;
-	}
-	return true;
+static void ui_result_cb(void *user) {
+    ui_result_t *result = (ui_result_t *)user;
+    if (!result) return;
+
+    if (result->persist_login) {
+        config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, result->session_key);
+        config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, result->username);
+        config_save();
+        gui_notify_popup(result->text);
+    } else if (result->persist_logout) {
+        config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, "");
+        config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, "");
+        config_save();
+        gui_notify_popup(result->text);
+    } else if (result->text[0]) {
+        gui_notify_popup(result->text);
+    }
+
+    free(result);
 }
 
-// ---------------------------------------------------------------------------
-// Worker operations
-// ---------------------------------------------------------------------------
+static void post_ui_message(const char *text, bool persist_login, const char *new_session,
+                            const char *new_username, bool persist_logout) {
+    ui_result_t *result = calloc(1, sizeof(*result));
+    if (!result) return;
 
-static bool do_login_request(const char *user, const char *password, char *error, size_t error_size) {
-	if (!user || !*user || !password || !*password) {
-		snprintf(error, error_size, "Username and password are required");
-		return false;
-	}
+    snprintf(result->text, sizeof(result->text), "%s", text ? text : "");
+    result->persist_login = persist_login;
+    result->persist_logout = persist_logout;
+    snprintf(result->session_key, sizeof(result->session_key), "%s", new_session ? new_session : "");
+    snprintf(result->username, sizeof(result->username), "%s", new_username ? new_username : "");
 
-	sign_param_t params[3] = {
-		{"method", "auth.getMobileSession"},
-		{"password", password},
-		{"username", user},
-	};
-	char *body = NULL;
-	int status = 0;
-	if (!api_call_locked(params, 3, false, &body, &status) || !response_ok(body)) {
-		format_api_error(body, status, error, error_size);
-		free(body);
-		return false;
-	}
-
-	const char *key_start = strstr(body, "<key>");
-	const char *key_end = key_start ? strstr(key_start + 5, "</key>") : NULL;
-	if (!key_start || !key_end || key_end <= key_start + 5) {
-		snprintf(error, error_size, "Last.fm login returned no session key");
-		free(body);
-		return false;
-	}
-
-	char key[LASTFM_SESSION_MAX];
-	size_t key_len = (size_t)(key_end - (key_start + 5));
-	if (key_len >= sizeof(key)) {
-		key_len = sizeof(key) - 1;
-	}
-	memcpy(key, key_start + 5, key_len);
-	key[key_len] = '\0';
-
-	char normalized_user[LASTFM_TEXT_MAX];
-	const char *name_start = strstr(body, "<name>");
-	const char *name_end = name_start ? strstr(name_start + 6, "</name>") : NULL;
-	if (name_start && name_end && name_end > name_start + 6) {
-		size_t name_len = (size_t)(name_end - (name_start + 6));
-		if (name_len >= sizeof(normalized_user)) name_len = sizeof(normalized_user) - 1;
-		memcpy(normalized_user, name_start + 6, name_len);
-		normalized_user[name_len] = '\0';
-	} else {
-		snprintf(normalized_user, sizeof(normalized_user), "%s", user);
-	}
-
-	pthread_mutex_lock(&state_mutex);
-	snprintf(session_key, sizeof(session_key), "%s", key);
-	snprintf(username, sizeof(username), "%s", normalized_user);
-	logging_in = false;
-	persist_session = true;
-	clear_persisted_session = false;
-	char message[192];
-	snprintf(message, sizeof(message), "Logged in to Last.fm as %s", username);
-	snprintf(last_message, sizeof(last_message), "%s", message);
-	message_serial++;
-	pthread_mutex_unlock(&state_mutex);
-
-	free(body);
-	return true;
+    if (!gui_post(ui_result_cb, result)) {
+        free(result);
+    }
 }
 
-static bool do_now_playing(const lastfm_track_t *track) {
-	if (!track || !track->artist[0] || !track->title[0]) {
-		return false;
-	}
+/* ------------------------------------------------------------------------- */
+/* Network operations                                                        */
+/* ------------------------------------------------------------------------- */
 
-	char duration[32];
-	snprintf(duration, sizeof(duration), "%d", track->duration);
-	char album_value[LASTFM_TEXT_MAX];
-	snprintf(album_value, sizeof(album_value), "%s", track->album);
+static bool do_login(job_t *job) {
+    char key[LASTFM_API_KEY_MAX];
+    char secret[LASTFM_API_SECRET_MAX];
 
-	sign_param_t params[5];
-	size_t count = 0;
-	params[count++] = (sign_param_t){"artist", track->artist};
-	params[count++] = (sign_param_t){"duration", duration};
-	if (album_value[0]) {
-		params[count++] = (sign_param_t){"album", album_value};
-	}
-	params[count++] = (sign_param_t){"method", "track.updateNowPlaying"};
-	params[count++] = (sign_param_t){"track", track->title};
+    pthread_mutex_lock(&state_mutex);
+    snprintf(key, sizeof(key), "%s", api_key);
+    snprintf(secret, sizeof(secret), "%s", api_secret);
+    pthread_mutex_unlock(&state_mutex);
 
-	char *body = NULL;
-	int status = 0;
-	bool ok = api_call_locked(params, count, true, &body, &status) && response_ok(body);
-	free(body);
-	(void)status;
-	return ok;
+    if (!key[0] || !secret[0]) {
+        post_ui_message("Last.fm: API key and API secret are required", false, NULL, NULL, false);
+        return false;
+    }
+
+    const param_t params[] = {
+        {"method", "auth.getMobileSession"},
+        {"username", job->username},
+        {"password", job->password},
+    };
+
+    char *body = NULL;
+    int status = 0;
+    bool request_ok = api_call(key, secret, params, sizeof(params) / sizeof(params[0]), &body, &status);
+
+    char session[LASTFM_SESSION_MAX] = "";
+    char error[160] = "";
+
+    if (request_ok && status == 200 && xml_ok(body) && xml_key(body, session, sizeof(session))) {
+        pthread_mutex_lock(&state_mutex);
+        snprintf(session_key, sizeof(session_key), "%s", session);
+        snprintf(username, sizeof(username), "%s", job->username);
+        logging_in = false;
+        login_pending = false;
+        set_message_locked("Logged in to Last.fm");
+        pthread_cond_signal(&state_cond);
+        pthread_mutex_unlock(&state_mutex);
+
+        memset((void *)job->password, 0, sizeof(job->password));
+        post_ui_message("Logged in to Last.fm", true, session, job->username, false);
+        memset(job->password, 0, sizeof(job->password));
+        free(body);
+        return true;
+    }
+
+    if (body && xml_error(body, error, sizeof(error))) {
+        char message[192];
+        snprintf(message, sizeof(message), "Last.fm login failed: %s", error);
+        post_ui_message(message, false, NULL, NULL, false);
+    } else if (http_last_error()) {
+        char message[192];
+        snprintf(message, sizeof(message), "Last.fm login failed: %s", http_last_error());
+        post_ui_message(message, false, NULL, NULL, false);
+    } else {
+        char message[192];
+        snprintf(message, sizeof(message), "Last.fm login failed: HTTP %d", status);
+        post_ui_message(message, false, NULL, NULL, false);
+    }
+
+    pthread_mutex_lock(&state_mutex);
+    logging_in = false;
+    login_pending = false;
+    memset(login_password, 0, sizeof(login_password));
+    pthread_mutex_unlock(&state_mutex);
+    memset(job->password, 0, sizeof(job->password));
+    free(body);
+    return false;
 }
 
-static bool do_scrobble(const lastfm_track_t *track) {
-	if (!track || !track->artist[0] || !track->title[0] || track->timestamp <= 0) {
-		return false;
-	}
+static bool do_scrobble(const lastfm_track_t *track, const char *session, const char *key, const char *secret) {
+    char timestamp[32], duration[32];
+    snprintf(timestamp, sizeof(timestamp), "%lld", (long long)track->timestamp);
+    snprintf(duration, sizeof(duration), "%.0f", track->duration);
 
-	char duration[32];
-	char timestamp[32];
-	snprintf(duration, sizeof(duration), "%d", track->duration);
-	snprintf(timestamp, sizeof(timestamp), "%lld", (long long)track->timestamp);
+    param_t params[8];
+    size_t count = 0;
+    params[count++] = (param_t){"method", "track.scrobble"};
+    params[count++] = (param_t){"sk", session};
+    params[count++] = (param_t){"track", track->title};
+    params[count++] = (param_t){"artist", track->artist};
+    if (track->album[0]) params[count++] = (param_t){"album", track->album};
+    params[count++] = (param_t){"timestamp", timestamp};
+    /* duration is optional to Last.fm but supported by the API. */
+    if (count < 6) params[count++] = (param_t){"duration", duration};
 
-	sign_param_t params[8];
-	size_t count = 0;
-	params[count++] = (sign_param_t){"artist", track->artist};
-	if (track->album[0]) {
-		params[count++] = (sign_param_t){"album", track->album};
-	}
-	params[count++] = (sign_param_t){"duration", duration};
-	params[count++] = (sign_param_t){"method", "track.scrobble"};
-	params[count++] = (sign_param_t){"timestamp", timestamp};
-	params[count++] = (sign_param_t){"track", track->title};
-
-	char *body = NULL;
-	int status = 0;
-	bool ok = api_call_locked(params, count, true, &body, &status) && response_ok(body);
-	free(body);
-	(void)status;
-	return ok;
+    char *body = NULL;
+    int status = 0;
+    bool ok = api_call(key, secret, params, count, &body, &status);
+    bool accepted = ok && status == 200 && xml_ok(body);
+    free(body);
+    return accepted;
 }
 
-static bool lastfm_is_send_enabled(void) {
-	bool allowed;
-	pthread_mutex_lock(&state_mutex);
-	allowed = enabled && session_key[0];
-	pthread_mutex_unlock(&state_mutex);
-	return allowed;
+static bool do_now_playing(const lastfm_track_t *track, const char *session, const char *key, const char *secret) {
+    char duration[32];
+    snprintf(duration, sizeof(duration), "%.0f", track->duration);
+
+    param_t params[6];
+    size_t count = 0;
+    params[count++] = (param_t){"method", "track.updateNowPlaying"};
+    params[count++] = (param_t){"sk", session};
+    params[count++] = (param_t){"track", track->title};
+    params[count++] = (param_t){"artist", track->artist};
+    if (track->album[0]) params[count++] = (param_t){"album", track->album};
+    params[count++] = (param_t){"duration", duration};
+
+    char *body = NULL;
+    int status = 0;
+    bool ok = api_call(key, secret, params, count, &body, &status);
+    bool accepted = ok && status == 200 && xml_ok(body);
+    free(body);
+    return accepted;
 }
 
-static bool do_sync_queue(void) {
-	lastfm_track_t item;
-	if (!lastfm_is_send_enabled()) {
-		return true;
-	}
-	prune_queue();
-	if (!read_first_queued(&item)) {
-		return true;
-	}
-	if (!do_scrobble(&item)) {
-		return false;
-	}
-	return remove_first_queued();
+static void do_sync_queue(const char *session, const char *key, const char *secret) {
+    queue_prune();
+
+    lastfm_track_t item;
+    if (!queue_first(&item)) {
+        return;
+    }
+
+    if (do_scrobble(&item, session, key, secret)) {
+        queue_remove_first();
+    }
 }
 
-static void worker_mark_scrobble_complete(uint64_t generation) {
-	pthread_mutex_lock(&state_mutex);
-	if (generation == track_generation) {
-		scrobble_pending = false;
-		scrobbled_this_track = true;
-	} 
-	pthread_mutex_unlock(&state_mutex);
-}
-
-static void worker_mark_scrobble_queued(uint64_t generation) {
-	pthread_mutex_lock(&state_mutex);
-	if (generation == track_generation) {
-		scrobble_pending = false;
-		scrobbled_this_track = true;
-	}
-	pthread_mutex_unlock(&state_mutex);
+static bool current_send_snapshot(lastfm_track_t *track, char *session, size_t session_size,
+                                  unsigned *generation_out) {
+    pthread_mutex_lock(&state_mutex);
+    bool allowed = send_enabled_locked() && current_track_valid;
+    if (allowed) {
+        *track = current_track;
+        snprintf(session, session_size, "%s", session_key);
+        if (generation_out) *generation_out = current_generation;
+    }
+    pthread_mutex_unlock(&state_mutex);
+    return allowed;
 }
 
 static void *lastfm_worker(void *unused) {
-	(void)unused;
-	for (;;) {
-		worker_job_kind_t job = JOB_NONE;
-		lastfm_track_t track;
-		uint64_t generation = 0;
-		char login_user[LASTFM_TEXT_MAX];
-		char login_pass[LASTFM_TEXT_MAX];
+    (void)unused;
 
-		memset(&track, 0, sizeof(track));
-		memset(login_user, 0, sizeof(login_user));
-		memset(login_pass, 0, sizeof(login_pass));
+    pthread_mutex_lock(&state_mutex);
+    while (!worker_stop) {
+        while (!worker_stop && !login_pending && !current_track_valid) {
+            struct timespec wake;
+            clock_gettime(CLOCK_REALTIME, &wake);
+            wake.tv_sec += LASTFM_POLL_SECONDS;
+            pthread_cond_timedwait(&state_cond, &state_mutex, &wake);
+            break;
+        }
 
-		pthread_mutex_lock(&state_mutex);
-		while (!worker_stop && !login_pending && !now_playing_pending && !sync_pending && !scrobble_pending) {
-			pthread_cond_wait(&state_cond, &state_mutex);
-		}
-		if (worker_stop) {
-			pthread_mutex_unlock(&state_mutex);
-			break;
-		}
+        if (worker_stop) {
+            break;
+        }
 
-		if (login_pending) {
-			job = JOB_LOGIN;
-			snprintf(login_user, sizeof(login_user), "%s", login_username);
-			snprintf(login_pass, sizeof(login_pass), "%s", login_password);
-			memset(login_password, 0, sizeof(login_password));
-			login_pending = false;
-		} else if (now_playing_pending) {
-			job = JOB_NOW_PLAYING;
-			track = now_playing_track;
-			generation = now_playing_generation;
-			now_playing_pending = false;
-		} else if (sync_pending) {
-			job = JOB_SYNC_QUEUE;
-			sync_pending = false;
-		} else if (scrobble_pending) {
-			job = JOB_SCROBBLE;
-			track = pending_scrobble_track;
-			generation = pending_scrobble_generation;
-			scrobble_pending = false;
-			scrobble_in_flight = true;
-		}
-		pthread_mutex_unlock(&state_mutex);
+        bool do_login_job = login_pending;
+        job_t job = {0};
+        if (do_login_job) {
+            job.kind = JOB_LOGIN;
+            snprintf(job.username, sizeof(job.username), "%s", login_username);
+            snprintf(job.password, sizeof(job.password), "%s", login_password);
+            memset(login_password, 0, sizeof(login_password));
+            /*
+             * Keep login_pending true while the worker operates: the UI will
+             * reject another login until the request has completed.
+             */
+            pthread_mutex_unlock(&state_mutex);
+            do_login(&job);
+            pthread_mutex_lock(&state_mutex);
+            continue;
+        }
 
-		switch (job) {
-		case JOB_LOGIN: {
-			char error[192];
-			bool ok = do_login_request(login_user, login_pass, error, sizeof(error));
-			memset(login_pass, 0, sizeof(login_pass));
-			if (!ok) {
-				pthread_mutex_lock(&state_mutex);
-				logging_in = false;
-				set_message_locked(error);
-				pthread_mutex_unlock(&state_mutex);
-			}
-			break;
-		}
-		case JOB_NOW_PLAYING:
-			// Advisory. The source plugin deliberately ignores failures here.
-			if (lastfm_is_send_enabled()) {
-				do_now_playing(&track);
-			}
-			break;
-		case JOB_SCROBBLE: {
-			bool allowed = lastfm_is_send_enabled();
-			bool ok = allowed && do_scrobble(&track);
-			if (ok) {
-				// The direct request is complete only after Last.fm accepted it.
-				worker_mark_scrobble_complete(generation);
-			} else if (allowed) {
-				// Only cache a failed attempt while the service is still enabled.
-				// If the user disabled Last.fm while the request was in flight, leave
-				// the play eligible for a later retry rather than silently queueing it.
-				bool queued = enqueue_scrobble(&track);
-				if (queued) {
-					// Identical policy to the plugin: once a failed direct request has
-					// been safely written to disk, do not attempt the same play again.
-					worker_mark_scrobble_queued(generation);
-				}
-			}
-			pthread_mutex_lock(&state_mutex);
-			scrobble_in_flight = false;
-			pthread_mutex_unlock(&state_mutex);
-			break;
-		}
-		case JOB_SYNC_QUEUE:
-			// Queue sync failures are silent. The next 15-second poll retries the
-			// exact original record with its original timestamp.
-			do_sync_queue();
-			break;
-		default:
-			break;
-		}
-	}
-	return NULL;
+        pthread_mutex_unlock(&state_mutex);
+
+        /*
+         * One poll pass:
+         *   1. drain one old offline record
+         *   2. update now-playing once for a newly announced track
+         *   3. check the current track against Last.fm's 50%/4-minute rule
+         */
+        char session[LASTFM_SESSION_MAX];
+        char key[LASTFM_API_KEY_MAX];
+        char secret[LASTFM_API_SECRET_MAX];
+        bool allowed;
+        pthread_mutex_lock(&state_mutex);
+        allowed = send_enabled_locked();
+        snprintf(session, sizeof(session), "%s", session_key);
+        snprintf(key, sizeof(key), "%s", api_key);
+        snprintf(secret, sizeof(secret), "%s", api_secret);
+        pthread_mutex_unlock(&state_mutex);
+
+        if (allowed) {
+            do_sync_queue(session, key, secret);
+        }
+
+        lastfm_track_t track;
+        unsigned generation = 0;
+        if (current_send_snapshot(&track, session, sizeof(session), &generation)) {
+            bool send_now = false;
+            bool scrobble = false;
+
+            double position = 0;
+            double total = 0;
+            audio_get_progress(&position, &total);
+
+            if (total > 0 && track.duration <= 0) {
+                track.duration = total;
+                pthread_mutex_lock(&state_mutex);
+                if (current_generation == generation) {
+                    current_track.duration = total;
+                }
+                pthread_mutex_unlock(&state_mutex);
+            }
+
+            pthread_mutex_lock(&state_mutex);
+            if (current_generation == generation && !now_playing_sent) {
+                now_playing_sent = true;
+                send_now = true;
+            }
+            pthread_mutex_unlock(&state_mutex);
+
+            if (send_now) {
+                /* Advisory: failure does not affect scrobbling. */
+                do_now_playing(&track, session, key, secret);
+            }
+
+            double duration = track.duration;
+            if (duration >= 30.0) {
+                double threshold = duration / 2.0;
+                if (threshold > 240.0) threshold = 240.0;
+
+                pthread_mutex_lock(&state_mutex);
+                if (current_generation == generation && !scrobbled_this_track &&
+                    !scrobble_in_flight && audio_get_status() == AUDIO_STATUS_PLAYING &&
+                    position >= threshold) {
+                    scrobble_in_flight = true;
+                    scrobble = true;
+                }
+                pthread_mutex_unlock(&state_mutex);
+            }
+
+            if (scrobble) {
+                bool accepted = do_scrobble(&track, session, key, secret);
+                bool queued = false;
+
+                if (!accepted) {
+                    /*
+                     * Queueing is disk I/O and must not happen while state_mutex
+                     * is held: the UI can change settings while the card is slow.
+                     */
+                    queued = queue_enqueue(&track);
+                }
+
+                pthread_mutex_lock(&state_mutex);
+                if (current_generation == generation) {
+                    if (accepted || queued) {
+                        scrobbled_this_track = true;
+                    }
+                    scrobble_in_flight = false;
+                }
+                pthread_mutex_unlock(&state_mutex);
+            }
+        }
+
+        /* Wait roughly until the next 15-second poll or an explicit wake. */
+        pthread_mutex_lock(&state_mutex);
+        if (!worker_stop) {
+            struct timespec wake;
+            clock_gettime(CLOCK_REALTIME, &wake);
+            wake.tv_sec += LASTFM_POLL_SECONDS;
+            pthread_cond_timedwait(&state_cond, &state_mutex, &wake);
+        }
+    }
+    pthread_mutex_unlock(&state_mutex);
+    return NULL;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------------- */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------- */
 
 void lastfm_init(void) {
-	pthread_mutex_lock(&state_mutex);
-	if (worker_started) {
-		pthread_mutex_unlock(&state_mutex);
-		return;
-	}
+    pthread_mutex_lock(&state_mutex);
+    if (worker_started) {
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
 
-	enabled = config_get_bool(LASTFM_CONFIG_SECTION, CFG_ENABLED, false);
-	snprintf(api_key, sizeof(api_key), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_API_KEY, ""));
-	snprintf(api_secret, sizeof(api_secret), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_API_SECRET, ""));
-	snprintf(session_key, sizeof(session_key), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, ""));
-	snprintf(username, sizeof(username), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_USERNAME, ""));
-	build_queue_paths();
+    enabled = config_get_bool(LASTFM_CONFIG_SECTION, CFG_ENABLED, false);
+    snprintf(api_key, sizeof(api_key), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_API_KEY, ""));
+    snprintf(api_secret, sizeof(api_secret), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_API_SECRET, ""));
+    snprintf(session_key, sizeof(session_key), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, ""));
+    snprintf(username, sizeof(username), "%s", config_get(LASTFM_CONFIG_SECTION, CFG_USERNAME, ""));
+    queue_paths_init();
 
-	worker_stop = false;
-	if (pthread_create(&worker_thread, NULL, lastfm_worker, NULL) != 0) {
-		set_message_locked("Could not start Last.fm worker");
-		pthread_mutex_unlock(&state_mutex);
-		return;
-	}
-	worker_started = true;
-	pthread_mutex_unlock(&state_mutex);
+    worker_stop = false;
+    if (pthread_create(&worker_thread, NULL, lastfm_worker, NULL) != 0) {
+        set_message_locked("Last.fm worker could not start");
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
+    worker_started = true;
+    pthread_mutex_unlock(&state_mutex);
 }
 
 void lastfm_on_track_started(const song_metadata_t *metadata) {
-	if (!metadata || !metadata->artist[0] || !metadata->title[0]) {
-		return;
-	}
+    if (!metadata || !metadata->artist[0] || !metadata->title[0]) {
+        return;
+    }
 
-	pthread_mutex_lock(&state_mutex);
-	if (!worker_started) {
-		pthread_mutex_unlock(&state_mutex);
-		return;
-	}
+    /*
+     * Only record a new Last.fm play for a genuine new track. The device
+     * playback layer calls this from its track-change path; pauses/resumes and
+     * output restarts do not call it.
+     */
+    pthread_mutex_lock(&state_mutex);
+    if (!worker_started) {
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
 
-	copy_track(&current_track, metadata, time(NULL), 0);
-	current_track_valid = true;
-	scrobbled_this_track = false;
-	scrobble_pending = false;
-	track_generation++;
+    double duration = 0;
+    double current = 0;
+    audio_get_progress(&current, &duration);
 
-	if (enabled && session_key[0]) {
-		double ignored_position = 0.0, total = 0.0;
-		audio_get_progress(&ignored_position, &total);
-		if (total > 0.0) {
-			current_track.duration = (int)(total + 0.5);
-		}
-		now_playing_track = current_track;
-		now_playing_generation = track_generation;
-		now_playing_pending = true;
-		sync_pending = true;
-		pthread_cond_signal(&state_cond);
-	}
-	pthread_mutex_unlock(&state_mutex);
-}
+    copy_track(&current_track, metadata, time(NULL), duration);
+    current_track_valid = true;
+    current_generation++;
+    scrobbled_this_track = false;
+    scrobble_in_flight = false;
+    now_playing_sent = false;
+    set_message_locked("Track started");
 
-void lastfm_poll(void) {
-	// Called by the LVGL/UI timer. This is the only place that persists worker
-	// results into config, keeping config.c strictly on the UI/main thread.
-	bool do_persist = false;
-	bool do_clear = false;
-	uint64_t now = (uint64_t)time(NULL);
-
-	pthread_mutex_lock(&state_mutex);
-	if (persist_session) {
-		persist_session = false;
-		do_persist = true;
-	}
-	if (clear_persisted_session) {
-		clear_persisted_session = false;
-		do_clear = true;
-	}
-
-	if (enabled && session_key[0]) {
-		if (last_service_time == 0 || now - last_service_time >= LASTFM_POLL_SECONDS) {
-			last_service_time = now;
-			sync_pending = true;
-		}
-
-		if (current_track_valid && !scrobbled_this_track && !scrobble_pending && !scrobble_in_flight) {
-			double position = 0.0;
-			double total = 0.0;
-			audio_status_t status = audio_get_status();
-			audio_get_progress(&position, &total);
-			if (total > 0.0) {
-				current_track.duration = (int)(total + 0.5);
-			}
-			int duration = current_track.duration;
-			if (status == AUDIO_STATUS_PLAYING && duration >= 30) {
-				double threshold = duration / 2.0;
-				if (threshold > 240.0) threshold = 240.0;
-				if (position >= threshold) {
-					pending_scrobble_track = current_track;
-					pending_scrobble_generation = track_generation;
-					scrobble_pending = true;
-				}
-			}
-		}
-	}
-	pthread_mutex_unlock(&state_mutex);
-
-	if (do_persist) {
-		char session_copy[LASTFM_SESSION_MAX];
-		char username_copy[LASTFM_TEXT_MAX];
-		pthread_mutex_lock(&state_mutex);
-		snprintf(session_copy, sizeof(session_copy), "%s", session_key);
-		snprintf(username_copy, sizeof(username_copy), "%s", username);
-		pthread_mutex_unlock(&state_mutex);
-		config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, session_copy);
-		config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, username_copy);
-		config_save();
-	}
-	if (do_clear) {
-		config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, "");
-		config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, "");
-		config_save();
-	}
-	pthread_mutex_lock(&state_mutex);
-	bool wake = login_pending || now_playing_pending || sync_pending || scrobble_pending;
-	if (wake) {
-		pthread_cond_signal(&state_cond);
-	}
-	pthread_mutex_unlock(&state_mutex);
+    pthread_cond_signal(&state_cond);
+    pthread_mutex_unlock(&state_mutex);
 }
 
 void lastfm_set_enabled(bool value) {
-	pthread_mutex_lock(&state_mutex);
-	enabled = value;
-	config_set_bool(LASTFM_CONFIG_SECTION, CFG_ENABLED, enabled);
-	config_save();
-	if (enabled && session_key[0]) {
-		sync_pending = true;
-		pthread_cond_signal(&state_cond);
-	}
-	pthread_mutex_unlock(&state_mutex);
+    pthread_mutex_lock(&state_mutex);
+    enabled = value;
+    config_set_bool(LASTFM_CONFIG_SECTION, CFG_ENABLED, enabled);
+    config_save();
+    if (enabled && session_key[0]) {
+        pthread_cond_signal(&state_cond);
+    }
+    pthread_mutex_unlock(&state_mutex);
 }
 
-static void set_credential(const char *key_name, char *dst, size_t dst_size, const char *value) {
-	pthread_mutex_lock(&state_mutex);
-	snprintf(dst, dst_size, "%s", value ? value : "");
-	// The API credentials are part of the session identity. Changing either one
-	// invalidates the old session for this application, so force a fresh login.
-	session_key[0] = '\0';
-	username[0] = '\0';
-	logging_in = false;
-	config_set(LASTFM_CONFIG_SECTION, key_name, dst);
-	config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, "");
-	config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, "");
-	config_save();
-	set_message_locked(dst[0] ? "Last.fm credentials updated; please log in again" : "Last.fm credential cleared");
-	pthread_mutex_unlock(&state_mutex);
+static void set_credential_locked(const char *key, char *dst, size_t dst_size, const char *value) {
+    snprintf(dst, dst_size, "%s", value ? value : "");
+
+    /*
+     * The credentials are part of the session identity. Changing either one
+     * invalidates the current session and forces a fresh login.
+     */
+    session_key[0] = '\0';
+    username[0] = '\0';
+    config_set(LASTFM_CONFIG_SECTION, key, dst);
+    config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, "");
+    config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, "");
+    config_save();
+    set_message_locked(dst[0] ? "Last.fm credentials updated; log in again"
+                               : "Last.fm credential cleared");
 }
 
-void lastfm_set_api_key(const char *value) { set_credential(CFG_API_KEY, api_key, sizeof(api_key), value); }
+void lastfm_set_api_key(const char *value) {
+    pthread_mutex_lock(&state_mutex);
+    set_credential_locked(CFG_API_KEY, api_key, sizeof(api_key), value);
+    pthread_cond_signal(&state_cond);
+    pthread_mutex_unlock(&state_mutex);
+}
 
 void lastfm_set_api_secret(const char *value) {
-	set_credential(CFG_API_SECRET, api_secret, sizeof(api_secret), value);
+    pthread_mutex_lock(&state_mutex);
+    set_credential_locked(CFG_API_SECRET, api_secret, sizeof(api_secret), value);
+    pthread_cond_signal(&state_cond);
+    pthread_mutex_unlock(&state_mutex);
 }
 
 void lastfm_login(const char *user, const char *password) {
-	pthread_mutex_lock(&state_mutex);
-	if (!api_key[0] || !api_secret[0]) {
-		set_message_locked("Set the Last.fm API key and API secret first");
-		pthread_mutex_unlock(&state_mutex);
-		return;
-	}
-	if (logging_in || login_pending) {
-		pthread_mutex_unlock(&state_mutex);
-		return;
-	}
-	snprintf(login_username, sizeof(login_username), "%s", user ? user : "");
-	snprintf(login_password, sizeof(login_password), "%s", password ? password : "");
-	logging_in = true;
-	clear_persisted_session = false;
-	login_pending = true;
-	set_message_locked("Logging in to Last.fm...");
-	pthread_cond_signal(&state_cond);
-	pthread_mutex_unlock(&state_mutex);
+    pthread_mutex_lock(&state_mutex);
+    if (!api_key[0] || !api_secret[0]) {
+        set_message_locked("Last.fm: API key and API secret are required");
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
+    if (logging_in || login_pending) {
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
+
+    snprintf(login_username, sizeof(login_username), "%s", user ? user : "");
+    snprintf(login_password, sizeof(login_password), "%s", password ? password : "");
+    logging_in = true;
+    login_pending = true;
+    set_message_locked("Logging in to Last.fm...");
+    pthread_cond_signal(&state_cond);
+    pthread_mutex_unlock(&state_mutex);
 }
 
 void lastfm_logout(void) {
-	pthread_mutex_lock(&state_mutex);
-	session_key[0] = '\0';
-	username[0] = '\0';
-	logging_in = false;
-	login_pending = false;
-	memset(login_password, 0, sizeof(login_password));
-	clear_persisted_session = true;
-	set_message_locked("Logged out of Last.fm");
-	pthread_mutex_unlock(&state_mutex);
-
-	// Persist on the UI/main thread on the next lastfm_poll().
+    pthread_mutex_lock(&state_mutex);
+    session_key[0] = '\0';
+    username[0] = '\0';
+    logging_in = false;
+    login_pending = false;
+    memset(login_password, 0, sizeof(login_password));
+    config_set(LASTFM_CONFIG_SECTION, CFG_SESSION_KEY, "");
+    config_set(LASTFM_CONFIG_SECTION, CFG_USERNAME, "");
+    config_save();
+    set_message_locked("Logged out of Last.fm");
+    pthread_mutex_unlock(&state_mutex);
 }
 
 void lastfm_get_snapshot(lastfm_snapshot_t *out) {
-	if (!out) {
-		return;
-	}
-	memset(out, 0, sizeof(*out));
+    if (!out) return;
 
-	pthread_mutex_lock(&state_mutex);
-	out->enabled = enabled;
-	out->logged_in = session_key[0] != '\0';
-	out->logging_in = logging_in;
-	out->api_key_configured = api_key[0] != '\0';
-	out->api_secret_configured = api_secret[0] != '\0';
-	snprintf(out->username, sizeof(out->username), "%s", username);
-	snprintf(out->last_message, sizeof(out->last_message), "%s", last_message);
-	out->message_serial = message_serial;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&state_mutex);
 
-	if (!enabled) {
-		snprintf(out->status, sizeof(out->status), "Disabled");
-	} else if (!api_key[0] || !api_secret[0]) {
-		snprintf(out->status, sizeof(out->status), "API key and secret required");
-	} else if (logging_in) {
-		snprintf(out->status, sizeof(out->status), "Logging in...");
-	} else if (!session_key[0]) {
-		snprintf(out->status, sizeof(out->status), "Not logged in");
-	} else if (username[0]) {
-		snprintf(out->status, sizeof(out->status), "Connected as %s", username);
-	} else {
-		snprintf(out->status, sizeof(out->status), "Connected");
-	}
-	pthread_mutex_unlock(&state_mutex);
+    out->enabled = enabled;
+    out->logged_in = session_key[0] != '\0';
+    out->logging_in = logging_in;
+    out->api_key_configured = api_key[0] != '\0';
+    out->api_secret_configured = api_secret[0] != '\0';
+    snprintf(out->username, sizeof(out->username), "%s", username);
+    snprintf(out->last_message, sizeof(out->last_message), "%s", last_message);
+    out->message_serial = message_serial;
+
+    if (!enabled) {
+        snprintf(out->status, sizeof(out->status), "Disabled");
+    } else if (!api_key[0] || !api_secret[0]) {
+        snprintf(out->status, sizeof(out->status), "API key and API secret required");
+    } else if (logging_in) {
+        snprintf(out->status, sizeof(out->status), "Logging in...");
+    } else if (!session_key[0]) {
+        snprintf(out->status, sizeof(out->status), "Not logged in");
+    } else {
+        snprintf(out->status, sizeof(out->status), "Connected as %s", username[0] ? username : "Last.fm user");
+    }
+
+    pthread_mutex_unlock(&state_mutex);
 }
