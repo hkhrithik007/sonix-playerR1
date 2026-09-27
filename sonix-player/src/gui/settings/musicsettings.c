@@ -15,6 +15,7 @@
 #include "src/gui/audio/msebsettings.h"
 #include "src/gui/audio/peqpage.h"
 #include "src/gui/nowplaying/coverflow.h"
+#include "src/gui/settings/lastfmsettings.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/library/music.h"
 #include "src/gui/shell/settingsrow.h"
@@ -1487,6 +1488,9 @@ void musicsettings_init(gui_config_t *cfg) {
 
 	build_playback_page(cfg);
 	settingsrow_add(container, "musicsettings_playback_options", NULL, switch_screen_cb, playback_screen);
+
+	lastfmsettings_init(cfg);
+	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());
 
 	build_display_page(cfg);
 	settingsrow_add(container, "musicsettings_display_options", NULL, switch_screen_cb, display_screen);
