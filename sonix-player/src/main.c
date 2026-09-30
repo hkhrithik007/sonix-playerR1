@@ -32,6 +32,7 @@
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/bluetooth/btplayer.h"
 #include "src/system/device/clock.h"
+#include "src/system/device/factoryreset.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/led.h"
@@ -85,14 +86,13 @@ static void host_shot_poll_cb(lv_timer_t *timer) {
 // "Remember track", deferred: restoring the remembered track kicks off a cover
 // decode and an audio open, which must not run while the very first frame is
 // still being put together. It is scheduled a moment after the UI has painted.
-static void restore_track_timer_cb(lv_timer_t *timer) {
-	lv_timer_delete(timer);
-
+// True when a track was put back.
+static bool restore_saved_track(void) {
 	char saved_track[512];
 	double saved_pos = 0;
 	if (!library_playback_state_load(saved_track, sizeof(saved_track), &saved_pos) ||
 		access(saved_track, R_OK) != 0) {
-		return;
+		return false;
 	}
 
 	// The queue is saved next to the track, so a library list or a shuffled
@@ -118,7 +118,7 @@ static void restore_track_timer_cb(lv_timer_t *timer) {
 								 saved_pos);
 			library_queue_free(extra, extra_count);
 			free(extra_slots);
-			return;
+			return true;
 		}
 		library_index_close(ix);
 	}
@@ -133,10 +133,16 @@ static void restore_track_timer_cb(lv_timer_t *timer) {
 	if (queue_count > 0) {
 		player_restore_list((const char *const *)queue, queue_count, queue_index, queue_custom, saved_track, saved_pos);
 		library_queue_free(queue, queue_count);
-		return;
+		return true;
 	}
 
 	player_restore_track(saved_track, saved_pos);
+	return true;
+}
+
+static void restore_track_timer_cb(lv_timer_t *timer) {
+	lv_timer_delete(timer);
+	restore_saved_track();
 }
 
 #ifndef HOST_BUILD
@@ -1715,6 +1721,46 @@ static lv_display_t *init_target_display(void) {
 }
 #endif
 
+#ifndef HOST_BUILD
+// The kernel's real-time throttling: of every sched_rt_period_us, at most
+// sched_rt_runtime_us goes to real-time threads and the rest to everything
+// else. At -1 there is no limit, and one real-time thread that stops blocking
+// holds the single core for good: the interface, the card's I/O and the kernel
+// threads never run again, and the device resets with nothing on the card.
+// Held to nine tenths of the period, so a spin slows the device down instead.
+#define RT_SHARE_TENTHS 9
+
+static long read_proc_long(const char *path) {
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return 0;
+	}
+	long v = 0;
+	if (fscanf(f, "%ld", &v) != 1) {
+		v = 0;
+	}
+	fclose(f);
+	return v;
+}
+
+static void limit_realtime_share(void) {
+	long period = read_proc_long("/proc/sys/kernel/sched_rt_period_us");
+	long runtime = read_proc_long("/proc/sys/kernel/sched_rt_runtime_us");
+	if (period <= 0) {
+		return;
+	}
+	long wanted = period / 10 * RT_SHARE_TENTHS;
+	if (runtime >= 0 && runtime <= wanted) {
+		return;
+	}
+	FILE *f = fopen("/proc/sys/kernel/sched_rt_runtime_us", "w");
+	if (f) {
+		fprintf(f, "%ld", wanted);
+		fclose(f);
+	}
+}
+#endif
+
 int main(int argc, char **argv) {
 	// Before anything at all -- before the signal guards, before the allocator
 	// is tuned, before a display is opened. thttpd runs this same binary as the
@@ -1752,6 +1798,9 @@ int main(int argc, char **argv) {
 	set_oom_priority("-500");
 
 	lock_code_pages();
+
+	// Before the first real-time thread starts.
+	limit_realtime_share();
 #endif
 
 #ifndef HOST_BUILD
@@ -1773,8 +1822,14 @@ int main(int argc, char **argv) {
 	if (!config_file) {
 		config_file = "/usr/data/device_config.ini";
 	}
+	struct stat config_st;
+	bool first_start = stat(config_file, &config_st) != 0;
 #endif
 	config_init(config_file);
+#ifndef HOST_BUILD
+	// Before the card is mounted and before either radio starts.
+	factoryreset_clear_stock_data(first_start);
+#endif
 
 	// The reader's own file, beside the settings. SONIX_EBOOK_CONFIG moves it for
 	// the host build the same way SONIX_CONFIG moves the other one; with neither
@@ -2130,8 +2185,19 @@ int main(int argc, char **argv) {
 	}
 
 	// "Remember track", once the first frames are on screen (see the timer).
+	//
+	// Except with "Show Now Playing at startup" (Music > Display options): then
+	// the first frame is the now-playing page, so the track is put back here,
+	// before it, and the page opened over the home screen without the slide.
+	// The artwork still arrives from its worker a moment later.
 	if (config_get_int("player", "remember_track", 0)) {
-		lv_timer_create(restore_track_timer_cb, 600, NULL);
+		if (config_get_bool("music", "nowplaying_at_boot", false)) {
+			if (restore_saved_track()) {
+				player_sheet_open(false);
+			}
+		} else {
+			lv_timer_create(restore_track_timer_cb, 600, NULL);
+		}
 	}
 
 
