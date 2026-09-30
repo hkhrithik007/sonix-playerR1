@@ -675,4 +675,215 @@ jobs:
           echo "Rootfs image:"
           ls -lh "$ROOTFS_IMAGE"
 
-          
+          # ----------------------------------------------------------
+          # Verify the Sonix Player binary exists in the firmware.
+          # ----------------------------------------------------------
+          echo "Checking Sonix Player binary..."
+
+          unsquashfs -ll "$ROOTFS_IMAGE" \
+            | grep -q 'usr/bin/sonix_player' || {
+              echo "ERROR: usr/bin/sonix_player was not found."
+              exit 1
+            }
+
+          # ----------------------------------------------------------
+          # Verify Last.fm sealed key payload exists.
+          # ----------------------------------------------------------
+          echo "Checking Last.fm sealed key payload..."
+
+          KEYS_SIZE=$(
+            unsquashfs -cat "$ROOTFS_IMAGE" \
+              usr/resource/sonix/components/streaming-keys.bin \
+              | wc -c
+          )
+
+          echo "streaming-keys.bin size: $KEYS_SIZE bytes"
+
+          if [ "$KEYS_SIZE" -le 0 ]; then
+            echo "ERROR: streaming-keys.bin is empty or missing."
+            exit 1
+          fi
+
+          # ----------------------------------------------------------
+          # Verify firmware contains the expected main filesystem.
+          # ----------------------------------------------------------
+          echo "Checking root filesystem contents..."
+
+          unsquashfs -ll "$ROOTFS_IMAGE" \
+            | grep -q 'usr/resource/sonix' || {
+              echo "ERROR: Sonix resource directory was not found."
+              exit 1
+            }
+
+          echo "============================================"
+          echo "CUSTOM R1.UPT VERIFICATION PASSED"
+          echo "============================================"
+
+      # ============================================================
+      # CREATE BUILD INFORMATION
+      # ============================================================
+      - name: Create beta build information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          {
+            echo "HiBy R1 Sonix Player Beta Firmware"
+            echo
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Run number: ${GITHUB_RUN_NUMBER}"
+            echo "Build time: ${BUILD_TIME_IST}"
+            echo
+            echo "Base firmware: Official HiBy R1 v1.6"
+            echo
+            echo "This is a beta build."
+          } > sonix-packer/beta-build-info.txt
+
+          cat sonix-packer/beta-build-info.txt
+
+      # ============================================================
+      # UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload beta firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-beta-${{ github.run_number }}
+          path: |
+            sonix-packer/r1.upt
+            sonix-packer/beta-build-info.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================
+      # PREPARE ROLLING BETA RELEASE
+      # ============================================================
+      - name: Prepare rolling beta release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${LATEST_BETA_RELEASE_TAG}"
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          RELEASE_TITLE="HiBy R1 Beta - ${BUILD_TIME_IST}"
+
+          RELEASE_NOTES=$(
+            cat <<EOF
+          ## HiBy R1 Beta
+
+          **Build time:** ${BUILD_TIME_IST}
+
+          **Commit:** ${GITHUB_SHA}
+
+          **Run:** #${GITHUB_RUN_NUMBER}
+
+          **Base firmware:** Official HiBy R1 v1.6
+
+          This is a rolling beta release. The assets are replaced by the newest successful beta build.
+          EOF
+          )
+
+          echo "Release tag: $TAG"
+          echo "Release title: $RELEASE_TITLE"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Existing beta release found."
+
+            gh release edit "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --prerelease
+
+          else
+            echo "Creating rolling beta release."
+
+            gh release create "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --prerelease
+          fi
+
+      # ============================================================
+      # UPLOAD ROLLING BETA FIRMWARE
+      # ============================================================
+      - name: Upload rolling beta firmware
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${LATEST_BETA_RELEASE_TAG}"
+
+          test -s sonix-packer/r1.upt
+          test -s sonix-packer/beta-build-info.txt
+
+          gh release upload "$TAG" \
+            sonix-packer/r1.upt \
+            sonix-packer/beta-build-info.txt \
+            --clobber
+
+          echo "============================================"
+          echo "BETA RELEASE UPDATED"
+          echo "============================================"
+
+          gh release view "$TAG"
+
+      # ============================================================
+      # FINAL SUMMARY
+      # ============================================================
+      - name: Final build summary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          {
+            echo "## HiBy R1 Beta Firmware"
+            echo
+            echo "### Build successful"
+            echo
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
+            echo "- Build time: \`${BUILD_TIME_IST}\`"
+            echo "- Base firmware: HiBy R1 v1.6"
+            echo "- Release tag: \`${LATEST_BETA_RELEASE_TAG}\`"
+            echo
+            echo "### Firmware"
+            echo
+            echo "\`sonix-packer/r1.upt\`"
+            echo
+            echo "### Verification"
+            echo
+            echo "- UPT archive valid"
+            echo "- ota_v0 present"
+            echo "- ota_update.in present"
+            echo "- Rootfs chunks present"
+            echo "- Sonix Player binary present"
+            echo "- Last.fm sealed key payload present"
+            echo
+            echo "### Result"
+            echo
+            echo "Rolling beta release updated successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Build completed successfully."
