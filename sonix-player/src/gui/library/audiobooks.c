@@ -1006,8 +1006,18 @@ static void finished_cb(lv_event_t *e) {
 // usual scan page.
 static bool upgrade_offered;
 
+// With no books indexed the page says a scan is needed instead of its tiles.
+static lv_obj_t *section_grid;
+static lv_obj_t *section_empty;
+
+static void section_scan_cb(lv_event_t *e) {
+	(void)e;
+	start_scan(NULL);
+}
+
 static void section_loaded_cb(lv_event_t *e) {
 	(void)e;
+	gridpage_show_empty(section_grid, section_empty, !audiobookdb_scan_running() && audiobookdb_count() == 0);
 	if (!upgrade_offered && audiobookdb_needs_rescan()) {
 		upgrade_offered = true;
 		// After this page's own load has finished, not inside it.
@@ -1023,7 +1033,10 @@ static void build_section_page(gui_config_t *cfg) {
 		{"audiobook_continue", &icon_menu_audiobook_continue, NULL, open_continue},
 	};
 	// The Music page's grid of two by three, so the tiles are the same size.
-	gridpage_build(audiobooks_screen, cfg, entries, (int)(sizeof(entries) / sizeof(entries[0])), 2, 3, true);
+	section_grid =
+		gridpage_build(audiobooks_screen, cfg, entries, (int)(sizeof(entries) / sizeof(entries[0])), 2, 3, true);
+	section_empty =
+		gridpage_empty_panel(audiobooks_screen, cfg, &icon_book_headphones, "audiobook_no_database", section_scan_cb);
 
 	// The options, and to their left the finished books.
 	settingsrow_title_corner_slots(settingsrow_title(audiobooks_screen, cfg, "audiobooks"), cfg, 2);
@@ -1415,8 +1428,6 @@ static lv_obj_t *scan_status_label;
 static lv_obj_t *scan_ok_button;
 static lv_obj_t *scan_cancel_button;
 static lv_timer_t *scan_poll_timer;
-// The one folder audiobooks are read from, at the root of the card.
-#define AUDIOBOOK_FOLDER "Audiobooks"
 
 static char scan_root[512];
 
@@ -1515,7 +1526,7 @@ static void build_scan_page(gui_config_t *cfg) {
 	// The folder and not the whole card: see the note in audiobookdb.c. Built
 	// once here so the scan and the line under the button cannot disagree about
 	// where books live.
-	snprintf(scan_root, sizeof(scan_root), "%s/%s", cfg->sd_root_path ? cfg->sd_root_path : "", AUDIOBOOK_FOLDER);
+	snprintf(scan_root, sizeof(scan_root), "%s/%s", cfg->sd_root_path ? cfg->sd_root_path : "", AUDIOBOOKDB_FOLDER);
 
 	lv_obj_add_style(audiobookscan_screen, &theme_style_screen, 0);
 
