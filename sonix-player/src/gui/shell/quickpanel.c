@@ -245,12 +245,8 @@ static void refresh_now_playing_card(void) {
 		const char *slash = strrchr(state.current_file, '/');
 		scrolltext_set(np_title, state.metadata.title[0] ? state.metadata.title
 														 : (slash ? slash + 1 : state.current_file));
-		// Prefer the album artist when the tags carry one: on compilations and
-		// classical albums that is the name the record is filed under, while the
-		// per-track artist changes from row to row. Same rule as the player line
-		// and the screensaver.
-		const char *artist =
-			state.metadata.album_artist[0] ? state.metadata.album_artist : state.metadata.artist;
+		// The same name the player line and the screensaver show.
+		const char *artist = metadata_shown_artist(&state.metadata);
 		scrolltext_set(np_artist, artist);
 	} else {
 		scrolltext_set(np_title, tr("quickpanel_no_track"));
@@ -1429,7 +1425,9 @@ static void sonixlink_clicked_cb(lv_event_t *e) {
 	}
 
 	bool want = !sonixlink_get_enabled();
-	if (want && network_needed("quickpanel_sonixlink_only_works_over_wi_fi")) {
+	// Bluetooth carries it too, for a paired phone: Wi-Fi is needed only when
+	// Bluetooth is off.
+	if (want && !bluetooth_get_enabled() && network_needed("sonixlink_needs_wifi_or_bluetooth")) {
 		return;
 	}
 

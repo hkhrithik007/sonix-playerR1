@@ -99,6 +99,7 @@ struct mp4_file {
 	char title[256];
 	char artist[256];
 	char album_artist[256];
+	bool compilation; // the cpil atom
 	char album[256];
 	char genre[128];
 	int year;
@@ -107,6 +108,8 @@ struct mp4_file {
 	char series[256];	  // ----:SERIES, else the movement name
 	char series_part[32]; // ----:SERIES-PART, else the movement number
 	char *lyrics;		  // the ©lyr atom, malloc'd; NULL when absent
+	char *description;	  // ldes, desc or ©cmt, malloc'd; NULL when absent
+	int description_rank; // which of the three it came from: 3, 2, 1
 
 	uint64_t cover_off;
 	uint32_t cover_size;
@@ -517,6 +520,26 @@ static void copy_text(char *dst, size_t dst_size, const unsigned char *src, size
 	dst[len] = '\0';
 }
 
+// Keeps the text when it outranks what is already held. A summary is capped
+// at 8 KB: the page that shows it has no use for a store page's worth of text.
+static void set_description(mp4_file_t *m, const unsigned char *value, size_t len, int rank) {
+	if (len == 0 || rank <= m->description_rank) {
+		return;
+	}
+	if (len > 8192) {
+		len = 8192;
+	}
+	char *text = malloc(len + 1);
+	if (!text) {
+		return;
+	}
+	memcpy(text, value, len);
+	text[len] = '\0';
+	free(m->description);
+	m->description = text;
+	m->description_rank = rank;
+}
+
 static const char *const GENRES[] = {
 	"Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge", "Hip-Hop", "Jazz", "Metal",
 	"New Age", "Oldies", "Other", "Pop", "R&B", "Rap", "Reggae", "Rock", "Techno", "Industrial",
@@ -630,6 +653,10 @@ static void parse_ilst(mp4_file_t *m, const box_t *ilst) {
 		case FOURCC('a', 'A', 'R', 'T'):
 			copy_text(m->album_artist, sizeof(m->album_artist), value, value_len);
 			break;
+		// A one-byte integer, 1 on a compilation.
+		case FOURCC('c', 'p', 'i', 'l'):
+			m->compilation = value_len >= 1 && value[value_len - 1] != 0;
+			break;
 		case FOURCC(0xA9, 'a', 'l', 'b'):
 			copy_text(m->album, sizeof(m->album), value, value_len);
 			break;
@@ -644,6 +671,17 @@ static void parse_ilst(mp4_file_t *m, const box_t *ilst) {
 					m->lyrics[value_len] = '\0';
 				}
 			}
+			break;
+		// An audiobook's summary. The long description wins over the short one,
+		// which wins over a plain comment.
+		case FOURCC('l', 'd', 'e', 's'):
+			set_description(m, value, value_len, 3);
+			break;
+		case FOURCC('d', 'e', 's', 'c'):
+			set_description(m, value, value_len, 2);
+			break;
+		case FOURCC(0xA9, 'c', 'm', 't'):
+			set_description(m, value, value_len, 1);
 			break;
 		// The movement pair, which audiobook taggers use for the series: a name,
 		// and a 16-bit number.
@@ -1330,6 +1368,7 @@ void mp4_close(mp4_file_t *m) {
 	}
 	free(m->chapters);
 	free(m->lyrics);
+	free(m->description);
 	free(m->size_cache);
 	if (m->fd >= 0) {
 		close(m->fd);
@@ -1556,6 +1595,7 @@ int mp4_chapter_at_time(const mp4_file_t *m, double secs) {
 const char *mp4_tag_title(const mp4_file_t *m) { return m ? m->title : ""; }
 const char *mp4_tag_artist(const mp4_file_t *m) { return m ? m->artist : ""; }
 const char *mp4_tag_album_artist(const mp4_file_t *m) { return m ? m->album_artist : ""; }
+bool mp4_tag_compilation(const mp4_file_t *m) { return m && m->compilation; }
 const char *mp4_tag_album(const mp4_file_t *m) { return m ? m->album : ""; }
 const char *mp4_tag_genre(const mp4_file_t *m) { return m ? m->genre : ""; }
 int mp4_tag_year(const mp4_file_t *m) { return m ? m->year : 0; }
@@ -1564,6 +1604,10 @@ const char *mp4_tag_series(const mp4_file_t *m) { return m ? m->series : ""; }
 
 const char *mp4_tag_series_part(const mp4_file_t *m) { return m ? m->series_part : ""; }
 const char *mp4_tag_lyrics(const mp4_file_t *m) { return m ? m->lyrics : NULL; }
+
+const char *mp4_tag_description(const mp4_file_t *m) { return m ? m->description : NULL; }
+
+int mp4_tag_description_rank(const mp4_file_t *m) { return m ? m->description_rank : 0; }
 
 const char *mp4_tag_freeform(const mp4_file_t *m, const char *name) {
 	if (!m || !name) {

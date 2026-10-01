@@ -20,6 +20,11 @@ void player_play_file(const char *filepath);
 // playback).
 void player_refresh_now_playing(void);
 
+// The "4/12" under the progress bar: the place in the queue as the screen shows
+// it (the deal's order under shuffle) and the length. False, with both zero,
+// where the screen shows nothing -- one track, a book, DLNA, a stream.
+bool player_queue_position(int *position, int *count);
+
 // ---------------------------------------------------------------------------
 // The three arrangements of the now-playing page
 //
@@ -126,11 +131,5 @@ const lv_image_dsc_t *player_backdrop_image(void);
 // clears it.
 void player_set_cover_release_cb(void (*cb)(void));
 
-// The lyrics view (see player.c): whether the playing track can have one (a
-// file on the card), whether it is up, and the menu entry that puts it up or
-// takes it down.
-bool player_lyrics_available(void);
-bool player_lyrics_shown(void);
-void player_lyrics_toggle(void);
 
 #endif
