@@ -14,6 +14,11 @@ typedef struct {
 	int year;		  // 0 if unknown
 	bool has_tags;	  // true if any tag field was found
 
+	// Marked as a compilation: COMPILATION (or ITUNESCOMPILATION) in Vorbis
+	// and APE tags, TCMP or TXXX:COMPILATION in ID3v2, cpil in MP4. Each track
+	// of such a record has its own performer, and that is the name to show.
+	bool compilation;
+
 	// The series a book belongs to and its place in it, for the audiobook
 	// index: SERIES / SERIES-PART and MOVEMENTNAME / MOVEMENT in Vorbis and APE
 	// tags, TXXX:SERIES / TXXX:SERIES-PART, MVNM and MVIN in ID3v2, the same
@@ -48,10 +53,23 @@ typedef struct {
 // into two shelves.
 void metadata_read(const char *filepath, song_metadata_t *out);
 
+// The artist to show for the track: the album's artist when the tags have
+// one, since that is the name the record is filed under -- except on a
+// compilation, where the album is credited to "Various Artists" or the like
+// and the track's own performer says more.
+const char *metadata_shown_artist(const song_metadata_t *m);
+
 // The lyrics the file carries, as text: a Vorbis or APE LYRICS or
 // UNSYNCEDLYRICS field, an ID3v2 USLT frame, an SYLT frame turned into LRC, or
 // an MP4 ©lyr atom. Timed text wins over plain when a file has both. malloc'd,
 // NULL when there are none.
 char *metadata_read_lyrics(const char *filepath);
+
+// metadata_read(), and the description the file carries as plain text, for
+// an audiobook's summary: a Vorbis or APE DESCRIPTION, SUMMARY or COMMENT, an
+// ID3v2 COMM frame or TXXX:DESCRIPTION, an MP4 ldes, desc or comment atom.
+// HTML is reduced to text and the length capped at 8 KB. malloc'd, NULL when
+// the file has none.
+char *metadata_read_with_description(const char *filepath, song_metadata_t *out);
 
 #endif // METADATA_H
