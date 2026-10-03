@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Static)
+name: Build SpotUI for HiBy R1 (R1 Loader Fix)
 
 on:
   push:
@@ -267,9 +267,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v5-static-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v7-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
           restore-keys: |
-            spotui-cargo-v5-static-${{ runner.os }}-
+            spotui-cargo-v7-r1-loader-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -321,9 +321,7 @@ jobs:
       # example that references serde_json fails with E0433 unless
       # the dependency is explicitly added.
       #
-      # This addresses the exact serde_json failure shown in the previous run.
-      # The build also forces static CRT linkage because the R1 does not
-      # provide /lib/ld-musl-mipsel.so.1.
+      # This is the exact failure shown in the previous run.
       # ============================================================
       - name: Add daemon serde_json dependency
         shell: bash
@@ -412,29 +410,155 @@ jobs:
 
       # ============================================================
       # CONFIGURE CARGO MIPS LINKER
+      #
+      # The downloaded musl GCC archive is relocatable. After it is
+      # extracted into the GitHub Actions workspace, GCC may not find
+      # its target CRT/sysroot files automatically.
+      #
+      # The previous build failed with:
+      #   cannot find crt1.o
+      #   cannot find crti.o
+      #   cannot find crtbegin.o
+      #   cannot find crtend.o
+      #
+      # We explicitly locate those files and create a GCC wrapper
+      # supplying --sysroot, -B and -L paths.
+      #
+      # IMPORTANT:
+      # We keep the daemon dynamically linked because this is the
+      # build mode used by the working SpotUI repository. The R1
+      # musl loader is bundled separately below.
       # ============================================================
-      - name: Configure MIPS Cargo linker
+      - name: Configure MIPS musl linker
         shell: bash
         run: |
           set -euo pipefail
 
-          LINKER="$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc"
+          TOOLCHAIN="$MIPSEL_TOOLCHAIN_DIR"
+          REAL_GCC="$TOOLCHAIN/bin/mipsel-linux-musl-gcc"
+
+          test -x "$REAL_GCC"
+
+          CRT1="$(find "$TOOLCHAIN" -type f -name 'crt1.o' -print -quit)"
+          CRTBEGIN="$(find "$TOOLCHAIN" -type f -name 'crtbegin.o' -print -quit)"
+          LOADER="$(find "$TOOLCHAIN" -type f -name 'ld-musl-mipsel.so.1' -print -quit)"
+
+          test -n "$CRT1" || {
+            echo "ERROR: crt1.o was not found in toolchain."
+            exit 1
+          }
+
+          test -n "$CRTBEGIN" || {
+            echo "ERROR: crtbegin.o was not found in toolchain."
+            exit 1
+          }
+
+          test -n "$LOADER" || {
+            echo "ERROR: ld-musl-mipsel.so.1 was not found in toolchain."
+            exit 1
+          }
+
+          SYSROOT_LIB="$(dirname "$CRT1")"
+          SYSROOT="$(dirname "$SYSROOT_LIB")"
+          GCC_LIB="$(dirname "$CRTBEGIN")"
+
+          echo "Real GCC      : $REAL_GCC"
+          echo "Sysroot       : $SYSROOT"
+          echo "Sysroot lib   : $SYSROOT_LIB"
+          echo "GCC runtime   : $GCC_LIB"
+          echo "Musl loader   : $LOADER"
+
+          for f in \
+            "$SYSROOT_LIB/crt1.o" \
+            "$SYSROOT_LIB/crti.o" \
+            "$SYSROOT_LIB/crtn.o" \
+            "$GCC_LIB/crtbegin.o" \
+            "$GCC_LIB/crtend.o"
+          do
+            test -f "$f" || {
+              echo "ERROR: required CRT object is missing: $f"
+              exit 1
+            }
+          done
+
+          # Create a relocatable-toolchain-safe linker wrapper.
+          LINKER_WRAPPER="$RUNNER_TEMP/mipsel-linux-musl-gcc-r1"
+
+          cat > "$LINKER_WRAPPER" <<EOF
+          #!/bin/sh
+          exec "$REAL_GCC" \
+            --sysroot="$SYSROOT" \
+            -B"$GCC_LIB/" \
+            -L"$SYSROOT_LIB" \
+            -L"$GCC_LIB" \
+            "\$@"
+          EOF
+
+          chmod 0755 "$LINKER_WRAPPER"
+
+          echo "LINKER_WRAPPER=$LINKER_WRAPPER" >> "$GITHUB_ENV"
+          echo "MUSL_SYSROOT=$SYSROOT" >> "$GITHUB_ENV"
+          echo "MUSL_SYSROOT_LIB=$SYSROOT_LIB" >> "$GITHUB_ENV"
+          echo "MUSL_GCC_LIB=$GCC_LIB" >> "$GITHUB_ENV"
+          echo "MUSL_LOADER=$LOADER" >> "$GITHUB_ENV"
 
           mkdir -p "$LIBRESPOT_ROOT/.cargo"
           mkdir -p "$SPOTUI_ROOT/engine/ui/.cargo"
 
           cat > "$LIBRESPOT_ROOT/.cargo/config.toml" <<EOF
           [target.mipsel-unknown-linux-musl]
-          linker = "$LINKER"
+          linker = "$LINKER_WRAPPER"
           EOF
 
           cat > "$SPOTUI_ROOT/engine/ui/.cargo/config.toml" <<EOF
           [target.mipsel-unknown-linux-musl]
-          linker = "$LINKER"
+          linker = "$LINKER_WRAPPER"
           EOF
 
+          echo
           echo "librespot Cargo config:"
           cat "$LIBRESPOT_ROOT/.cargo/config.toml"
+
+      # ============================================================
+      # VERIFY MIPS LINKER SEARCH PATHS
+      # ============================================================
+      - name: Verify MIPS linker paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Testing compiler wrapper:"
+          "$LINKER_WRAPPER" --version | head -n 1
+
+          echo
+          echo "crt1.o:"
+          "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" \
+            --sysroot="$MUSL_SYSROOT" \
+            -B"$MUSL_GCC_LIB/" \
+            -print-file-name=crt1.o
+
+          echo
+          echo "crtbegin.o:"
+          "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" \
+            --sysroot="$MUSL_SYSROOT" \
+            -B"$MUSL_GCC_LIB/" \
+            -print-file-name=crtbegin.o
+
+          echo
+          echo "crtend.o:"
+          "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" \
+            --sysroot="$MUSL_SYSROOT" \
+            -B"$MUSL_GCC_LIB/" \
+            -print-file-name=crtend.o
+
+          test -f "$MUSL_SYSROOT_LIB/crt1.o"
+          test -f "$MUSL_SYSROOT_LIB/crti.o"
+          test -f "$MUSL_SYSROOT_LIB/crtn.o"
+          test -f "$MUSL_GCC_LIB/crtbegin.o"
+          test -f "$MUSL_GCC_LIB/crtend.o"
+
+          echo
+          echo "MIPS linker/sysroot verification passed."
 
       # ============================================================
       # BUILD SPOTUI DAEMON
@@ -455,7 +579,7 @@ jobs:
           set +e
 
           env \
-            RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static -C strip=symbols' \
+            RUSTFLAGS='-C strip=symbols' \
             CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$DAEMON_TARGET_DIR" \
             cargo +nightly build \
@@ -509,30 +633,85 @@ jobs:
           sha256sum "$DAEMON"
 
           echo
-          echo "ELF program headers:"
-          readelf -l "$DAEMON"
+          echo "ELF program interpreter:"
+          readelf -l "$DAEMON" | grep -E 'Requesting program interpreter|INTERP' || true
+
+      # ============================================================
+      # PACKAGE R1 MUSL RUNTIME
+      #
+      # mipsel-unknown-linux-musl produces a dynamic binary on this
+      # target. The R1 does not provide /lib/ld-musl-mipsel.so.1, which
+      # is why the manually pushed binary previously returned:
+      #   not found
+      #
+      # We therefore bundle the matching loader in /usr/data and make
+      # the autorun script invoke it explicitly.
+      # ============================================================
+      - name: Prepare R1 musl runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
+          RUNTIME_DIR="$RUNNER_TEMP/spotui-runtime"
+
+          test -s "$DAEMON"
+          test -s "$MUSL_LOADER"
+
+          rm -rf "$RUNTIME_DIR"
+          mkdir -p "$RUNTIME_DIR"
+
+          cp -Lf "$MUSL_LOADER" \
+            "$RUNTIME_DIR/ld-musl-mipsel.so.1"
+
+          # Record any explicitly required shared libraries.
+          readelf -d "$DAEMON" \
+            | awk '$2 == "(NEEDED)" {
+                gsub("\\[|\\]", "", $5);
+                print $5
+              }' \
+            | sort -u \
+            > "$RUNNER_TEMP/spotui-needed.txt"
+
+          cat "$RUNNER_TEMP/spotui-needed.txt" || true
+
+          while IFS= read -r LIB; do
+            [ -n "$LIB" ] || continue
+
+            case "$LIB" in
+              libc.so|ld-musl-mipsel.so.1)
+                continue
+                ;;
+            esac
+
+            FOUND="$(
+              find "$MIPSEL_TOOLCHAIN_DIR" \
+                -type f \
+                -name "$LIB" \
+                -print \
+                -quit
+            )"
+
+            test -n "$FOUND" || {
+              echo "ERROR: runtime library not found in toolchain: $LIB"
+              exit 1
+            }
+
+            cp -Lf "$FOUND" "$RUNTIME_DIR/$LIB"
+          done < "$RUNNER_TEMP/spotui-needed.txt"
+
+          chmod 0755 "$RUNTIME_DIR/ld-musl-mipsel.so.1"
+          chmod 0644 "$RUNTIME_DIR"/*.so* 2>/dev/null || true
+          chmod 0755 "$RUNTIME_DIR/ld-musl-mipsel.so.1"
+
+          echo "Runtime contents:"
+          ls -lah "$RUNTIME_DIR"
 
           echo
-          echo "Checking for dynamic ELF interpreter..."
-          if readelf -l "$DAEMON" | grep -q 'INTERP'; then
-            echo "ERROR: spotui_daemon is still dynamically linked."
-            echo "The HiBy R1 does not provide /lib/ld-musl-mipsel.so.1."
-            exit 1
-          fi
+          echo "Runtime SHA256:"
+          sha256sum "$RUNTIME_DIR"/*
 
-          if file "$DAEMON" | grep -qi 'statically linked'; then
-            echo "OK: spotui_daemon is statically linked."
-          else
-            echo "ERROR: spotui_daemon was not reported as statically linked."
-            file "$DAEMON"
-            exit 1
-          fi
-
-          file "$DAEMON" | grep -Eqi 'MIPS.*MIPS32 rel2' || {
-            echo "ERROR: unexpected SpotUI daemon architecture."
-            file "$DAEMON"
-            exit 1
-          }
+          echo "SPOTUI_RUNTIME_DIR=$RUNTIME_DIR" >> "$GITHUB_ENV"
 
       # ============================================================
       # BUILD ORIGINAL SPOTUI UI
@@ -553,7 +732,6 @@ jobs:
           set +e
 
           env \
-            RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static -C strip=symbols' \
             CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$UI_TARGET_DIR" \
             cargo +nightly build \
@@ -588,25 +766,6 @@ jobs:
           echo "SHA256:"
           sha256sum "$UI"
 
-          echo
-          echo "ELF program headers:"
-          readelf -l "$UI"
-
-          echo
-          echo "Checking UI for dynamic ELF interpreter..."
-          if readelf -l "$UI" | grep -q 'INTERP'; then
-            echo "ERROR: spotui-ui-poc is still dynamically linked."
-            exit 1
-          fi
-
-          if file "$UI" | grep -qi 'statically linked'; then
-            echo "OK: spotui-ui-poc is statically linked."
-          else
-            echo "ERROR: spotui-ui-poc was not reported as statically linked."
-            file "$UI"
-            exit 1
-          fi
-
       # ============================================================
       # SAVE CARGO CACHE
       # ============================================================
@@ -632,6 +791,7 @@ jobs:
 
           mkdir -p \
             dist/usr/data \
+            dist/usr/data/spotui-runtime \
             dist/usr/bin \
             dist/etc/init.d
 
@@ -640,10 +800,15 @@ jobs:
 
           cp -f "$DAEMON" dist/usr/data/spotui_daemon
           cp -f "$UI" dist/usr/data/spotui-ui-poc
+          cp -Lf "$SPOTUI_RUNTIME_DIR"/* dist/usr/data/spotui-runtime/
 
           chmod 0755 \
             dist/usr/data/spotui_daemon \
-            dist/usr/data/spotui-ui-poc
+            dist/usr/data/spotui-ui-poc \
+            dist/usr/data/spotui-runtime/ld-musl-mipsel.so.1
+
+          chmod 0644 dist/usr/data/spotui-runtime/*.so* 2>/dev/null || true
+          chmod 0755 dist/usr/data/spotui-runtime/ld-musl-mipsel.so.1
 
           # ========================================================
           # Spotify daemon autorun
@@ -684,7 +849,17 @@ jobs:
           echo "[spotui-autostart] starting spotui_daemon" >> "$LOG"
           echo "[spotui-autostart] $(date)" >> "$LOG"
 
-          nohup "$DAEMON" >> "$LOG" 2>&1 &
+          LOADER="/usr/data/spotui-runtime/ld-musl-mipsel.so.1"
+          RUNTIME="/usr/data/spotui-runtime"
+
+          if [ ! -x "$LOADER" ]; then
+              echo "[spotui-autostart] musl loader missing; skipping start." >> "$LOG"
+              exit 0
+          fi
+
+          nohup "$LOADER" \
+              --library-path "$RUNTIME" \
+              "$DAEMON" >> "$LOG" 2>&1 &
 
           exit 0
           EOF
@@ -741,6 +916,10 @@ jobs:
 
           test -x dist/usr/bin/spotui_daemon_autostart.sh
           test -x dist/etc/init.d/S91_spotui_daemon
+          test -x dist/usr/data/spotui-runtime/ld-musl-mipsel.so.1
+
+          echo "Bundled R1 musl runtime:"
+          ls -lah dist/usr/data/spotui-runtime
 
           echo "Daemon:"
           file dist/usr/data/spotui_daemon
@@ -804,8 +983,9 @@ jobs:
             echo "  /etc/init.d/S91_spotui_daemon"
             echo
             echo "serde_json dependency: explicitly added for SpotUI daemon."
-            echo "Linkage: statically linked; no musl interpreter required."
             echo "Credentials are provisioned separately."
+            echo "R1 musl runtime loader: bundled under /usr/data/spotui-runtime/."
+            echo "Daemon is started through the bundled musl loader."
           } > dist/build-info.txt
 
           cat dist/build-info.txt
@@ -820,6 +1000,7 @@ jobs:
           path: |
             dist/usr/data/spotui_daemon
             dist/usr/data/spotui-ui-poc
+            dist/usr/data/spotui-runtime/*
             dist/usr/bin/spotui_daemon_autostart.sh
             dist/etc/init.d/S91_spotui_daemon
             dist/SHA256SUMS
@@ -910,6 +1091,7 @@ jobs:
           gh release upload "$TAG" \
             dist/usr/data/spotui_daemon \
             dist/usr/data/spotui-ui-poc \
+            dist/usr/data/spotui-runtime/* \
             dist/usr/bin/spotui_daemon_autostart.sh \
             dist/etc/init.d/S91_spotui_daemon \
             dist/SHA256SUMS \
@@ -952,9 +1134,9 @@ jobs:
             echo "- MIPS toolchain downloaded from GitHub instead of stalled musl.cc endpoint"
             echo "- SpotUI source auto-resolved"
             echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
-            echo "- spotui_daemon and spotui-ui-poc forced to static CRT linkage"
-            echo "- ELF interpreter check added; dynamic binaries fail the workflow"
             echo "- Spotify daemon autorun included"
+            echo "- MIPS sysroot/GCC CRT search paths explicitly configured"
+            echo "- R1 musl loader bundled and invoked explicitly"
             echo
             echo "### Artifacts"
             echo
