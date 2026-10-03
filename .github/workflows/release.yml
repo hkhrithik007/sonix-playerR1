@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Guaranteed R1 UI Patch v4) (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
+name: Build SpotUI for HiBy R1 (Robust R1 UI Patch) (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
 
 on:
   push:
@@ -28,7 +28,7 @@ env:
   # Canonical working SpotUI source.
   SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
   SPOTUI_REF: main
-  R1_UI_PATCH_VERSION: v4-guaranteed-no-wlan0-startup
+  R1_UI_PATCH_VERSION: v5-robust-no-wlan0-startup
 
   # ============================================================
   # Build/cache locations
@@ -134,18 +134,16 @@ jobs:
           git -C "$SPOTUI_ROOT" rev-parse HEAD
 
       # ============================================================
-      # APPLY GUARANTEED HiBy R1 UI PATCH
+      # APPLY ROBUST HiBy R1 UI PATCH
       #
-      # The CI checkout may be a Sonix repository, so the workflow
-      # clones spotui-hiby-r1/main itself. That upstream UI still has
-      # an R3/R3PII-specific wlan0 startup state. Apply the R1 patch
-      # in CI immediately before the UI is compiled.
+      # Do not use a fragile full-text regex for this source. Upstream
+      # main.rs has changed over time. Instead, locate the named Rust
+      # blocks/functions and edit only the relevant statements.
       #
-      # This patcher is intentionally regex-based and verifies every
-      # transformation. The build fails rather than silently compiling
-      # an unpatched UI.
+      # The build MUST fail if any R3/R3PII wlan0 startup recovery
+      # remains, so we never silently publish the old UI again.
       # ============================================================
-      - name: Apply guaranteed HiBy R1 UI patch
+      - name: Apply robust HiBy R1 UI patch
         shell: bash
         run: |
           set -euo pipefail
@@ -163,52 +161,131 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text(encoding="utf-8")
 
-          def sub_once(pattern: str, replacement: str, label: str) -> None:
-              global text
-              text2, count = re.subn(pattern, replacement, text, count=1)
-              if count != 1:
+          def find_block(text: str, start_marker: str) -> tuple[int, int]:
+              start = text.find(start_marker)
+              if start < 0:
                   raise SystemExit(
-                      f"ERROR: {label}: expected 1 match, found {count}"
+                      f"ERROR: block start not found: {start_marker!r}"
                   )
-              text = text2
 
-          # StartupStage: remove Wi-Fi as a UI state.
-          sub_once(
-              r"(?m)^(\s*)Wifi,\s*$",
+              brace = text.find("{", start)
+              if brace < 0:
+                  raise SystemExit(
+                      f"ERROR: opening brace not found after: {start_marker!r}"
+                  )
+
+              depth = 0
+              in_string = False
+              escaped = False
+              in_line_comment = False
+              in_block_comment = False
+              i = brace
+
+              while i < len(text):
+                  c = text[i]
+                  n = text[i + 1] if i + 1 < len(text) else ""
+
+                  if in_line_comment:
+                      if c == "\n":
+                          in_line_comment = False
+                      i += 1
+                      continue
+
+                  if in_block_comment:
+                      if c == "*" and n == "/":
+                          in_block_comment = False
+                          i += 2
+                          continue
+                      i += 1
+                      continue
+
+                  if in_string:
+                      if escaped:
+                          escaped = False
+                      elif c == "\\":
+                          escaped = True
+                      elif c == '"':
+                          in_string = False
+                      i += 1
+                      continue
+
+                  if c == "/" and n == "/":
+                      in_line_comment = True
+                      i += 2
+                      continue
+
+                  if c == "/" and n == "*":
+                      in_block_comment = True
+                      i += 2
+                      continue
+
+                  if c == '"':
+                      in_string = True
+                      i += 1
+                      continue
+
+                  if c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return start, i + 1
+
+                  i += 1
+
+              raise SystemExit(
+                  f"ERROR: unterminated block: {start_marker!r}"
+              )
+
+          def replace_block(text: str, marker: str, replacement: str) -> str:
+              start, end = find_block(text, marker)
+              return text[:start] + replacement + text[end:]
+
+          # ----------------------------------------------------------
+          # 1. StartupStage: remove Wifi entry if it exists.
+          # ----------------------------------------------------------
+          enum_marker = "enum StartupStage"
+          enum_start, enum_end = find_block(text, enum_marker)
+          enum_block = text[enum_start:enum_end]
+
+          enum_block_new = re.sub(
+              r"(?m)^[ \t]*Wifi,[ \t]*\r?\n",
               "",
-              "StartupStage Wifi entry",
+              enum_block,
           )
 
-          # Remove Wi-Fi-specific labels/width.
-          sub_once(
-              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Starting Wi-Fi",[ \t]*\r?\n',
-              "",
-              "Starting Wi-Fi label",
-          )
+          text = text[:enum_start] + enum_block_new + text[enum_end:]
 
-          sub_once(
-              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Preparing the network connection",[ \t]*\r?\n',
-              "",
-              "Wi-Fi detail label",
-          )
+          # ----------------------------------------------------------
+          # 2. Remove every Wi-Fi-specific UI arm. If a newer source
+          #    already removed one, there is nothing to do.
+          # ----------------------------------------------------------
+          def remove_line_containing(line_text: str, needle: str) -> str:
+              lines = line_text.splitlines(keepends=True)
+              return "".join(
+                  line for line in lines
+                  if needle not in line
+              )
 
-          sub_once(
-              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*120,[ \t]*\r?\n',
-              "",
-              "Wi-Fi progress width",
-          )
+          start, end = find_block(text, "impl StartupStage")
+          impl = text[start:end]
+          for token in (
+              "Self::Wifi => \"Starting Wi-Fi\"",
+              "Self::Wifi => \"Preparing the network connection\"",
+              "Self::Wifi => 120",
+              "Self::Wifi => \"Retry Wi-Fi\"",
+          ):
+              impl = remove_line_containing(impl, token)
+          text = text[:start] + impl + text[end:]
 
-          sub_once(
-              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Retry Wi-Fi",[ \t]*\r?\n',
-              "",
-              "Wi-Fi retry label",
-          )
+          # ----------------------------------------------------------
+          # 3. Replace the complete Wi-Fi route helper with a generic
+          #    default-route diagnostic.
+          # ----------------------------------------------------------
+          route_marker = "fn wifi_has_default_route"
+          route_start, route_end = find_block(text, route_marker)
 
-          # Replace the complete route helper with an interface-agnostic
-          # version. It is diagnostic only; startup no longer uses it.
-          sub_once(
-              r"(?ms)^fn[ \t]+wifi_has_default_route\(\)[ \t]*->[ \t]*bool[ \t]*\{.*?^}\r?\n",
-              """fn wifi_has_default_route() -> bool {
+          route_replacement = """fn wifi_has_default_route() -> bool {
               std::fs::read_to_string("/proc/net/route")
                   .ok()
                   .map(|routes| {
@@ -219,71 +296,123 @@ jobs:
                       })
                   })
                   .unwrap_or(false)
-          }
-          """,
-              "Wi-Fi route helper",
-          )
+          }"""
 
-          # Remove the complete R3/R3PII Wi-Fi recovery function while
-          # keeping the following process-running function intact.
-          sub_once(
-              r"(?ms)^fn[ \t]+request_startup_recovery\(stage:[ \t]*StartupStage\)[ \t]*\{.*?^}\r?\n(?=/// Check whether a named process)",
-              """fn request_startup_recovery(stage: StartupStage) {
+          text = text[:route_start] + route_replacement + text[route_end:]
+
+          # ----------------------------------------------------------
+          # 4. Replace startup recovery. The R1 UI must never run
+          #    wpa_cli/udhcpc or manipulate wlan0.
+          # ----------------------------------------------------------
+          recovery_marker = "fn request_startup_recovery"
+          recovery_start, recovery_end = find_block(text, recovery_marker)
+
+          recovery_replacement = """fn request_startup_recovery(stage: StartupStage) {
               eprintln!("[poc] startup retry requested -> {:?}", stage);
-          }
-          """,
-              "Wi-Fi recovery function",
+          }"""
+
+          text = (
+              text[:recovery_start]
+              + recovery_replacement
+              + text[recovery_end:]
           )
 
-          # Startup readiness comes from the daemon.
-          sub_once(
-              r"(?ms)    let mut startup_stage[ \t]*=[ \t]*if tracks_loaded[ \t]*\{.*?^    \};",
-              """    let mut startup_stage = if tracks_loaded {
+          # ----------------------------------------------------------
+          # 5. Replace initial startup_stage assignment by locating
+          #    the statement, not relying on a line-exact match.
+          # ----------------------------------------------------------
+          marker = "let mut startup_stage"
+          pos = text.find(marker)
+          if pos < 0:
+              raise SystemExit("ERROR: startup_stage declaration not found")
+
+          # Find the first semicolon at brace depth 0 after the declaration.
+          brace_depth = 0
+          semi = None
+          for i in range(pos, len(text)):
+              c = text[i]
+              if c == "{":
+                  brace_depth += 1
+              elif c == "}":
+                  brace_depth -= 1
+              elif c == ";" and brace_depth == 0:
+                  semi = i + 1
+                  break
+
+          if semi is None:
+              raise SystemExit("ERROR: startup_stage statement not terminated")
+
+          startup_replacement = """let mut startup_stage = if tracks_loaded {
               None
           } else {
               match daemon_playback_state() {
                   Some(_) => Some(StartupStage::Library),
                   None => Some(StartupStage::Spotify),
               }
-          };""",
-              "initial startup stage",
-          )
+          };"""
 
-          # Retry readiness comes from the daemon.
-          sub_once(
-              r"(?ms)            let updated_stage[ \t]*=[ \t]*if !wifi_has_default_route\(\)[ \t]*\{.*?^            \};",
-              """            let updated_stage = match daemon_playback_state() {
+          text = text[:pos] + startup_replacement + text[semi:]
+
+          # ----------------------------------------------------------
+          # 6. Replace the updated_stage statement similarly.
+          # ----------------------------------------------------------
+          marker = "let updated_stage"
+          pos = text.find(marker)
+          if pos < 0:
+              raise SystemExit("ERROR: updated_stage declaration not found")
+
+          brace_depth = 0
+          semi = None
+          for i in range(pos, len(text)):
+              c = text[i]
+              if c == "{":
+                  brace_depth += 1
+              elif c == "}":
+                  brace_depth -= 1
+              elif c == ";" and brace_depth == 0:
+                  semi = i + 1
+                  break
+
+          if semi is None:
+              raise SystemExit("ERROR: updated_stage statement not terminated")
+
+          retry_replacement = """let updated_stage = match daemon_playback_state() {
                   Some(_) => StartupStage::Library,
                   None => StartupStage::Spotify,
-              };""",
-              "startup retry stage",
-          )
+              };"""
+
+          text = text[:pos] + retry_replacement + text[semi:]
 
           path.write_text(text, encoding="utf-8")
-          print(f"Patched {path}")
+          print(f"Patched: {path}")
           PY
 
           echo
-          echo "===== VERIFY PATCHED SOURCE ====="
+          echo "===== FINAL R1 UI SOURCE CHECK ====="
 
+          UI_SOURCE="$SPOTUI_ROOT/engine/ui/src/main.rs"
+
+          # Anything below means the patch was not fully applied.
           if grep -nE \
-            'StartupStage::Wifi|Self::Wifi|Starting Wi-Fi|wpa_cli|hostname:HiBy-R3PROII' \
+            'StartupStage::Wifi|Self::Wifi|Starting Wi-Fi|Retry Wi-Fi|wpa_cli|udhcpc|hostname:HiBy-R3PROII' \
             "$UI_SOURCE"
           then
             echo
-            echo "ERROR: R1-incompatible Wi-Fi startup code remains."
+            echo "ERROR: R1-incompatible Wi-Fi startup/recovery code remains."
             exit 1
           fi
 
           grep -q 'enum StartupStage' "$UI_SOURCE"
           grep -q 'daemon_playback_state()' "$UI_SOURCE"
+          grep -q 'let mut startup_stage' "$UI_SOURCE"
+          grep -q 'let updated_stage' "$UI_SOURCE"
 
           echo
           echo "Patched UI source SHA256:"
           sha256sum "$UI_SOURCE"
 
           echo
-          echo "HiBy R1 UI patch verification passed."
+          echo "R1 UI patch verification PASSED."
 
       # ============================================================
       # VERIFY PROJECT STRUCTURE
@@ -1068,18 +1197,20 @@ jobs:
 
           cd "$SPOTUI_ROOT/engine/ui"
 
-          echo "Final UI source verification:"
+          echo "Final R1 UI source verification:"
           ! grep -q 'StartupStage::Wifi' src/main.rs
           ! grep -q 'Self::Wifi' src/main.rs
           ! grep -q 'Starting Wi-Fi' src/main.rs
+          ! grep -q 'Retry Wi-Fi' src/main.rs
           ! grep -q 'wpa_cli' src/main.rs
+          ! grep -q 'udhcpc' src/main.rs
           ! grep -q 'hostname:HiBy-R3PROII' src/main.rs
 
-          echo "UI source SHA256:"
+          echo "Patched UI source SHA256:"
           sha256sum src/main.rs
 
-          # Prevent an old cached executable from being accepted as the
-          # result of this build.
+          # Never allow an old POC executable to masquerade as the result
+          # of the patched source build.
           rm -f             "$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc"             "$UI_TARGET_DIR/$RUST_TARGET/release/deps/spotui_ui_poc-"*             2>/dev/null || true
 
           set +e
