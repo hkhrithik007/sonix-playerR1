@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: spotui-hiby-r1-${{ github.ref }}
@@ -21,6 +21,9 @@ env:
   # ============================================================
   RUST_TARGET: mipsel-unknown-linux-musl
   LIBRESPOT_VERSION: v0.8.0
+
+  # Rolling GitHub Release used for the latest successful SpotUI build.
+  SPOTUI_RELEASE_TAG: spotui
 
   # Canonical working SpotUI source.
   SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
@@ -774,6 +777,101 @@ jobs:
             dist/build-info.txt
           if-no-files-found: error
           retention-days: 30
+
+      # ============================================================
+      # PREPARE / UPDATE ROLLING SPOTUI RELEASE
+      # ============================================================
+      - name: Prepare SpotUI release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${SPOTUI_RELEASE_TAG}"
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          RELEASE_TITLE="SpotUI HiBy R1 - ${BUILD_TIME_IST}"
+
+          RELEASE_NOTES=$(
+            cat <<EOF
+          ## SpotUI HiBy R1
+
+          **Build time:** ${BUILD_TIME_IST}
+
+          **Commit:** ${GITHUB_SHA}
+
+          **Run:** #${GITHUB_RUN_NUMBER}
+
+          **Branch:** ${GITHUB_REF_NAME}
+
+          **Target:** ${RUST_TARGET}
+
+          **librespot:** ${LIBRESPOT_VERSION}
+
+          This is the rolling SpotUI release. Assets are replaced by
+          the newest successful build.
+
+          Credentials are provisioned separately.
+          EOF
+          )
+
+          echo "Release tag: $TAG"
+          echo "Release title: $RELEASE_TITLE"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Existing SpotUI release found."
+
+            gh release edit "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --prerelease
+          else
+            echo "Creating SpotUI release."
+
+            gh release create "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --prerelease
+          fi
+
+      # ============================================================
+      # UPLOAD / REPLACE ROLLING SPOTUI RELEASE ASSETS
+      # ============================================================
+      - name: Upload SpotUI release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${SPOTUI_RELEASE_TAG}"
+
+          test -s dist/usr/data/spotui_daemon
+          test -s dist/usr/data/spotui-ui-poc
+          test -s dist/usr/bin/spotui_daemon_autostart.sh
+          test -s dist/etc/init.d/S91_spotui_daemon
+          test -s dist/SHA256SUMS
+          test -s dist/build-info.txt
+
+          gh release upload "$TAG" \
+            dist/usr/data/spotui_daemon \
+            dist/usr/data/spotui-ui-poc \
+            dist/usr/bin/spotui_daemon_autostart.sh \
+            dist/etc/init.d/S91_spotui_daemon \
+            dist/SHA256SUMS \
+            dist/build-info.txt \
+            --clobber
+
+          echo "============================================"
+          echo "SPOTUI RELEASE UPDATED"
+          echo "============================================"
+
+          gh release view "$TAG"
 
       # ============================================================
       # FINAL SUMMARY
