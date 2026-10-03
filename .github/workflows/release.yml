@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1
+name: Build SpotUI for HiBy R1 (Static)
 
 on:
   push:
@@ -267,9 +267,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v4-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v5-static-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
           restore-keys: |
-            spotui-cargo-v4-${{ runner.os }}-
+            spotui-cargo-v5-static-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -321,7 +321,9 @@ jobs:
       # example that references serde_json fails with E0433 unless
       # the dependency is explicitly added.
       #
-      # This is the exact failure shown in the previous run.
+      # This addresses the exact serde_json failure shown in the previous run.
+      # The build also forces static CRT linkage because the R1 does not
+      # provide /lib/ld-musl-mipsel.so.1.
       # ============================================================
       - name: Add daemon serde_json dependency
         shell: bash
@@ -453,7 +455,7 @@ jobs:
           set +e
 
           env \
-            RUSTFLAGS='-C strip=symbols' \
+            RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static -C strip=symbols' \
             CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$DAEMON_TARGET_DIR" \
             cargo +nightly build \
@@ -506,6 +508,32 @@ jobs:
           echo "SHA256:"
           sha256sum "$DAEMON"
 
+          echo
+          echo "ELF program headers:"
+          readelf -l "$DAEMON"
+
+          echo
+          echo "Checking for dynamic ELF interpreter..."
+          if readelf -l "$DAEMON" | grep -q 'INTERP'; then
+            echo "ERROR: spotui_daemon is still dynamically linked."
+            echo "The HiBy R1 does not provide /lib/ld-musl-mipsel.so.1."
+            exit 1
+          fi
+
+          if file "$DAEMON" | grep -qi 'statically linked'; then
+            echo "OK: spotui_daemon is statically linked."
+          else
+            echo "ERROR: spotui_daemon was not reported as statically linked."
+            file "$DAEMON"
+            exit 1
+          fi
+
+          file "$DAEMON" | grep -Eqi 'MIPS.*MIPS32 rel2' || {
+            echo "ERROR: unexpected SpotUI daemon architecture."
+            file "$DAEMON"
+            exit 1
+          }
+
       # ============================================================
       # BUILD ORIGINAL SPOTUI UI
       # ============================================================
@@ -525,6 +553,7 @@ jobs:
           set +e
 
           env \
+            RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static -C strip=symbols' \
             CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$UI_TARGET_DIR" \
             cargo +nightly build \
@@ -558,6 +587,25 @@ jobs:
 
           echo "SHA256:"
           sha256sum "$UI"
+
+          echo
+          echo "ELF program headers:"
+          readelf -l "$UI"
+
+          echo
+          echo "Checking UI for dynamic ELF interpreter..."
+          if readelf -l "$UI" | grep -q 'INTERP'; then
+            echo "ERROR: spotui-ui-poc is still dynamically linked."
+            exit 1
+          fi
+
+          if file "$UI" | grep -qi 'statically linked'; then
+            echo "OK: spotui-ui-poc is statically linked."
+          else
+            echo "ERROR: spotui-ui-poc was not reported as statically linked."
+            file "$UI"
+            exit 1
+          fi
 
       # ============================================================
       # SAVE CARGO CACHE
@@ -756,6 +804,7 @@ jobs:
             echo "  /etc/init.d/S91_spotui_daemon"
             echo
             echo "serde_json dependency: explicitly added for SpotUI daemon."
+            echo "Linkage: statically linked; no musl interpreter required."
             echo "Credentials are provisioned separately."
           } > dist/build-info.txt
 
@@ -903,6 +952,8 @@ jobs:
             echo "- MIPS toolchain downloaded from GitHub instead of stalled musl.cc endpoint"
             echo "- SpotUI source auto-resolved"
             echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
+            echo "- spotui_daemon and spotui-ui-poc forced to static CRT linkage"
+            echo "- ELF interpreter check added; dynamic binaries fail the workflow"
             echo "- Spotify daemon autorun included"
             echo
             echo "### Artifacts"
