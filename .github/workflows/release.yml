@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
+name: Build SpotUI for HiBy R1 (Guaranteed R1 UI Patch v4) (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
 
 on:
   push:
@@ -28,6 +28,7 @@ env:
   # Canonical working SpotUI source.
   SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
   SPOTUI_REF: main
+  R1_UI_PATCH_VERSION: v4-guaranteed-no-wlan0-startup
 
   # ============================================================
   # Build/cache locations
@@ -131,6 +132,158 @@ jobs:
 
           echo "SpotUI commit:"
           git -C "$SPOTUI_ROOT" rev-parse HEAD
+
+      # ============================================================
+      # APPLY GUARANTEED HiBy R1 UI PATCH
+      #
+      # The CI checkout may be a Sonix repository, so the workflow
+      # clones spotui-hiby-r1/main itself. That upstream UI still has
+      # an R3/R3PII-specific wlan0 startup state. Apply the R1 patch
+      # in CI immediately before the UI is compiled.
+      #
+      # This patcher is intentionally regex-based and verifies every
+      # transformation. The build fails rather than silently compiling
+      # an unpatched UI.
+      # ============================================================
+      - name: Apply guaranteed HiBy R1 UI patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UI_SOURCE="$SPOTUI_ROOT/engine/ui/src/main.rs"
+          test -f "$UI_SOURCE"
+
+          cp -f "$UI_SOURCE" "$UI_SOURCE.before-r1-ci-patch"
+
+          python3 - "$UI_SOURCE" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          def sub_once(pattern: str, replacement: str, label: str) -> None:
+              global text
+              text2, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: {label}: expected 1 match, found {count}"
+                  )
+              text = text2
+
+          # StartupStage: remove Wi-Fi as a UI state.
+          sub_once(
+              r"(?m)^(\s*)Wifi,\s*$",
+              "",
+              "StartupStage Wifi entry",
+          )
+
+          # Remove Wi-Fi-specific labels/width.
+          sub_once(
+              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Starting Wi-Fi",[ \t]*\r?\n',
+              "",
+              "Starting Wi-Fi label",
+          )
+
+          sub_once(
+              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Preparing the network connection",[ \t]*\r?\n',
+              "",
+              "Wi-Fi detail label",
+          )
+
+          sub_once(
+              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*120,[ \t]*\r?\n',
+              "",
+              "Wi-Fi progress width",
+          )
+
+          sub_once(
+              r'(?m)^[ \t]*Self::Wifi[ \t]*=>[ \t]*"Retry Wi-Fi",[ \t]*\r?\n',
+              "",
+              "Wi-Fi retry label",
+          )
+
+          # Replace the complete route helper with an interface-agnostic
+          # version. It is diagnostic only; startup no longer uses it.
+          sub_once(
+              r"(?ms)^fn[ \t]+wifi_has_default_route\(\)[ \t]*->[ \t]*bool[ \t]*\{.*?^}\r?\n",
+              """fn wifi_has_default_route() -> bool {
+              std::fs::read_to_string("/proc/net/route")
+                  .ok()
+                  .map(|routes| {
+                      routes.lines().skip(1).any(|line| {
+                          let mut fields = line.split_whitespace();
+                          fields.next();
+                          fields.next() == Some("00000000")
+                      })
+                  })
+                  .unwrap_or(false)
+          }
+          """,
+              "Wi-Fi route helper",
+          )
+
+          # Remove the complete R3/R3PII Wi-Fi recovery function while
+          # keeping the following process-running function intact.
+          sub_once(
+              r"(?ms)^fn[ \t]+request_startup_recovery\(stage:[ \t]*StartupStage\)[ \t]*\{.*?^}\r?\n(?=/// Check whether a named process)",
+              """fn request_startup_recovery(stage: StartupStage) {
+              eprintln!("[poc] startup retry requested -> {:?}", stage);
+          }
+          """,
+              "Wi-Fi recovery function",
+          )
+
+          # Startup readiness comes from the daemon.
+          sub_once(
+              r"(?ms)    let mut startup_stage[ \t]*=[ \t]*if tracks_loaded[ \t]*\{.*?^    \};",
+              """    let mut startup_stage = if tracks_loaded {
+              None
+          } else {
+              match daemon_playback_state() {
+                  Some(_) => Some(StartupStage::Library),
+                  None => Some(StartupStage::Spotify),
+              }
+          };""",
+              "initial startup stage",
+          )
+
+          # Retry readiness comes from the daemon.
+          sub_once(
+              r"(?ms)            let updated_stage[ \t]*=[ \t]*if !wifi_has_default_route\(\)[ \t]*\{.*?^            \};",
+              """            let updated_stage = match daemon_playback_state() {
+                  Some(_) => StartupStage::Library,
+                  None => StartupStage::Spotify,
+              };""",
+              "startup retry stage",
+          )
+
+          path.write_text(text, encoding="utf-8")
+          print(f"Patched {path}")
+          PY
+
+          echo
+          echo "===== VERIFY PATCHED SOURCE ====="
+
+          if grep -nE \
+            'StartupStage::Wifi|Self::Wifi|Starting Wi-Fi|wpa_cli|hostname:HiBy-R3PROII' \
+            "$UI_SOURCE"
+          then
+            echo
+            echo "ERROR: R1-incompatible Wi-Fi startup code remains."
+            exit 1
+          fi
+
+          grep -q 'enum StartupStage' "$UI_SOURCE"
+          grep -q 'daemon_playback_state()' "$UI_SOURCE"
+
+          echo
+          echo "Patched UI source SHA256:"
+          sha256sum "$UI_SOURCE"
+
+          echo
+          echo "HiBy R1 UI patch verification passed."
 
       # ============================================================
       # VERIFY PROJECT STRUCTURE
@@ -915,6 +1068,20 @@ jobs:
 
           cd "$SPOTUI_ROOT/engine/ui"
 
+          echo "Final UI source verification:"
+          ! grep -q 'StartupStage::Wifi' src/main.rs
+          ! grep -q 'Self::Wifi' src/main.rs
+          ! grep -q 'Starting Wi-Fi' src/main.rs
+          ! grep -q 'wpa_cli' src/main.rs
+          ! grep -q 'hostname:HiBy-R3PROII' src/main.rs
+
+          echo "UI source SHA256:"
+          sha256sum src/main.rs
+
+          # Prevent an old cached executable from being accepted as the
+          # result of this build.
+          rm -f             "$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc"             "$UI_TARGET_DIR/$RUST_TARGET/release/deps/spotui_ui_poc-"*             2>/dev/null || true
+
           set +e
 
           env \
@@ -1163,6 +1330,7 @@ jobs:
             echo
             echo "Daemon: /usr/data/spotui_daemon"
             echo "UI: /usr/data/spotui-ui-poc"
+            echo "R1 UI patch: ${R1_UI_PATCH_VERSION}"
             echo "Socket: /tmp/spotui.sock"
             echo
             echo "Autorun:"
