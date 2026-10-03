@@ -1,4 +1,4 @@
-name: Build SpotUI HiBy R1
+name: Build SpotUI for HiBy R1
 
 on:
   push:
@@ -12,24 +12,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: spotui-r1-${{ github.ref }}
+  group: spotui-hiby-r1-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  # HiBy R1 MIPS little-endian Linux target
+  # Target used by the working SpotUI/librespot build.
   RUST_TARGET: mipsel-unknown-linux-musl
 
-  # Use the same daemon source and build protocol documented by SpotUI.
-  # The project currently targets librespot v0.8.0.
+  # Working SpotUI daemon is built against librespot 0.8.0.
   LIBRESPOT_VERSION: v0.8.0
 
-  # Cross compiler installation/cache location
+  # If this workflow is accidentally installed in another repository
+  # (for example Sonix), it can still build the canonical SpotUI source.
+  SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
+  SPOTUI_REF: main
+
+  # Cross compiler/cache.
   MIPSEL_TOOLCHAIN_DIR: ${{ github.workspace }}/.cache/mipsel-linux-musl-cross
 
-  # Cargo caches/build outputs
+  # Cargo caches/build outputs.
   CARGO_HOME: ${{ github.workspace }}/.cache/cargo
-  DAEMON_TARGET_DIR: ${{ github.workspace }}/.cache/daemon-target
-  UI_TARGET_DIR: ${{ github.workspace }}/.cache/ui-target
+  DAEMON_TARGET_DIR: ${{ github.workspace }}/.cache/spotui-daemon-target
+  UI_TARGET_DIR: ${{ github.workspace }}/.cache/spotui-ui-target
 
 jobs:
   build:
@@ -42,7 +46,7 @@ jobs:
       # ============================================================
       # CHECKOUT
       # ============================================================
-      - name: Checkout SpotUI
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -71,31 +75,124 @@ jobs:
           echo "Build dependencies installed."
 
       # ============================================================
-      # VERIFY PROJECT STRUCTURE
+      # RESOLVE SPOTUI SOURCE
+      #
+      # The previous workflow failed here because it assumed the
+      # workflow was always running from a SpotUI checkout.
+      #
+      # This version uses the checkout when it contains SpotUI.
+      # Otherwise it clones the canonical R1 SpotUI repository.
+      # ============================================================
+      - name: Resolve SpotUI source tree
+        id: spotui-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$GITHUB_WORKSPACE"
+          CANDIDATE="$WORKSPACE"
+
+          REQUIRED_FILES=(
+            "apps/spotify/daemon/spotui_daemon.rs"
+            "engine/ui/Cargo.toml"
+            "engine/ui/src/main.rs"
+          )
+
+          have_spotui_tree() {
+            for path in "${REQUIRED_FILES[@]}"; do
+              if [ ! -f "$CANDIDATE/$path" ]; then
+                return 1
+              fi
+            done
+            return 0
+          }
+
+          if have_spotui_tree; then
+            echo "Current checkout is the SpotUI repository."
+            echo "SPOTUI_ROOT=$CANDIDATE" >> "$GITHUB_ENV"
+          else
+            echo "Current checkout does not contain the SpotUI source tree."
+            echo "Cloning canonical SpotUI:"
+            echo "  $SPOTUI_REPOSITORY"
+            echo "  ref: $SPOTUI_REF"
+
+            rm -rf "$WORKSPACE/spotui-source"
+
+            git clone \
+              --depth 1 \
+              --branch "$SPOTUI_REF" \
+              "$SPOTUI_REPOSITORY" \
+              "$WORKSPACE/spotui-source"
+
+            CANDIDATE="$WORKSPACE/spotui-source"
+
+            for path in "${REQUIRED_FILES[@]}"; do
+              if [ ! -f "$CANDIDATE/$path" ]; then
+                echo "ERROR: Required SpotUI file is missing:"
+                echo "$CANDIDATE/$path"
+                exit 1
+              fi
+            done
+
+            echo "SPOTUI_ROOT=$CANDIDATE" >> "$GITHUB_ENV"
+          fi
+
+          echo "SpotUI source root:"
+          echo "$CANDIDATE"
+
+          echo
+          echo "Required files:"
+          for path in "${REQUIRED_FILES[@]}"; do
+            ls -lh "$CANDIDATE/$path"
+          done
+
+          echo
+          echo "SpotUI source resolved successfully."
+
+      # ============================================================
+      # VERIFY SOURCE STRUCTURE
       # ============================================================
       - name: Verify SpotUI project structure
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f apps/spotify/daemon/spotui_daemon.rs
-          test -f engine/ui/Cargo.toml
-          test -f engine/ui/src/main.rs
+          missing=0
 
-          echo "Canonical daemon source:"
-          ls -lh apps/spotify/daemon/spotui_daemon.rs
+          for path in \
+            "$SPOTUI_ROOT/apps/spotify/daemon/spotui_daemon.rs" \
+            "$SPOTUI_ROOT/engine/ui/Cargo.toml" \
+            "$SPOTUI_ROOT/engine/ui/src/main.rs"
+          do
+            if [ -f "$path" ]; then
+              echo "OK: $path"
+            else
+              echo "MISSING: $path"
+              missing=1
+            fi
+          done
 
-          echo "SpotUI structure verified."
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "ERROR: SpotUI source structure is incomplete."
+            echo "SPOTUI_ROOT=$SPOTUI_ROOT"
+            find "$SPOTUI_ROOT" \
+              -maxdepth 4 \
+              -type f \
+              | sort \
+              | head -n 300
+            exit 1
+          fi
 
       # ============================================================
-      # RESTORE MIPSEL TOOLCHAIN CACHE
+      # RESTORE MIPS TOOLCHAIN CACHE
       # ============================================================
       - name: Restore MIPS toolchain cache
         id: mips-toolchain-cache
         uses: actions/cache/restore@v4
         with:
           path: .cache/mipsel-linux-musl-cross
-          key: spotui-mipsel-toolchain-v1-${{ runner.os }}
+          key: spotui-mipsel-toolchain-v2-${{ runner.os }}
 
       # ============================================================
       # INSTALL MIPSEL MUSL TOOLCHAIN
@@ -105,7 +202,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TOOLCHAIN_DIR="${MIPSEL_TOOLCHAIN_DIR}"
+          TOOLCHAIN_DIR="$MIPSEL_TOOLCHAIN_DIR"
           TOOLCHAIN_TARBALL="$RUNNER_TEMP/mipsel-linux-musl-cross.tgz"
 
           mkdir -p "$TOOLCHAIN_DIR"
@@ -155,9 +252,9 @@ jobs:
         with:
           path: |
             .cache/cargo
-            .cache/daemon-target
-            .cache/ui-target
-          key: spotui-cargo-v1-${{ runner.os }}-${{ hashFiles('apps/spotify/daemon/spotui_daemon.rs', 'engine/ui/Cargo.toml', 'engine/ui/Cargo.lock', 'Cargo.lock') }}
+            .cache/spotui-daemon-target
+            .cache/spotui-ui-target
+          key: spotui-cargo-v2-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
 
       # ============================================================
       # INSTALL RUST NIGHTLY
@@ -174,85 +271,48 @@ jobs:
           rustup run nightly rustc --version
           rustup run nightly cargo --version
 
-          echo "Rust nightly installed."
-
       # ============================================================
-      # CONFIGURE MIPS LINKER FOR CARGO
+      # CLONE LIBRESPOT 0.8.0
+      #
+      # The fork contains a librespot directory placeholder, but the
+      # canonical build is from the dedicated librespot 0.8.0 source.
       # ============================================================
-      - name: Configure MIPS Rust target
+      - name: Prepare librespot 0.8.0
         shell: bash
         run: |
           set -euo pipefail
 
-          TOOLCHAIN="${MIPSEL_TOOLCHAIN_DIR}"
-          LINKER="$TOOLCHAIN/bin/mipsel-linux-musl-gcc"
+          LIBRESPOT_ROOT="$RUNNER_TEMP/librespot"
 
-          mkdir -p librespot/.cargo
-          mkdir -p engine/ui/.cargo
+          rm -rf "$LIBRESPOT_ROOT"
 
-          cat > librespot/.cargo/config.toml <<EOF
-          [target.mipsel-unknown-linux-musl]
-          linker = "$LINKER"
-          EOF
+          echo "Cloning librespot ${LIBRESPOT_VERSION}..."
 
-          cat > engine/ui/.cargo/config.toml <<EOF
-          [target.mipsel-unknown-linux-musl]
-          linker = "$LINKER"
-          EOF
+          git clone \
+            --depth 1 \
+            --branch "$LIBRESPOT_VERSION" \
+            https://github.com/librespot-org/librespot.git \
+            "$LIBRESPOT_ROOT"
 
-          echo "librespot/.cargo/config.toml:"
-          cat librespot/.cargo/config.toml
+          test -f "$LIBRESPOT_ROOT/Cargo.toml"
+          test -d "$LIBRESPOT_ROOT/examples"
 
-          echo
-          echo "engine/ui/.cargo/config.toml:"
-          cat engine/ui/.cargo/config.toml
+          echo "librespot source ready:"
+          git -C "$LIBRESPOT_ROOT" rev-parse HEAD
+          git -C "$LIBRESPOT_ROOT" describe --tags --always || true
 
-      # ============================================================
-      # PREPARE LIBRESPOT BUILD TREE
-      # ============================================================
-      - name: Prepare librespot build tree
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BUILD_TREE="librespot"
-
-          if [ ! -f "$BUILD_TREE/Cargo.toml" ]; then
-            echo "The repository checkout does not contain a populated librespot tree."
-            echo "Cloning librespot ${LIBRESPOT_VERSION}..."
-
-            rm -rf "$BUILD_TREE"
-
-            git clone \
-              --depth 1 \
-              --branch "${LIBRESPOT_VERSION}" \
-              https://github.com/librespot-org/librespot.git \
-              "$BUILD_TREE"
-          fi
-
-          test -f "$BUILD_TREE/Cargo.toml"
-          test -d "$BUILD_TREE/examples"
-
-          echo "Checking librespot version..."
-
-          if grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.8\.0"' \
-              "$BUILD_TREE/Cargo.toml"; then
-            echo "librespot 0.8.0 confirmed."
-          else
-            echo "WARNING: librespot Cargo.toml does not explicitly show version 0.8.0."
-            echo "The daemon is documented as targeting librespot v0.8.0."
-          fi
+          echo "LIBRESPOT_ROOT=$LIBRESPOT_ROOT" >> "$GITHUB_ENV"
 
       # ============================================================
       # COPY CANONICAL DAEMON SOURCE
       # ============================================================
-      - name: Install canonical SpotUI daemon into librespot
+      - name: Copy canonical SpotUI daemon source
         shell: bash
         run: |
           set -euo pipefail
 
-          SOURCE="apps/spotify/daemon/spotui_daemon.rs"
-          DEST="librespot/examples/spotui_daemon.rs"
+          SOURCE="$SPOTUI_ROOT/apps/spotify/daemon/spotui_daemon.rs"
+          DEST="$LIBRESPOT_ROOT/examples/spotui_daemon.rs"
 
           cp -f "$SOURCE" "$DEST"
 
@@ -265,6 +325,36 @@ jobs:
           test "$SOURCE_SHA" = "$DEST_SHA"
 
           echo "Daemon source hashes match."
+
+      # ============================================================
+      # CONFIGURE CARGO FOR MIPS
+      # ============================================================
+      - name: Configure Cargo MIPS linker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LINKER="$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc"
+
+          mkdir -p "$LIBRESPOT_ROOT/.cargo"
+          mkdir -p "$SPOTUI_ROOT/engine/ui/.cargo"
+
+          cat > "$LIBRESPOT_ROOT/.cargo/config.toml" <<EOF
+          [target.mipsel-unknown-linux-musl]
+          linker = "$LINKER"
+          EOF
+
+          cat > "$SPOTUI_ROOT/engine/ui/.cargo/config.toml" <<EOF
+          [target.mipsel-unknown-linux-musl]
+          linker = "$LINKER"
+          EOF
+
+          echo "librespot Cargo target configuration:"
+          cat "$LIBRESPOT_ROOT/.cargo/config.toml"
+
+          echo
+          echo "SpotUI UI Cargo target configuration:"
+          cat "$SPOTUI_ROOT/engine/ui/.cargo/config.toml"
 
       # ============================================================
       # BUILD SPOTUI DAEMON
@@ -280,11 +370,13 @@ jobs:
 
           mkdir -p "$DAEMON_TARGET_DIR"
 
-          cd librespot
+          cd "$LIBRESPOT_ROOT"
 
           set +e
+
           env \
             RUSTFLAGS='-C strip=symbols' \
+            CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$DAEMON_TARGET_DIR" \
             cargo +nightly build \
             --release \
@@ -295,32 +387,32 @@ jobs:
             --features 'rustls-tls-webpki-roots,with-libmdns'
 
           STATUS=$?
+
           set -e
 
+          DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
+
           if [ "$STATUS" -ne 0 ]; then
+            echo
             echo "SPOTUI DAEMON BUILD FAILED"
+            echo
+            echo "Cargo version:"
+            rustup run nightly cargo --version || true
+            echo
+            echo "Rust target:"
+            rustup target list --toolchain nightly | grep "$RUST_TARGET" || true
+            echo
+            echo "Expected output:"
+            echo "$DAEMON"
 
-            echo "Relevant Cargo files:"
-            find . \
-              -maxdepth 2 \
-              -type f \
-              \( -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-              -print \
-              | sort || true
-
-            echo "Cargo target directory:"
-            find "$DAEMON_TARGET_DIR" \
-              -maxdepth 4 \
-              -type f \
-              \( -name '*.log' -o -name '*.json' \) \
-              -print 2>/dev/null \
-              | sort \
-              | head -n 100 || true
+            if [ -f "$DAEMON" ]; then
+              echo
+              echo "Partial daemon output:"
+              ls -lh "$DAEMON"
+            fi
 
             exit "$STATUS"
           fi
-
-          DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
 
           test -s "$DAEMON"
           test -x "$DAEMON"
@@ -336,7 +428,7 @@ jobs:
           sha256sum "$DAEMON"
 
       # ============================================================
-      # BUILD SPOTUI UI
+      # BUILD ORIGINAL SPOTUI UI
       # ============================================================
       - name: Build SpotUI UI
         shell: bash
@@ -349,10 +441,12 @@ jobs:
 
           mkdir -p "$UI_TARGET_DIR"
 
-          cd engine/ui
+          cd "$SPOTUI_ROOT/engine/ui"
 
           set +e
+
           env \
+            CARGO_HOME="$CARGO_HOME" \
             CARGO_TARGET_DIR="$UI_TARGET_DIR" \
             cargo +nightly build \
             --release \
@@ -360,14 +454,17 @@ jobs:
             --target "$RUST_TARGET"
 
           STATUS=$?
+
           set -e
+
+          UI="$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc"
 
           if [ "$STATUS" -ne 0 ]; then
             echo "SPOTUI UI BUILD FAILED"
+            echo "Expected output:"
+            echo "$UI"
             exit "$STATUS"
           fi
-
-          UI="$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc"
 
           test -s "$UI"
           test -x "$UI"
@@ -391,43 +488,188 @@ jobs:
         with:
           path: |
             .cache/cargo
-            .cache/daemon-target
-            .cache/ui-target
+            .cache/spotui-daemon-target
+            .cache/spotui-ui-target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       # ============================================================
-      # PACKAGE BUILD OUTPUTS
+      # CREATE DAEMON AUTORUN SCRIPT
+      #
+      # This starts ONLY the Spotify daemon at boot.
+      # It deliberately does not replace the stock HiBy UI/player.
+      # That makes it suitable for the later Sonix integration where
+      # Sonix owns the display and calls /tmp/spotui.sock.
       # ============================================================
-      - name: Prepare SpotUI artifacts
+      - name: Create daemon autorun payload
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p dist
+          rm -rf dist
+          mkdir -p \
+            dist/usr/data \
+            dist/usr/bin \
+            dist/etc/init.d
 
-          cp -f \
-            "$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon" \
-            dist/spotui_daemon
+          DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
+          UI="$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc"
 
-          cp -f \
-            "$UI_TARGET_DIR/$RUST_TARGET/release/spotui-ui-poc" \
-            dist/spotui-ui-poc
+          cp -f "$DAEMON" dist/usr/data/spotui_daemon
+          cp -f "$UI" dist/usr/data/spotui-ui-poc
 
-          chmod +x dist/spotui_daemon
-          chmod +x dist/spotui-ui-poc
+          chmod 0755 \
+            dist/usr/data/spotui_daemon \
+            dist/usr/data/spotui-ui-poc
 
-          echo "Verifying final binaries..."
+          # Runtime launcher. It waits briefly for the R1 network route,
+          # then starts the daemon in the background.
+          cat > dist/usr/bin/spotui_daemon_autostart.sh <<'EOF'
+          #!/bin/sh
 
-          file dist/spotui_daemon
-          file dist/spotui-ui-poc
+          DAEMON="/usr/data/spotui_daemon"
+          LOG="/tmp/daemon.log"
+          MAX_WAIT=60
 
-          file dist/spotui_daemon | grep -qi 'MIPS'
-          file dist/spotui-ui-poc | grep -qi 'MIPS'
+          if [ ! -x "$DAEMON" ]; then
+              exit 0
+          fi
 
+          # Do not start a second daemon if one is already running.
+          if pidof spotui_daemon >/dev/null 2>&1; then
+              exit 0
+          fi
+
+          # Wait for wlan0 to obtain a default route.
+          n=0
+          while [ "$n" -lt "$MAX_WAIT" ]; do
+              if grep -q '^wlan0[[:space:]][^[:space:]]*[[:space:]]00000000[[:space:]]' /proc/net/route 2>/dev/null; then
+                  break
+              fi
+
+              n=$((n + 1))
+              sleep 1
+          done
+
+          # Credentials are provisioned separately. Do not create or
+          # overwrite credentials here.
+          if [ ! -d "/usr/data/librespot-cache" ]; then
+              echo "[spotui-autostart] librespot cache not present; daemon not started." >> "$LOG"
+              exit 0
+          fi
+
+          echo "[spotui-autostart] starting spotui_daemon" >> "$LOG"
+          echo "[spotui-autostart] time $(date)" >> "$LOG"
+
+          nohup "$DAEMON" >> "$LOG" 2>&1 &
+
+          exit 0
+          EOF
+
+          chmod 0755 dist/usr/bin/spotui_daemon_autostart.sh
+
+          # Standard HiBy-style init script. This does not replace or
+          # kill hiby_player; it only makes the daemon available to
+          # another local client such as Sonix.
+          cat > dist/etc/init.d/S91_spotui_daemon <<'EOF'
+          #!/bin/sh
+
+          case "$1" in
+              start)
+                  /usr/bin/spotui_daemon_autostart.sh &
+                  ;;
+              stop)
+                  if pidof spotui_daemon >/dev/null 2>&1; then
+                      killall spotui_daemon 2>/dev/null || true
+                  fi
+                  ;;
+              restart)
+                  "$0" stop
+                  sleep 1
+                  "$0" start
+                  ;;
+              *)
+                  echo "Usage: $0 {start|stop|restart}"
+                  exit 1
+                  ;;
+          esac
+
+          exit 0
+          EOF
+
+          chmod 0755 dist/etc/init.d/S91_spotui_daemon
+
+          # An optional single command helper for ADB/manual testing.
+          cat > dist/install_spotui_daemon_adb.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+
+          adb push dist/usr/data/spotui_daemon /usr/data/spotui_daemon.new
+          adb push dist/usr/bin/spotui_daemon_autostart.sh /usr/bin/spotui_daemon_autostart.sh
+          adb push dist/etc/init.d/S91_spotui_daemon /etc/init.d/S91_spotui_daemon
+
+          adb shell 'chmod 755 /usr/data/spotui_daemon.new /usr/bin/spotui_daemon_autostart.sh /etc/init.d/S91_spotui_daemon'
+
+          adb shell 'mv /usr/data/spotui_daemon.new /usr/data/spotui_daemon'
+          adb shell '/etc/init.d/S91_spotui_daemon start'
+
+          echo "SpotUI daemon installed and started."
+          EOF
+
+          chmod 0755 dist/install_spotui_daemon_adb.sh
+
+          echo "Deployment payload:"
+          find dist -type f -printf '%M %s %p\n' | sort
+
+      # ============================================================
+      # VERIFY FINAL OUTPUTS
+      # ============================================================
+      - name: Verify SpotUI binaries and autorun
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s dist/usr/data/spotui_daemon
+          test -s dist/usr/data/spotui-ui-poc
+          test -x dist/usr/data/spotui_daemon
+          test -x dist/usr/data/spotui-ui-poc
+
+          test -x dist/usr/bin/spotui_daemon_autostart.sh
+          test -x dist/etc/init.d/S91_spotui_daemon
+          test -x dist/install_spotui_daemon_adb.sh
+
+          echo "Daemon:"
+          file dist/usr/data/spotui_daemon
+          file dist/usr/data/spotui_daemon | grep -qi 'MIPS'
+
+          echo
+          echo "UI:"
+          file dist/usr/data/spotui-ui-poc
+          file dist/usr/data/spotui-ui-poc | grep -qi 'MIPS'
+
+          echo
+          echo "Autorun:"
+          head -n 80 dist/etc/init.d/S91_spotui_daemon
+          echo
+          head -n 100 dist/usr/bin/spotui_daemon_autostart.sh
+
+          echo
+          echo "SHA256:"
           sha256sum \
-            dist/spotui_daemon \
-            dist/spotui-ui-poc \
+            dist/usr/data/spotui_daemon \
+            dist/usr/data/spotui-ui-poc \
+            dist/usr/bin/spotui_daemon_autostart.sh \
+            dist/etc/init.d/S91_spotui_daemon \
             > dist/SHA256SUMS
+
+          cat dist/SHA256SUMS
+
+      # ============================================================
+      # BUILD INFORMATION
+      # ============================================================
+      - name: Create build information
+        shell: bash
+        run: |
+          set -euo pipefail
 
           BUILD_TIME_IST=$(
             TZ=Asia/Kolkata \
@@ -437,42 +679,52 @@ jobs:
           {
             echo "SpotUI HiBy R1 build"
             echo
-            echo "Branch: ${GITHUB_REF_NAME}"
-            echo "Commit: ${GITHUB_SHA}"
+            echo "Workflow repository: ${GITHUB_REPOSITORY}"
+            echo "Workflow branch: ${GITHUB_REF_NAME}"
+            echo "Workflow commit: ${GITHUB_SHA}"
             echo "Run number: ${GITHUB_RUN_NUMBER}"
             echo "Build time: ${BUILD_TIME_IST}"
             echo
-            echo "Target: ${RUST_TARGET}"
-            echo "librespot target version: ${LIBRESPOT_VERSION}"
+            echo "SpotUI source: ${SPOTUI_REPOSITORY}"
+            echo "SpotUI ref: ${SPOTUI_REF}"
+            echo "Rust target: ${RUST_TARGET}"
+            echo "librespot target: ${LIBRESPOT_VERSION}"
             echo
-            echo "Outputs:"
-            echo "  spotui_daemon"
-            echo "  spotui-ui-poc"
+            echo "Important runtime paths:"
+            echo "  /usr/data/spotui_daemon"
+            echo "  /usr/data/spotui-ui-poc"
+            echo "  /tmp/spotui.sock"
+            echo
+            echo "Autorun:"
+            echo "  /usr/bin/spotui_daemon_autostart.sh"
+            echo "  /etc/init.d/S91_spotui_daemon"
+            echo
+            echo "Credentials are NOT generated by this workflow."
+            echo "Provision them separately on the device."
           } > dist/build-info.txt
 
           cat dist/build-info.txt
 
-          echo
-          echo "Checksums:"
-          cat dist/SHA256SUMS
-
       # ============================================================
-      # UPLOAD BUILD ARTIFACTS
+      # UPLOAD ARTIFACT
       # ============================================================
-      - name: Upload SpotUI binaries
+      - name: Upload SpotUI build artifact
         uses: actions/upload-artifact@v4
         with:
           name: spotui-hiby-r1-${{ github.run_number }}
           path: |
-            dist/spotui_daemon
-            dist/spotui-ui-poc
+            dist/usr/data/spotui_daemon
+            dist/usr/data/spotui-ui-poc
+            dist/usr/bin/spotui_daemon_autostart.sh
+            dist/etc/init.d/S91_spotui_daemon
+            dist/install_spotui_daemon_adb.sh
             dist/SHA256SUMS
             dist/build-info.txt
           if-no-files-found: error
           retention-days: 30
 
       # ============================================================
-      # FINAL BUILD SUMMARY
+      # FINAL SUMMARY
       # ============================================================
       - name: Final build summary
         shell: bash
@@ -489,6 +741,7 @@ jobs:
             echo
             echo "### Build successful"
             echo
+            echo "- Workflow repository: \`${GITHUB_REPOSITORY}\`"
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
@@ -496,12 +749,22 @@ jobs:
             echo "- Target: \`${RUST_TARGET}\`"
             echo "- librespot: \`${LIBRESPOT_VERSION}\`"
             echo
-            echo "### Artifacts"
+            echo "### Binaries"
             echo
             echo "- \`spotui_daemon\`"
             echo "- \`spotui-ui-poc\`"
-            echo "- \`SHA256SUMS\`"
-            echo "- \`build-info.txt\`"
+            echo
+            echo "### Autorun"
+            echo
+            echo "- \`/usr/bin/spotui_daemon_autostart.sh\`"
+            echo "- \`/etc/init.d/S91_spotui_daemon\`"
+            echo
+            echo "The autorun only starts the Spotify daemon."
+            echo "It does not replace the stock HiBy UI/player."
+            echo
+            echo "### Credentials"
+            echo
+            echo "Credential provisioning remains separate, as requested."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "SpotUI HiBy R1 build completed successfully."
