@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Robust R1 UI Patch) (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
+name: Build SpotUI for HiBy R1 (R1 UI + Vorbis Playback Fix)
 
 on:
   push:
@@ -29,6 +29,7 @@ env:
   SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
   SPOTUI_REF: main
   R1_UI_PATCH_VERSION: v5-robust-no-wlan0-startup
+  R1_PLAYBACK_PATCH_VERSION: symphonia-ogg-0.5.5-integer-root-v1
 
   # ============================================================
   # Build/cache locations
@@ -592,9 +593,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v9-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v14-r1-vorbis-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs', 'engine/ui/src/main.rs') }}
           restore-keys: |
-            spotui-cargo-v9-r1-loader-${{ runner.os }}-
+            spotui-cargo-v14-r1-vorbis-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -732,6 +733,206 @@ jobs:
           echo "Build-tree daemon SHA256: $DEST_SHA"
 
           test "$SOURCE_SHA" = "$DEST_SHA"
+
+      # ============================================================
+      # PATCH SYMPHONIA VORBIS FOR MIPS32 SOFT-FLOAT
+      #
+      # Playback currently reaches Symphonia but crashes in
+      # symphonia-format-ogg 0.5.5 lookup1_values() at the assertion:
+      #   (value + 1).pow(dimensions) > entries
+      # The R1 build is MIPS32 soft-float and the f32::powf() root
+      # calculation can land on the wrong integer. Replace it with
+      # exact integer arithmetic so valid Vorbis headers do not panic.
+      # ============================================================
+      - name: Patch Symphonia Vorbis MIPS math
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export CARGO_HOME="$CARGO_HOME"
+
+          # The daemon was already proven to reach Symphonia 0.5.5 on the
+          # R1. Fetch the dependency tree before modifying its cached source.
+          cargo +nightly fetch --manifest-path "$LIBRESPOT_ROOT/Cargo.toml"
+
+          SYMPHONIA_OGG_SRC="$(
+            printf '%s\n' \
+              "$CARGO_HOME"/registry/src/*/symphonia-format-ogg-0.5.5 \
+              | head -n 1
+          )"
+
+          test -d "$SYMPHONIA_OGG_SRC"
+
+          VORBIS_SOURCE="$SYMPHONIA_OGG_SRC/src/mappings/vorbis.rs"
+          test -f "$VORBIS_SOURCE"
+
+          echo "Symphonia OGG source:"
+          echo "$VORBIS_SOURCE"
+
+          python3 - "$VORBIS_SOURCE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          marker = "fn lookup1_values"
+
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit("ERROR: lookup1_values() was not found.")
+
+          # Locate the opening brace of the function.
+          brace = text.find("{", start)
+          if brace < 0:
+              raise SystemExit("ERROR: lookup1_values() opening brace not found.")
+
+          depth = 0
+          in_string = False
+          escaped = False
+          in_line_comment = False
+          in_block_comment = False
+          end = None
+
+          i = brace
+          while i < len(text):
+              c = text[i]
+              n = text[i + 1] if i + 1 < len(text) else ""
+
+              if in_line_comment:
+                  if c == "\n":
+                      in_line_comment = False
+                  i += 1
+                  continue
+
+              if in_block_comment:
+                  if c == "*" and n == "/":
+                      in_block_comment = False
+                      i += 2
+                      continue
+                  i += 1
+                  continue
+
+              if in_string:
+                  if escaped:
+                      escaped = False
+                  elif c == "\\":
+                      escaped = True
+                  elif c == '"':
+                      in_string = False
+                  i += 1
+                  continue
+
+              if c == "/" and n == "/":
+                  in_line_comment = True
+                  i += 2
+                  continue
+
+              if c == "/" and n == "*":
+                  in_block_comment = True
+                  i += 2
+                  continue
+
+              if c == '"':
+                  in_string = True
+                  i += 1
+                  continue
+
+              if c == "{":
+                  depth += 1
+              elif c == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1
+                      break
+
+              i += 1
+
+          if end is None:
+              raise SystemExit("ERROR: lookup1_values() closing brace not found.")
+
+          function_start = text.rfind("#[inline]", 0, start)
+          if function_start < 0:
+              function_start = start
+
+          old_block = text[function_start:end]
+
+          replacement = """#[inline]
+          fn lookup1_values(entries: u32, dimensions: u16) -> u32 {
+              // Vorbis lookup type 1 requires the largest integer v for which
+              // v.pow(dimensions) <= entries.
+              //
+              // Avoid f32::powf() here. On MIPS32 soft-float, its rounding can
+              // produce an adjacent integer and trip Symphonia's assertion.
+              if dimensions == 0 || entries == 0 {
+                  return 0;
+              }
+
+              let exponent = u32::from(dimensions);
+              let limit = u64::from(entries);
+
+              let power_leq_limit = |base: u32| -> bool {
+                  let mut value = 1u64;
+
+                  for _ in 0..exponent {
+                      value = match value.checked_mul(u64::from(base)) {
+                          Some(value) if value <= limit => value,
+                          _ => return false,
+                      };
+                  }
+
+                  true
+              };
+
+              // Exact integer binary search.
+              let mut lo = 0u32;
+              let mut hi = entries.saturating_add(1);
+
+              while lo.saturating_add(1) < hi {
+                  let mid = lo + (hi - lo) / 2;
+
+                  if power_leq_limit(mid) {
+                      lo = mid;
+                  } else {
+                      hi = mid;
+                  }
+              }
+
+              lo
+          }"""
+
+          # Normalize the indentation used in this Python source literal.
+          replacement = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in replacement.splitlines()
+          )
+
+          if "f32::powf" not in old_block and "power_leq_limit" in old_block:
+              print("Symphonia integer-root patch already present.")
+          else:
+              text = text[:function_start] + replacement + text[end:]
+              path.write_text(text, encoding="utf-8")
+              print("Applied Symphonia integer-root patch.")
+
+          PY
+
+          echo
+          echo "===== VERIFY SYMPHONIA VORBIS PATCH ====="
+
+          grep -n -A55 -B5 'fn lookup1_values' "$VORBIS_SOURCE"
+
+          if grep -q 'powf(1.0 f32 / f32::from(dimensions))' "$VORBIS_SOURCE"; then
+              echo "ERROR: old floating-point root calculation remains."
+              exit 1
+          fi
+
+          grep -q 'power_leq_limit' "$VORBIS_SOURCE"
+          grep -q 'checked_mul' "$VORBIS_SOURCE"
+          grep -q 'Binary search' "$VORBIS_SOURCE" \
+              || grep -q 'binary search' "$VORBIS_SOURCE"
+
+          echo
+          echo "Symphonia ${R1_PLAYBACK_PATCH_VERSION} verified."
 
       # ============================================================
       # CONFIGURE MIPS MUSL TOOLCHAIN
@@ -1621,6 +1822,7 @@ jobs:
             echo "- SpotUI source auto-resolved"
             echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
             echo "- Spotify daemon autorun included"
+            echo "- Symphonia OGG/Vorbis integer-root fix applied for MIPS32 soft-float"
             echo "- GCC resolves the MIPS sysroot, CRT objects, and musl loader directly"
             echo "- GCC is used to resolve CRT, loader, and runtime-library paths; no recursive toolchain scanning"
             echo "- R1 musl loader bundled and invoked explicitly"
