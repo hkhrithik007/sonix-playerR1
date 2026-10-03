@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (R1 Loader Fix)
+name: Build SpotUI for HiBy R1 (R1 Loader Symlink Fix)
 
 on:
   push:
@@ -441,7 +441,7 @@ jobs:
 
           CRT1="$(find "$TOOLCHAIN" -type f -name 'crt1.o' -print -quit)"
           CRTBEGIN="$(find "$TOOLCHAIN" -type f -name 'crtbegin.o' -print -quit)"
-          LOADER="$(find "$TOOLCHAIN" -type f -name 'ld-musl-mipsel.so.1' -print -quit)"
+          LOADER="$(find -L "$TOOLCHAIN" -type f -name 'ld-musl-mipsel.so.1' -print -quit)"
 
           test -n "$CRT1" || {
             echo "ERROR: crt1.o was not found in toolchain."
@@ -453,10 +453,27 @@ jobs:
             exit 1
           }
 
-          test -n "$LOADER" || {
+          if [ -z "$LOADER" ]; then
             echo "ERROR: ld-musl-mipsel.so.1 was not found in toolchain."
+            echo
+            echo "Possible musl loader/symlink entries:"
+            find -L "$TOOLCHAIN" \
+              \( -name 'ld-musl-mipsel.so.1' -o -name 'libc.so' \) \
+              -print \
+              2>/dev/null \
+              | sort \
+              | head -n 100 || true
+            echo
+            echo "Toolchain libraries:"
+            find "$TOOLCHAIN" \
+              -maxdepth 5 \
+              -type l \
+              -o -type f \
+              | grep -E '/(ld-musl|libc\.so)' \
+              | sort \
+              | head -n 100 || true
             exit 1
-          }
+          fi
 
           SYSROOT_LIB="$(dirname "$CRT1")"
           SYSROOT="$(dirname "$SYSROOT_LIB")"
@@ -467,6 +484,10 @@ jobs:
           echo "Sysroot lib   : $SYSROOT_LIB"
           echo "GCC runtime   : $GCC_LIB"
           echo "Musl loader   : $LOADER"
+          echo "Musl loader realpath:"
+          readlink -f "$LOADER" || true
+          echo "Musl loader file:"
+          ls -l "$LOADER"
 
           for f in \
             "$SYSROOT_LIB/crt1.o" \
@@ -685,7 +706,7 @@ jobs:
             esac
 
             FOUND="$(
-              find "$MIPSEL_TOOLCHAIN_DIR" \
+              find -L "$MIPSEL_TOOLCHAIN_DIR" \
                 -type f \
                 -name "$LIB" \
                 -print \
