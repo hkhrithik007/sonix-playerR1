@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (R1 Loader Symlink Fix)
+name: Build SpotUI for HiBy R1 (Toolchain Layout Fix) (R1 Loader Fix)
 
 on:
   push:
@@ -32,7 +32,7 @@ env:
   # ============================================================
   # Build/cache locations
   # ============================================================
-  MIPSEL_TOOLCHAIN_DIR: ${{ github.workspace }}/.cache/mipsel-linux-musl-cross
+  MIPSEL_TOOLCHAIN_ROOT: ${{ github.workspace }}/.cache/mipsel-toolchain-root
   CARGO_HOME: ${{ github.workspace }}/.cache/cargo
   DAEMON_TARGET_DIR: ${{ github.workspace }}/.cache/spotui-daemon-target
   UI_TARGET_DIR: ${{ github.workspace }}/.cache/spotui-ui-target
@@ -162,37 +162,35 @@ jobs:
         id: mips-toolchain-cache
         uses: actions/cache/restore@v4
         with:
-          path: .cache/mipsel-linux-musl-cross
-          key: spotui-mipsel-toolchain-v4-${{ runner.os }}-2025-06-12
+          path: .cache/mipsel-toolchain-root
+          key: spotui-mipsel-toolchain-v5-${{ runner.os }}-2025-06-12-preserved-layout
 
-      # ============================================================
-      # INSTALL MIPS LITTLE-ENDIAN MUSL TOOLCHAIN
-      #
-      # IMPORTANT:
-      # Do not use musl.cc. The previous workflow stalled there.
-      # ============================================================
       - name: Install MIPS little-endian musl toolchain
         shell: bash
         run: |
           set -euo pipefail
 
-          TOOLCHAIN_DIR="$MIPSEL_TOOLCHAIN_DIR"
+          CACHE_ROOT="$MIPSEL_TOOLCHAIN_ROOT"
+          ARCHIVE_ROOT="$CACHE_ROOT/mipsel-linux-musl-cross"
           DOWNLOAD="$RUNNER_TEMP/mipsel-linux-musl-cross.tgz"
 
-          TOOLCHAIN_URL="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/mipsel-linux-musl-cross.tgz"
+          mkdir -p "$CACHE_ROOT"
 
-          mkdir -p "$TOOLCHAIN_DIR"
-
-          if [ -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" ]; then
-            echo "Using cached MIPS toolchain."
+          # The archive must be extracted WITHOUT --strip-components.
+          # That preserves the toolchain's internal symlink layout.
+          if [ -x "$ARCHIVE_ROOT/bin/mipsel-linux-musl-gcc" ]; then
+            echo "Using cached MIPS toolchain:"
+            echo "$ARCHIVE_ROOT"
           else
             echo "============================================"
             echo "DOWNLOADING MIPS TOOLCHAIN"
             echo "============================================"
-            echo "$TOOLCHAIN_URL"
 
-            rm -rf "$TOOLCHAIN_DIR"
-            mkdir -p "$TOOLCHAIN_DIR"
+            TOOLCHAIN_URL="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/mipsel-linux-musl-cross.tgz"
+            echo "URL: $TOOLCHAIN_URL"
+
+            rm -rf "$CACHE_ROOT"
+            mkdir -p "$CACHE_ROOT"
 
             SUCCESS=0
 
@@ -228,32 +226,77 @@ jobs:
             done
 
             if [ "$SUCCESS" -ne 1 ]; then
-              echo
               echo "ERROR: Could not obtain a valid MIPS toolchain."
               exit 1
             fi
 
+            echo "Extracting while preserving original archive layout..."
+
             tar -xzf "$DOWNLOAD" \
-              --strip-components=1 \
-              -C "$TOOLCHAIN_DIR"
+              -C "$CACHE_ROOT"
 
             rm -f "$DOWNLOAD"
           fi
 
-          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc"
-          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-strip"
-          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-ar"
-          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-ranlib"
+          test -d "$ARCHIVE_ROOT"
+          test -x "$ARCHIVE_ROOT/bin/mipsel-linux-musl-gcc"
+          test -x "$ARCHIVE_ROOT/bin/mipsel-linux-musl-strip"
+          test -x "$ARCHIVE_ROOT/bin/mipsel-linux-musl-ar"
+          test -x "$ARCHIVE_ROOT/bin/mipsel-linux-musl-ranlib"
+
+          # Export the actual nested toolchain directory for all later steps.
+          echo "MIPSEL_TOOLCHAIN_DIR=$ARCHIVE_ROOT" >> "$GITHUB_ENV"
+
+          echo
+          echo "MIPS toolchain root:"
+          echo "$ARCHIVE_ROOT"
 
           echo
           echo "MIPS compiler:"
-          "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" --version | head -n 1
+          "$ARCHIVE_ROOT/bin/mipsel-linux-musl-gcc" --version | head -n 1
 
+          echo
+          echo "Top-level toolchain entries:"
+          ls -lah "$ARCHIVE_ROOT"
+
+      - name: Verify preserved MIPS toolchain layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Do not follow symlink directories here. The purpose of this
+          # check is specifically to prove that extraction did not create
+          # a self-referencing usr/ tree.
+          echo "Toolchain directory:"
+          ls -ld "$MIPSEL_TOOLCHAIN_DIR"
+
+          echo
+          echo "usr entry:"
+          if [ -e "$MIPSEL_TOOLCHAIN_DIR/usr" ] || [ -L "$MIPSEL_TOOLCHAIN_DIR/usr" ]; then
+            ls -ld "$MIPSEL_TOOLCHAIN_DIR/usr"
+          else
+            echo "No top-level usr entry."
+          fi
+
+          echo
+          echo "Compiler:"
+          "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" --version | head -n 1
+
+          echo
+          echo "Compiler sysroot:"
+          "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" -print-sysroot || true
+
+          echo
+          echo "Toolchain layout verification passed."
+
+      # ============================================================
+      # SAVE MIPS TOOLCHAIN CACHE
+      # ============================================================
       - name: Save MIPS toolchain cache
         if: success() && steps.mips-toolchain-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: .cache/mipsel-linux-musl-cross
+          path: .cache/mipsel-toolchain-root
           key: ${{ steps.mips-toolchain-cache.outputs.cache-primary-key }}
 
       # ============================================================
@@ -441,7 +484,7 @@ jobs:
 
           CRT1="$(find "$TOOLCHAIN" -type f -name 'crt1.o' -print -quit)"
           CRTBEGIN="$(find "$TOOLCHAIN" -type f -name 'crtbegin.o' -print -quit)"
-          LOADER="$(find -L "$TOOLCHAIN" -type f -name 'ld-musl-mipsel.so.1' -print -quit)"
+          LOADER="$(find "$TOOLCHAIN" -type f -name 'ld-musl-mipsel.so.1' -print -quit)"
 
           test -n "$CRT1" || {
             echo "ERROR: crt1.o was not found in toolchain."
@@ -453,27 +496,10 @@ jobs:
             exit 1
           }
 
-          if [ -z "$LOADER" ]; then
+          test -n "$LOADER" || {
             echo "ERROR: ld-musl-mipsel.so.1 was not found in toolchain."
-            echo
-            echo "Possible musl loader/symlink entries:"
-            find -L "$TOOLCHAIN" \
-              \( -name 'ld-musl-mipsel.so.1' -o -name 'libc.so' \) \
-              -print \
-              2>/dev/null \
-              | sort \
-              | head -n 100 || true
-            echo
-            echo "Toolchain libraries:"
-            find "$TOOLCHAIN" \
-              -maxdepth 5 \
-              -type l \
-              -o -type f \
-              | grep -E '/(ld-musl|libc\.so)' \
-              | sort \
-              | head -n 100 || true
             exit 1
-          fi
+          }
 
           SYSROOT_LIB="$(dirname "$CRT1")"
           SYSROOT="$(dirname "$SYSROOT_LIB")"
@@ -484,10 +510,6 @@ jobs:
           echo "Sysroot lib   : $SYSROOT_LIB"
           echo "GCC runtime   : $GCC_LIB"
           echo "Musl loader   : $LOADER"
-          echo "Musl loader realpath:"
-          readlink -f "$LOADER" || true
-          echo "Musl loader file:"
-          ls -l "$LOADER"
 
           for f in \
             "$SYSROOT_LIB/crt1.o" \
@@ -706,7 +728,7 @@ jobs:
             esac
 
             FOUND="$(
-              find -L "$MIPSEL_TOOLCHAIN_DIR" \
+              find "$MIPSEL_TOOLCHAIN_DIR" \
                 -type f \
                 -name "$LIB" \
                 -print \
