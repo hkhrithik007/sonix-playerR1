@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Final Toolchain Fix)
+name: Build SpotUI for HiBy R1 (Musl Loader Resolution Fix) (Final Toolchain Fix)
 
 on:
   push:
@@ -721,13 +721,18 @@ jobs:
       # ============================================================
       # PACKAGE R1 MUSL RUNTIME
       #
-      # mipsel-unknown-linux-musl produces a dynamic binary on this
-      # target. The R1 does not provide /lib/ld-musl-mipsel.so.1, which
-      # is why the manually pushed binary previously returned:
-      #   not found
+      # IMPORTANT:
+      # ld-musl-mipsel.so.1 is frequently a symlink in the cross
+      # toolchain. "test -s" on the symlink is not a reliable way to
+      # locate the real loader, especially when the link target is
+      # an absolute /lib path outside the toolchain.
       #
-      # We therefore bundle the matching loader in /usr/data and make
-      # the autorun script invoke it explicitly.
+      # Resolve the loader deterministically:
+      #   1. real loader file if the link target exists
+      #   2. relative symlink target
+      #   3. GCC's libc.so, which is the musl runtime image
+      #
+      # No recursive find is used.
       # ============================================================
       - name: Prepare R1 musl runtime
         shell: bash
@@ -736,20 +741,103 @@ jobs:
 
           DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
           RUNTIME_DIR="$RUNNER_TEMP/spotui-runtime"
-          REAL_GCC="$MIPSEL_GCC"
-
-          test -x "$REAL_GCC"
+          GCC="$MIPSEL_GCC"
 
           test -s "$DAEMON"
-          test -s "$MUSL_LOADER"
+          test -x "$GCC"
 
           rm -rf "$RUNTIME_DIR"
           mkdir -p "$RUNTIME_DIR"
 
-          cp -Lf "$MUSL_LOADER" \
+          # --------------------------------------------------------
+          # Resolve the actual musl loader image.
+          # --------------------------------------------------------
+          LOADER_LINK="$MUSL_LOADER"
+          LOADER_SOURCE=""
+
+          echo "Loader path selected during toolchain configuration:"
+          echo "$LOADER_LINK"
+
+          if [ -f "$LOADER_LINK" ]; then
+            LOADER_SOURCE="$LOADER_LINK"
+          elif [ -L "$LOADER_LINK" ]; then
+            LINK_TARGET="$(readlink "$LOADER_LINK" || true)"
+
+            echo "Loader is a symlink:"
+            echo "  $LOADER_LINK -> $LINK_TARGET"
+
+            if [ -n "$LINK_TARGET" ]; then
+              if [[ "$LINK_TARGET" = /* ]]; then
+                # Absolute target. First try it literally.
+                if [ -f "$LINK_TARGET" ]; then
+                  LOADER_SOURCE="$LINK_TARGET"
+                fi
+
+                # If the absolute link points at the runtime path,
+                # try the same path relative to the GCC sysroot.
+                if [ -z "$LOADER_SOURCE" ] && [ -f "$SYSROOT$LINK_TARGET" ]; then
+                  LOADER_SOURCE="$SYSROOT$LINK_TARGET"
+                fi
+              else
+                # Relative symlink.
+                LINK_DIR="$(dirname "$LOADER_LINK")"
+                CANDIDATE="$LINK_DIR/$LINK_TARGET"
+
+                if [ -f "$CANDIDATE" ]; then
+                  LOADER_SOURCE="$CANDIDATE"
+                fi
+              fi
+            fi
+          fi
+
+          # --------------------------------------------------------
+          # Musl's libc.so is the fallback runtime image.
+          # GCC can resolve it without recursive filesystem search.
+          # --------------------------------------------------------
+          if [ -z "$LOADER_SOURCE" ]; then
+            GCC_LIBC="$("$GCC" -print-file-name=libc.so 2>/dev/null || true)"
+
+            echo "GCC libc.so resolution:"
+            echo "$GCC_LIBC"
+
+            if [ -n "$GCC_LIBC" ] \
+              && [ "$GCC_LIBC" != "libc.so" ] \
+              && [ -f "$GCC_LIBC" ]; then
+              LOADER_SOURCE="$GCC_LIBC"
+            fi
+          fi
+
+          if [ -z "$LOADER_SOURCE" ] || [ ! -f "$LOADER_SOURCE" ]; then
+            echo
+            echo "ERROR: Could not resolve the actual mipsel musl loader image."
+            echo
+            echo "MUSL_LOADER=$LOADER_LINK"
+            echo "MUSL_SYSROOT=$SYSROOT"
+            echo
+            echo "GCC libc.so:"
+            "$GCC" -print-file-name=libc.so || true
+            echo
+            echo "Sysroot lib listing:"
+            ls -la "$SYSROOT/lib" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo
+          echo "Actual musl loader image:"
+          echo "$LOADER_SOURCE"
+
+          test -s "$LOADER_SOURCE"
+
+          cp -f "$LOADER_SOURCE" \
             "$RUNTIME_DIR/ld-musl-mipsel.so.1"
 
-          # Record any explicitly required shared libraries.
+          chmod 0755 "$RUNTIME_DIR/ld-musl-mipsel.so.1"
+
+          # --------------------------------------------------------
+          # Resolve DT_NEEDED libraries without recursive find.
+          # --------------------------------------------------------
+          echo
+          echo "Daemon DT_NEEDED:"
           readelf -d "$DAEMON" \
             | awk '$2 == "(NEEDED)" {
                 gsub("\\[|\\]", "", $5);
@@ -769,35 +857,39 @@ jobs:
                 ;;
             esac
 
-            FOUND="$($REAL_GCC -print-file-name="$LIB" 2>/dev/null || true)"
+            FOUND="$("$GCC" -print-file-name="$LIB" 2>/dev/null || true)"
 
-            if [ -z "$FOUND" ] || [ "$FOUND" = "$LIB" ] || [ ! -e "$FOUND" ]; then
+            if [ -z "$FOUND" ] || [ "$FOUND" = "$LIB" ] || [ ! -f "$FOUND" ]; then
+              FOUND=""
+
               for candidate in \
                 "$MUSL_SYSROOT_LIB/$LIB" \
                 "$MUSL_GCC_LIB/$LIB" \
-                "$MUSL_SYSROOT/usr/lib/$LIB"
+                "$SYSROOT/usr/lib/$LIB"
               do
-                if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+                if [ -f "$candidate" ]; then
                   FOUND="$candidate"
                   break
                 fi
               done
             fi
 
-            if [ -z "$FOUND" ] || [ "$FOUND" = "$LIB" ] || [ ! -e "$FOUND" ]; then
+            if [ -z "$FOUND" ]; then
               echo "ERROR: Required runtime library not found: $LIB"
-              echo "GCC returned: $FOUND"
               exit 1
             fi
+
+            echo "Bundling: $LIB"
+            echo "  from: $FOUND"
 
             cp -Lf "$FOUND" "$RUNTIME_DIR/$LIB"
           done < "$RUNNER_TEMP/spotui-needed.txt"
 
-          chmod 0755 "$RUNTIME_DIR/ld-musl-mipsel.so.1"
           chmod 0644 "$RUNTIME_DIR"/*.so* 2>/dev/null || true
           chmod 0755 "$RUNTIME_DIR/ld-musl-mipsel.so.1"
 
-          echo "Runtime contents:"
+          echo
+          echo "R1 runtime contents:"
           ls -lah "$RUNTIME_DIR"
 
           echo
