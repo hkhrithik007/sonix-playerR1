@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Final Toolchain Fix) (Toolchain Layout Fix) (R1 Loader Fix)
+name: Build SpotUI for HiBy R1 (Final Toolchain Fix)
 
 on:
   push:
@@ -310,9 +310,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v7-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v8-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
           restore-keys: |
-            spotui-cargo-v7-r1-loader-${{ runner.os }}-
+            spotui-cargo-v8-r1-loader-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -468,81 +468,96 @@ jobs:
         run: |
           set -euo pipefail
 
+          # IMPORTANT:
+          # ld-musl-mipsel.so.1 is the runtime dynamic loader. It is not
+          # a normal link library, so GCC is allowed to return the bare
+          # name when asked with -print-file-name=ld-musl-mipsel.so.1.
+          # Never use that query to decide whether the loader exists.
+          #
+          # Also do NOT recursively scan the cross-toolchain. These
+          # archives contain symlinks and recursive find can walk into
+          # a filesystem loop.
+          #
+          # Cargo uses the target GCC directly, matching the working
+          # SpotUI cross-build configuration.
+
           TOOLCHAIN="$MIPSEL_TOOLCHAIN_DIR"
-          REAL_GCC="$TOOLCHAIN/bin/mipsel-linux-musl-gcc"
+          MIPSEL_GCC="$TOOLCHAIN/bin/mipsel-linux-musl-gcc"
 
-          test -x "$REAL_GCC" || {
-            echo "ERROR: MIPS GCC not found: $REAL_GCC"
+          test -x "$MIPSEL_GCC" || {
+            echo "ERROR: MIPS GCC not found: $MIPSEL_GCC"
             exit 1
           }
 
-          # GCC is the authoritative source for its sysroot and support files.
-          SYSROOT="$($REAL_GCC --print-sysroot 2>/dev/null || true)"
-
-          if [ -z "$SYSROOT" ] || [ ! -d "$SYSROOT" ]; then
-            echo "ERROR: GCC returned an invalid sysroot: '$SYSROOT'"
-            echo "Compiler: $REAL_GCC"
-            echo "GCC -print-sysroot output:"
-            "$REAL_GCC" --print-sysroot || true
+          TARGET="$($MIPSEL_GCC -dumpmachine)"
+          test "$TARGET" = "mipsel-linux-musl" || {
+            echo "ERROR: unexpected compiler target: $TARGET"
             exit 1
-          fi
-
-          gcc_file() {
-            local name="$1"
-            local result
-
-            result="$($REAL_GCC -print-file-name="$name" 2>/dev/null || true)"
-
-            # GCC returns the bare filename when it cannot resolve it.
-            if [ -n "$result" ] && [ "$result" != "$name" ] && [ -e "$result" ]; then
-              printf '%s\n' "$result"
-              return 0
-            fi
-
-            return 1
           }
 
-          CRT1="$(gcc_file crt1.o || true)"
-          CRTI="$(gcc_file crti.o || true)"
-          CRTN="$(gcc_file crtn.o || true)"
-          CRTBEGIN="$(gcc_file crtbegin.o || true)"
-          CRTEND="$(gcc_file crtend.o || true)"
-          LOADER="$(gcc_file ld-musl-mipsel.so.1 || true)"
+          # Let GCC tell us its actual sysroot.
+          SYSROOT="$($MIPSEL_GCC -print-sysroot 2>/dev/null || true)"
+          test -n "$SYSROOT" || {
+            echo "ERROR: GCC returned an empty sysroot."
+            exit 1
+          }
 
-          # Fallback to the normal musl sysroot loader path. This is a
-          # deterministic path check, not a recursive filesystem scan.
-          if [ -z "$LOADER" ]; then
-            for candidate in \
-              "$SYSROOT/lib/ld-musl-mipsel.so.1" \
-              "$SYSROOT/usr/lib/ld-musl-mipsel.so.1" \
-              "$TOOLCHAIN/lib/ld-musl-mipsel.so.1" \
-              "$TOOLCHAIN/usr/lib/ld-musl-mipsel.so.1"
-            do
-              if [ -e "$candidate" ]; then
-                LOADER="$candidate"
-                break
-              fi
-            done
-          fi
+          test -d "$SYSROOT" || {
+            echo "ERROR: GCC sysroot does not exist: $SYSROOT"
+            exit 1
+          }
+
+          # These are link-time CRT objects. GCC knows their exact locations.
+          CRT1="$($MIPSEL_GCC -print-file-name=crt1.o)"
+          CRTI="$($MIPSEL_GCC -print-file-name=crti.o)"
+          CRTN="$($MIPSEL_GCC -print-file-name=crtn.o)"
+          CRTBEGIN="$($MIPSEL_GCC -print-file-name=crtbegin.o)"
+          CRTEND="$($MIPSEL_GCC -print-file-name=crtend.o)"
 
           for pair in \
             "crt1.o:$CRT1" \
             "crti.o:$CRTI" \
             "crtn.o:$CRTN" \
             "crtbegin.o:$CRTBEGIN" \
-            "crtend.o:$CRTEND" \
-            "ld-musl-mipsel.so.1:$LOADER"
+            "crtend.o:$CRTEND"
           do
             NAME="${pair%%:*}"
             VALUE="${pair#*:}"
 
-            if [ -z "$VALUE" ] || [ ! -e "$VALUE" ]; then
-              echo "ERROR: Could not resolve $NAME"
-              echo "GCC reports:"
-              "$REAL_GCC" -print-file-name="$NAME" || true
+            if [ -z "$VALUE" ] || [ "$VALUE" = "$NAME" ] || [ ! -e "$VALUE" ]; then
+              echo "ERROR: GCC could not resolve $NAME"
+              echo "gcc -print-file-name=$NAME -> $VALUE"
               exit 1
             fi
           done
+
+          # The musl dynamic linker is installed in the target's /lib.
+          # This is a deterministic path relative to GCC's sysroot.
+          LOADER="$SYSROOT/lib/ld-musl-mipsel.so.1"
+
+          if [ ! -e "$LOADER" ] && [ ! -L "$LOADER" ]; then
+            # Some toolchain layouts use usr/lib; allow that deterministic
+            # alternative, but never recurse through the toolchain.
+            ALT_LOADER="$SYSROOT/usr/lib/ld-musl-mipsel.so.1"
+            if [ -e "$ALT_LOADER" ] || [ -L "$ALT_LOADER" ]; then
+              LOADER="$ALT_LOADER"
+            fi
+          fi
+
+          if [ ! -e "$LOADER" ] && [ ! -L "$LOADER" ]; then
+            echo "ERROR: musl loader was not found in GCC sysroot."
+            echo
+            echo "GCC sysroot: $SYSROOT"
+            echo "Expected: $SYSROOT/lib/ld-musl-mipsel.so.1"
+            echo "Alternative: $SYSROOT/usr/lib/ld-musl-mipsel.so.1"
+            echo
+            echo "Sysroot lib directory:"
+            ls -la "$SYSROOT/lib" 2>/dev/null || true
+            echo
+            echo "Sysroot usr/lib directory:"
+            ls -la "$SYSROOT/usr/lib" 2>/dev/null || true
+            exit 1
+          fi
 
           SYSROOT_LIB="$(dirname "$CRT1")"
           GCC_LIB="$(dirname "$CRTBEGIN")"
@@ -550,46 +565,42 @@ jobs:
           echo "============================================"
           echo "MIPS TOOLCHAIN CONFIGURATION"
           echo "============================================"
-          echo "GCC          : $REAL_GCC"
-          echo "Target       : $($REAL_GCC -dumpmachine)"
-          echo "Sysroot      : $SYSROOT"
-          echo "Sysroot lib  : $SYSROOT_LIB"
-          echo "GCC runtime  : $GCC_LIB"
-          echo "crt1.o       : $CRT1"
-          echo "crti.o       : $CRTI"
-          echo "crtn.o       : $CRTN"
-          echo "crtbegin.o   : $CRTBEGIN"
-          echo "crtend.o     : $CRTEND"
-          echo "Musl loader  : $LOADER"
+          echo "GCC            : $MIPSEL_GCC"
+          echo "Target         : $TARGET"
+          echo "Sysroot        : $SYSROOT"
+          echo "Sysroot lib    : $SYSROOT_LIB"
+          echo "GCC runtime    : $GCC_LIB"
+          echo "crt1.o         : $CRT1"
+          echo "crti.o         : $CRTI"
+          echo "crtn.o         : $CRTN"
+          echo "crtbegin.o     : $CRTBEGIN"
+          echo "crtend.o       : $CRTEND"
+          echo "Musl loader    : $LOADER"
+          echo "Loader target  : $(readlink -f "$LOADER" 2>/dev/null || true)"
 
-          # Use the toolchain GCC directly. Its own specs contain the
-          # correct target search paths; no fragile wrapper is needed.
           mkdir -p "$LIBRESPOT_ROOT/.cargo"
           mkdir -p "$SPOTUI_ROOT/engine/ui/.cargo"
 
           cat > "$LIBRESPOT_ROOT/.cargo/config.toml" <<EOF
           [target.mipsel-unknown-linux-musl]
-          linker = "$REAL_GCC"
+          linker = "$MIPSEL_GCC"
           EOF
 
           cat > "$SPOTUI_ROOT/engine/ui/.cargo/config.toml" <<EOF
           [target.mipsel-unknown-linux-musl]
-          linker = "$REAL_GCC"
+          linker = "$MIPSEL_GCC"
           EOF
-
-          echo
-          echo "librespot Cargo config:"
-          cat "$LIBRESPOT_ROOT/.cargo/config.toml"
 
           echo "MUSL_SYSROOT=$SYSROOT" >> "$GITHUB_ENV"
           echo "MUSL_SYSROOT_LIB=$SYSROOT_LIB" >> "$GITHUB_ENV"
           echo "MUSL_GCC_LIB=$GCC_LIB" >> "$GITHUB_ENV"
           echo "MUSL_LOADER=$LOADER" >> "$GITHUB_ENV"
-          echo "MIPSEL_GCC=$REAL_GCC" >> "$GITHUB_ENV"
+          echo "MIPSEL_GCC=$MIPSEL_GCC" >> "$GITHUB_ENV"
 
-      # ============================================================
-      # VERIFY MIPS TOOLCHAIN
-      # ============================================================
+          echo
+          echo "librespot Cargo config:"
+          cat "$LIBRESPOT_ROOT/.cargo/config.toml"
+
       - name: Verify MIPS toolchain
         shell: bash
         run: |
@@ -602,9 +613,9 @@ jobs:
           test -f "$MUSL_SYSROOT_LIB/crtn.o"
           test -f "$MUSL_GCC_LIB/crtbegin.o"
           test -f "$MUSL_GCC_LIB/crtend.o"
-          test -e "$MUSL_LOADER"
+          test -e "$MUSL_LOADER" || test -L "$MUSL_LOADER"
 
-          echo "GCC version:"
+          echo "GCC:"
           "$MIPSEL_GCC" --version | head -n 1
 
           echo
@@ -613,18 +624,20 @@ jobs:
 
           echo
           echo "Sysroot:"
-          "$MIPSEL_GCC" --print-sysroot
+          "$MIPSEL_GCC" -print-sysroot
 
           echo
           echo "CRT resolution:"
           "$MIPSEL_GCC" -print-file-name=crt1.o
+          "$MIPSEL_GCC" -print-file-name=crti.o
+          "$MIPSEL_GCC" -print-file-name=crtn.o
           "$MIPSEL_GCC" -print-file-name=crtbegin.o
           "$MIPSEL_GCC" -print-file-name=crtend.o
 
           echo
-          echo "Musl loader resolution:"
-          "$MIPSEL_GCC" -print-file-name=ld-musl-mipsel.so.1 || true
+          echo "Musl loader:"
           ls -l "$MUSL_LOADER"
+          readlink -f "$MUSL_LOADER" 2>/dev/null || true
 
           echo
           echo "MIPS toolchain verification passed."
@@ -759,7 +772,20 @@ jobs:
             FOUND="$($REAL_GCC -print-file-name="$LIB" 2>/dev/null || true)"
 
             if [ -z "$FOUND" ] || [ "$FOUND" = "$LIB" ] || [ ! -e "$FOUND" ]; then
-              echo "ERROR: GCC could not resolve runtime library: $LIB"
+              for candidate in \
+                "$MUSL_SYSROOT_LIB/$LIB" \
+                "$MUSL_GCC_LIB/$LIB" \
+                "$MUSL_SYSROOT/usr/lib/$LIB"
+              do
+                if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+                  FOUND="$candidate"
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$FOUND" ] || [ "$FOUND" = "$LIB" ] || [ ! -e "$FOUND" ]; then
+              echo "ERROR: Required runtime library not found: $LIB"
               echo "GCC returned: $FOUND"
               exit 1
             fi
