@@ -24,12 +24,14 @@
 
 #include "src/system/bluetooth/airpods.h"
 #include "src/system/audio/audio.h"
+#include "src/system/bluetooth/btlog.h"
 #include "src/system/bluetooth/btreceiver.h"
 #include "src/system/bluetooth/btstack.h"
 #include "src/system/bluetooth/btvolume.h"
 #include "src/system/core/config.h"
 #include "src/system/device/power.h"
 #include "src/system/device/sysserver.h" // only for the notification socket now
+#include "src/system/remote/sonixlink_bt.h"
 #include "src/system/core/utils.h"
 
 // The pieces of the firmware this player uses, and nothing else. The bluez-tools
@@ -401,9 +403,11 @@ static bool stop_process(const char *name) {
 // this process's children: the player must never have to reap a daemon it is
 // not watching, and a daemon must never die because the player restarted.
 //
-// stdout and stderr are deliberately inherited -- that is how bluetoothd's and
-// bluealsa's own complaints reach the player's log, which is the only place
-// anybody ever reads them from on this device.
+// stdout and stderr are deliberately inherited -- that is how bluealsa's own
+// complaints, and anything else a daemon prints, reach the player's log, which
+// is the only place anybody ever reads them from on this device. bluetoothd
+// prints nothing there: it writes to syslog, which only the Bluetooth log
+// (btlog.h) listens to.
 static bool spawn_daemon(const char *path, char *const argv[]) {
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -429,6 +433,14 @@ static bool spawn_daemon(const char *path, char *const argv[]) {
 		// only reaping the middle process, which exits immediately
 	}
 	return true;
+}
+
+// bluez reads SIGUSR2 as "turn every debug line on", for good: there is no
+// signal that turns them off again, so the next bluetoothd started without -d
+// is what does.
+void bluetooth_daemon_debug_on(void) {
+	int sig = SIGUSR2;
+	for_each_process("bluetoothd", send_signal, &sig);
 }
 
 // The one place a helper is still run and waited for. Only ever with a fixed
@@ -823,7 +835,17 @@ static bool ensure_bluetoothd(void) {
 	if (!process_running("bluetoothd")) {
 		// -E is the experimental interface and -C the SDP compatibility one. Both
 		// are what the firmware starts it with.
-		char *argv[4] = {(char *)"bluetoothd", (char *)"-E", (char *)"-C", NULL};
+		//
+		// -d only with the Bluetooth log on (btlog.h): every debug line of
+		// bluez, from the profile state machine to the AVDTP negotiation. What
+		// bluetoothd says reaches that log through syslog, which it always
+		// writes to and the log listens on -- so nothing changes about where
+		// its output goes, and with the log off it goes nowhere, as on the
+		// firmware.
+		char *argv[5] = {(char *)"bluetoothd", (char *)"-E", (char *)"-C", NULL, NULL};
+		if (btlog_enabled()) {
+			argv[3] = (char *)"-d";
+		}
 		spawn_daemon(BLUETOOTHD_BIN, argv);
 	}
 
@@ -1127,7 +1149,7 @@ static bool ensure_bluealsa(void) {
 		char codecs[BT_MAX_CODECS][BT_CODEC_MAX];
 		int codec_count = codecs_to_ask_for(codecs, BT_MAX_CODECS);
 
-		char *argv[10 + BT_MAX_CODECS * 2];
+		char *argv[11 + BT_MAX_CODECS * 2];
 		int at = 0;
 		argv[at++] = (char *)"bluealsa";
 		argv[at++] = (char *)"-p";
@@ -1145,6 +1167,12 @@ static bool ensure_bluealsa(void) {
 		for (int i = 0; i < codec_count; i++) {
 			argv[at++] = (char *)"-c";
 			argv[at++] = codecs[i];
+		}
+		// With the Bluetooth log on, bluealsa's complaints go to syslog so they
+		// land in that log, stamped and in order with bluez's; otherwise they
+		// stay on stderr, which is the player's log.
+		if (btlog_enabled() && bluealsa_knows_option("--syslog")) {
+			argv[at++] = (char *)"--syslog";
 		}
 		argv[at] = NULL;
 		if (codec_count) {
@@ -1626,6 +1654,15 @@ static void forget_last_device(const char *mac) {
 // of the bring-up, before anything is asked of them.
 #define SELF_RECONNECT_GRACE_MS 8000
 
+// Whether Bluetooth is still meant to be on: a wait that took seconds may have
+// been overtaken by the switch.
+static bool bluetooth_still_wanted(void) {
+	pthread_mutex_lock(&lock);
+	bool wanted = g_enabled;
+	pthread_mutex_unlock(&lock);
+	return wanted;
+}
+
 // Waits for the bluealsa PCM of this device to exist, or for the deadline.
 static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 	for (int waited = 0;; waited += 100) {
@@ -1633,10 +1670,7 @@ static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 		if (btstack_audio_sink(sink, sizeof(sink)) && strcasecmp(sink, mac) == 0) {
 			return true;
 		}
-		pthread_mutex_lock(&lock);
-		bool abandon = !g_enabled;
-		pthread_mutex_unlock(&lock);
-		if (abandon || waited >= timeout_ms) {
+		if (!bluetooth_still_wanted() || waited >= timeout_ms) {
 			return false;
 		}
 		sleep_ms(100);
@@ -1649,7 +1683,8 @@ static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 //
 // A device streaming to this one is not a sink: a computer or a phone sending
 // to the receiver holds the other direction, and pushing it off would cut the
-// music it is sending.
+// music it is sending. Nor is a phone holding a SonixLink link: it is the
+// remote control, and the headphones connect beside it.
 static bool other_connected_sink(const char *except, char *out, size_t size) {
 	char sender[BT_MAC_MAX];
 	bool has_sender = btstack_audio_source(sender, sizeof(sender));
@@ -1657,6 +1692,9 @@ static bool other_connected_sink(const char *except, char *out, size_t size) {
 	pthread_mutex_lock(&lock);
 	for (int i = 0; i < g_paired_count; i++) {
 		if (has_sender && strcasecmp(g_paired[i].mac, sender) == 0) {
+			continue;
+		}
+		if (sonixlink_bt_is_peer(g_paired[i].mac)) {
 			continue;
 		}
 		if (g_paired[i].connected && strcasecmp(g_paired[i].mac, except) != 0) {
@@ -1674,6 +1712,64 @@ static bool other_connected_sink(const char *except, char *out, size_t size) {
 // makes bluez tear the link down.
 #define CONNECT_TIMEOUT_MS 25000
 #define PAIR_TIMEOUT_MS 40000
+
+// How long a device that refused Connect is watched for an audio stream of its
+// own before it is asked again.
+#define REFUSED_SETTLE_MS 2000
+
+// Whether the user has asked for something since the job that is running now:
+// a search, a pairing, a connection, a disconnection, a device forgotten.
+static bool user_job_waiting(void) {
+	bool waiting = false;
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < queue_count && !waiting; i++) {
+		switch (queue[(queue_head + i) % JOB_QUEUE_LEN].type) {
+		case JOB_SCAN:
+		case JOB_PAIR:
+		case JOB_CONNECT:
+		case JOB_DISCONNECT:
+		case JOB_FORGET:
+			waiting = true;
+			break;
+		default:
+			break;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return waiting;
+}
+
+// Whether a second Connect may still go out after a refused one. The same
+// things that stop going back to the last headphones stop it: the receiver
+// on, or a phone streaming to this device -- a Connect while that link is up
+// is what used to knock it off -- the user having moved on to something else,
+// or Bluetooth switched off in the meantime.
+static bool second_connect_allowed(const char *mac) {
+	if (!bluetooth_still_wanted()) {
+		return false;
+	}
+	char other[BT_MAC_MAX];
+	if (btstack_audio_source(other, sizeof(other)) || btreceiver_is_active()) {
+		fprintf(stderr, "bluetooth: something is streaming to this device; not asking %s again\n", mac);
+		return false;
+	}
+	if (user_job_waiting()) {
+		fprintf(stderr, "bluetooth: the user asked for something else; not asking %s again\n", mac);
+		return false;
+	}
+	return true;
+}
+
+// Whether a failed Connect was answered by the device itself, as opposed to the
+// device not being there at all. Only org.bluez.Error.Failed qualifies --
+// NotReady, InProgress, AlreadyConnected and the rest are about this side --
+// and of those, "Host is down" is the page timeout of a device that is switched
+// off or out of range, where asking again only repeats the five seconds. No
+// answer at all (an empty `why`) is a timeout of this side's own and does not
+// qualify either.
+static bool connect_was_refused(const char *why) {
+	return strstr(why, "org.bluez.Error.Failed") != NULL && strstr(why, "Host is down") == NULL;
+}
 
 static bool connect_device(const char *mac) {
 	// Never on top of a link that is already up.
@@ -1696,7 +1792,28 @@ static bool connect_device(const char *mac) {
 		sleep_ms(400);
 	}
 
-	bool ok = btstack_connect(mac, CONNECT_TIMEOUT_MS);
+	char why[160];
+	bool ok = btstack_connect(mac, CONNECT_TIMEOUT_MS, why, sizeof(why));
+	if (!ok && connect_was_refused(why)) {
+		// Not a speaker that is off or out of range -- that is a page
+		// timeout, "Host is down", five seconds of nothing. This one answered
+		// and the link came up for a moment before bluez gave up on it.
+		//
+		// Some speakers open their own A2DP stream the instant the link is
+		// there, at the same time as bluez opens one towards them; the two
+		// collide, bluez's side loses and answers Connect with a failure,
+		// and the speaker's own stream either carries on or is dropped with
+		// the link a second later. The first is looked for, the second gets
+		// one more Connect, made from scratch once the first has let go.
+		fprintf(stderr, "bluetooth: %s refused the link (%s)\n", mac, why);
+		if (wait_for_a2dp(mac, REFUSED_SETTLE_MS)) {
+			fprintf(stderr, "bluetooth: %s brought its audio up by itself after all\n", mac);
+			ok = true;
+		} else if (second_connect_allowed(mac)) {
+			fprintf(stderr, "bluetooth: asking %s once more\n", mac);
+			ok = btstack_connect(mac, CONNECT_TIMEOUT_MS, why, sizeof(why));
+		}
+	}
 	fprintf(stderr, "bluetooth: connect %s -> %s\n", mac, ok ? "ok" : "FAILED");
 	if (ok) {
 		remember_last_device(mac);
@@ -1726,6 +1843,20 @@ static bool connect_device(const char *mac) {
 	return ok;
 }
 
+// How long a bond reported as failed is looked for in bluez all the same.
+#define PAIR_LATE_MS 2000
+
+static bool device_is_paired(const char *mac) {
+	btstack_device_t devices[BT_MAX_DEVICES];
+	int count = btstack_devices(devices, BT_MAX_DEVICES);
+	for (int i = 0; i < count; i++) {
+		if (devices[i].paired && strcasecmp(devices[i].address, mac) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool pair_and_connect(const char *mac) {
 	// bluez must currently know this address. It ages a merely-seen device out
 	// after thirty seconds, and between the sweep finishing, the list being
@@ -1751,8 +1882,23 @@ static bool pair_and_connect(const char *mac) {
 
 	fprintf(stderr, "bluetooth: pairing %s\n", mac);
 	if (!btstack_pair(mac, PAIR_TIMEOUT_MS)) {
-		fprintf(stderr, "bluetooth: %s would not pair\n", mac);
-		return false;
+		// Some earbuds complete the bond and close the link before bluez has
+		// the answer to Pair, which then reports a failure or a timeout while
+		// the bond is saved -- and after the next Bluetooth restart the device
+		// shows up as paired after all. bluez's own Paired property is asked
+		// for a moment before calling it a failure.
+		bool paired = false;
+		for (int waited = 0; waited <= PAIR_LATE_MS && !paired; waited += 100) {
+			paired = device_is_paired(mac);
+			if (!paired && waited < PAIR_LATE_MS) {
+				sleep_ms(100);
+			}
+		}
+		if (!paired) {
+			fprintf(stderr, "bluetooth: %s would not pair\n", mac);
+			return false;
+		}
+		fprintf(stderr, "bluetooth: %s kept the bond although Pair failed; going on\n", mac);
 	}
 
 	// Trusted only for a device the user chose explicitly, which is exactly what
@@ -1802,26 +1948,15 @@ static bool reconnect_should_stop(const char *mac) {
 	bool off = !g_enabled;
 	bool someone_else = false;
 	for (int i = 0; i < g_paired_count && !someone_else; i++) {
-		if (g_paired[i].connected && strcasecmp(g_paired[i].mac, mac) != 0) {
+		// A phone driving the player through SonixLink is not in the way of
+		// the headphones coming back.
+		if (g_paired[i].connected && strcasecmp(g_paired[i].mac, mac) != 0 && !sonixlink_bt_is_peer(g_paired[i].mac)) {
 			copy_field(other, sizeof(other), g_paired[i].mac, sizeof(g_paired[i].mac));
 			someone_else = true;
 		}
 	}
-	bool user_waiting = false;
-	for (int i = 0; i < queue_count && !user_waiting; i++) {
-		switch (queue[(queue_head + i) % JOB_QUEUE_LEN].type) {
-		case JOB_SCAN:
-		case JOB_PAIR:
-		case JOB_CONNECT:
-		case JOB_DISCONNECT:
-		case JOB_FORGET:
-			user_waiting = true;
-			break;
-		default:
-			break;
-		}
-	}
 	pthread_mutex_unlock(&lock);
+	bool user_waiting = user_job_waiting();
 
 	if (off) {
 		return true;
@@ -2146,7 +2281,7 @@ static bool connected_mac(char *out, size_t size) {
 	bool found = false;
 	pthread_mutex_lock(&lock);
 	for (int i = 0; i < g_paired_count; i++) {
-		if (g_paired[i].connected) {
+		if (g_paired[i].connected && !sonixlink_bt_is_peer(g_paired[i].mac)) {
 			copy_field(out, size, g_paired[i].mac, sizeof(g_paired[i].mac));
 			found = true;
 			break;
@@ -2731,6 +2866,9 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_DISCONNECT:
 				name_for(job.mac, name, sizeof(name));
+				// Logged, because in the log a link closed from here and a
+				// speaker dropping the link look exactly the same otherwise.
+				fprintf(stderr, "bluetooth: disconnecting %s (asked for)\n", job.mac);
 				btstack_disconnect(job.mac);
 				sleep_ms(400);
 				refresh_devices();
@@ -2739,6 +2877,7 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_FORGET:
 				name_for(job.mac, name, sizeof(name));
+				fprintf(stderr, "bluetooth: forgetting %s\n", job.mac);
 				btstack_disconnect(job.mac);
 				set_op(btstack_remove(job.mac) ? BT_OP_OK : BT_OP_FAILED, name);
 				forget_last_device(job.mac);
@@ -3097,11 +3236,13 @@ void bluetooth_connect(const char *mac) { post_device_job(JOB_CONNECT, mac); }
 void bluetooth_disconnect(const char *mac) { post_device_job(JOB_DISCONNECT, mac); }
 void bluetooth_forget(const char *mac) { post_device_job(JOB_FORGET, mac); }
 
+// The connected audio device. A phone that is only the SonixLink remote is
+// connected too, and is not it.
 bool bluetooth_connected_device(bt_device_t *out) {
 	bool found = false;
 	pthread_mutex_lock(&lock);
 	for (int i = 0; i < g_paired_count; i++) {
-		if (g_paired[i].connected) {
+		if (g_paired[i].connected && !sonixlink_bt_is_peer(g_paired[i].mac)) {
 			if (out) {
 				*out = g_paired[i];
 			}

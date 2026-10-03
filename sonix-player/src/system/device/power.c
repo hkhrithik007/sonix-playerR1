@@ -615,9 +615,12 @@ static void park_wifi_now(void) {
 // Bluetooth's own "the point rather than an idle drain": a sink being written
 // to, a link that is up at all, a scan or a pairing in flight. A radio with
 // nothing on the other end of it is worth exactly as much off as on.
+//
+// SonixLink switched on counts, as it does for the Wi-Fi radio: a phone can
+// reach it over Bluetooth, and a parked radio is one the phone cannot find.
 static bool bluetooth_in_use(void) {
 	return bluetooth_audio_active() || bluetooth_connected_device(NULL) || bluetooth_scan_running() ||
-		   bluetooth_busy();
+		   bluetooth_busy() || sonixlink_get_enabled();
 }
 
 // Whether the player has anything on. This is what holds the shutdown timer at
@@ -983,6 +986,8 @@ static void suspend_to_ram(void) {
 		rtc_alarm_disarm(); // armed a moment ago for a sleep that never began
 		headset_suspend_finish();
 		headset_keys_wake();
+		// The route was parked and the DAC muted for a sleep that never began.
+		audio_force_output_reinit_after_resume();
 		return;
 	}
 	fputs("mem", f);
@@ -1016,8 +1021,12 @@ static void suspend_to_ram(void) {
 	// (suspend_volage == work_voltage on all four DCDCs) and the codec driver's
 	// PM callbacks are empty, so the CS43198 keeps its registers. See the note
 	// on alsa_controls_reapply() in alsa-controls.c.
+	//
+	// After a refused suspend too: the route was parked and the DAC muted all
+	// the same, and left that way the next play goes to the parked socket in
+	// silence.
+	audio_force_output_reinit_after_resume();
 	if (rc == 0) {
-		audio_force_output_reinit_after_resume();
 
 		// And the same courtesy to the radio. The daemons came through the
 		// suspend -- they are processes, nothing suspended them -- but the
@@ -1751,3 +1760,5 @@ void power_init(const power_config_t *cfg, lv_display_t *disp) {
 		   g_cfg.brightness, g_cfg.screen_off_enabled ? "on" : "off", g_cfg.screen_off_timeout_ms,
 		   g_mem_enabled ? "TEST" : "no", (unsigned long)mem_secs);
 }
+
+bool power_radios_parked(void) { return g_wifi_parked || g_bt_parked; }

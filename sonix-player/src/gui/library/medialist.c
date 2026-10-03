@@ -284,10 +284,11 @@ static bool album_view = true;
 static bool quality_badges;
 
 // "Show artist": the artist under each row's title, on the lists picked out by
-// artist_lists (MEDIALIST_ARTIST_* bits). Off by default, with all three picked
-// so that switching it on shows something at once.
+// artist_lists (MEDIALIST_ARTIST_* bits). Off by default, with all of them
+// picked so that switching it on shows something at once.
 static bool show_artist;
-static int artist_lists = MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES;
+static int artist_lists =
+	MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES;
 
 // Both are read on first use rather than in medialist_init(): the music
 // settings page is built before it (see gui_init), so a switch built from these
@@ -774,7 +775,7 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 }
 
 // Whether this list is one "Show artist" is on for: all the tracks, the albums
-// and the tracks inside one, or the tracks of a genre. Not an artist's own
+// and the tracks inside one, a genre's albums and tracks, or the favourites. Not an artist's own
 // lists, where the name is the page's title already, and not the name lists,
 // whose rows are artists or genres themselves.
 static bool panel_shows_artist(const panel_t *p) {
@@ -788,8 +789,11 @@ static bool panel_shows_artist(const panel_t *p) {
 		(p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_ALBUM)) {
 		return (artist_lists & MEDIALIST_ARTIST_ALBUMS) != 0;
 	}
-	if (p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_GENRE) {
+	if ((p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_ALBUMS) && p->filter == LIBRARY_FILTER_GENRE) {
 		return (artist_lists & MEDIALIST_ARTIST_GENRES) != 0;
+	}
+	if (p->kind == LIBRARY_LIST_FAVOURITES) {
+		return (artist_lists & MEDIALIST_ARTIST_FAVOURITES) != 0;
 	}
 	return false;
 }
@@ -2161,10 +2165,11 @@ static void row_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	// An artist: their records, or their tracks when the album view is off.
-	// An album, a genre: the tracks either way.
-	bool by_artist = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS;
-	if (by_artist && medialist_album_view()) {
+	// An artist or a genre: its records, or its tracks when the album view is
+	// off. An album: the tracks.
+	bool grouped = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS ||
+				   p->kind == LIBRARY_LIST_GENRES;
+	if (grouped && medialist_album_view()) {
 		medialist_open(name, LIBRARY_LIST_ALBUMS, filter_for(p->kind), name);
 		return;
 	}
@@ -3335,12 +3340,12 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	}
 
 	// Which of the three screens this list belongs on. Tracks are always the
-	// last level; an album list narrowed to one artist is the middle one;
-	// everything else is where a walk starts.
+	// last level; an album list narrowed to one artist or genre is the middle
+	// one; everything else is where a walk starts.
 	bool tracks_like =
 		(kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_FAVOURITES || kind == LIBRARY_LIST_PLAYLIST);
-	bool artist_albums = kind == LIBRARY_LIST_ALBUMS &&
-						 (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
+	bool artist_albums = kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
+														 filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE);
 	panel_t *p = tracks_like ? &panel_tracks : (artist_albums ? &panel_artist_albums : &panel_names);
 	p->kind = kind;
 	// A playlist is a query like any other, and the query's value is its
@@ -3612,4 +3617,43 @@ void medialist_init(gui_config_t *cfg) {
 	lv_timer_t *index_timer = lv_timer_create(index_timer_cb, 200, NULL);
 	power_pause_in_standby(index_timer);
 	theme_register_refresh(index_theme_refresh);
+}
+
+// ---------------------------------------------------------------------------
+// The order, for SonixLink
+// ---------------------------------------------------------------------------
+
+// The same decisions the corner buttons make in the list itself: which lists
+// can be reversed or put by date, and an artist's tracks by record.
+void medialist_list_order(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc) {
+	bool artist_tracks =
+		kind == LIBRARY_LIST_TRACKS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
+	bool sortable = (kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_NONE) ||
+					(kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_NONE) || kind == LIBRARY_LIST_ARTISTS ||
+					kind == LIBRARY_LIST_ALBUM_ARTISTS;
+	bool by_date = sort_can_date(kind, filter) && sort_is_added(kind);
+	if (order) {
+		*order = (artist_tracks && artist_album_order) ? LIBRARY_ORDER_ALBUM
+				 : by_date							   ? LIBRARY_ORDER_ADDED
+													   : LIBRARY_ORDER_DEFAULT;
+	}
+	if (desc) {
+		*desc = (sortable && !(artist_tracks && artist_album_order) && sort_is_desc(kind)) ||
+				(kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
+	}
+}
+
+void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artist_by_album, bool *favourites_reversed) {
+	if (desc_mask) {
+		*desc_mask = sort_desc_mask;
+	}
+	if (added_mask) {
+		*added_mask = sort_added_mask;
+	}
+	if (artist_by_album) {
+		*artist_by_album = artist_album_order;
+	}
+	if (favourites_reversed) {
+		*favourites_reversed = fav_reversed;
+	}
 }

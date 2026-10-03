@@ -7,10 +7,10 @@
 #include "lvgl/lvgl.h"
 
 // The library index pages: one screen for name lists (albums, artists, album
-// artists, genres), one for one artist's records, and one for track lists (all
-// tracks, and the tracks of whatever was tapped). A screen each rather than one
-// reused, so the back chevron walks artists -> that artist's albums -> the
-// album's tracks and back out again the way it should.
+// artists, genres), one for one artist's or one genre's records, and one for
+// track lists (all tracks, and the tracks of whatever was tapped). A screen each
+// rather than one reused, so the back chevron walks artists -> that artist's
+// albums -> the album's tracks and back out again the way it should.
 //
 // Rows are a fixed pool windowed over the scroll position, the same technique
 // as the file browser, and the data is windowed with them: the page holds the
@@ -18,17 +18,18 @@
 // rows back as the viewport moves, so the library has no size ceiling.
 extern lv_obj_t *medialist_screen;
 extern lv_obj_t *medialist_tracks_screen;
-// The middle level: one artist's records. Its own screen and not the first
-// one reused, because the way back from an album's tracks is that artist's
-// albums and the way back from those is the artist list -- three lists, and a
-// screen cannot be two of them at once.
+// The middle level: one artist's or one genre's records. Its own screen and
+// not the first one reused, because the way back from an album's tracks is
+// those albums and the way back from those is the artist or genre list -- three
+// lists, and a screen cannot be two of them at once.
 extern lv_obj_t *medialist_albums_screen;
 
 void medialist_init(gui_config_t *cfg);
 
-// Whether tapping an artist opens their records or their tracks. On by default;
-// Music > Display options turns it off, and an artist page is then a flat list
-// of that artist's tracks, with the album grouping on the corner button.
+// Whether tapping an artist or a genre opens its records or its tracks. On by
+// default; Music > Display options turns it off, and an artist or genre page is
+// then a flat list of tracks (an artist's with the album grouping on the corner
+// button).
 bool medialist_album_view(void);
 void medialist_set_album_view(bool on);
 
@@ -38,14 +39,26 @@ bool medialist_quality_badges(void);
 void medialist_set_quality_badges(bool on);
 
 // "Show artist": the artist under the title of each row, on the lists `lists`
-// picks out -- all the tracks, the albums, the tracks of a genre. The tracks
-// show their own artist, the albums their album artist.
+// picks out -- all the tracks, the albums, a genre's albums and tracks, the
+// favourites. The tracks show their own artist, the albums their album artist.
 #define MEDIALIST_ARTIST_TRACKS 1
 #define MEDIALIST_ARTIST_ALBUMS 2
 #define MEDIALIST_ARTIST_GENRES 4
+#define MEDIALIST_ARTIST_FAVOURITES 8
 bool medialist_show_artist(void);
 int medialist_artist_lists(void);
 void medialist_set_show_artist(bool on, int lists);
+
+// How the player's own list of `kind` narrowed by `filter` is ordered right now:
+// by name or by date, which way round, and an artist's tracks grouped by
+// record or not. What SonixLink follows, so a list on the phone reads in the
+// same order and a track tapped there gets the same queue as here.
+void medialist_list_order(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc);
+
+// The same choices as bits, for the phone to order its own lists by: bit
+// `kind` of `desc_mask` set is that list reversed, of `added_mask` that list by
+// date added.
+void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artist_by_album, bool *favourites_reversed);
 
 // Loads the list and switches to the right screen. For LIBRARY_LIST_TRACKS
 // the filter narrows to one album/artist/genre (LIBRARY_FILTER_NONE = all);

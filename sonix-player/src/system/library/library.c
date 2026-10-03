@@ -148,6 +148,11 @@ static const char *const SCHEMA_COLUMNS[] = {
 	// before the column existed therefore carries NULL until the card is
 	// scanned again. See TRACK_ORDER_IN_ALBUM.
 	"ALTER TABLE MEDIA_TABLE ADD COLUMN disc INT",
+	// Whose album the track is on (album_key()), written down with the track.
+	// The player works it out in SQL when it needs it, through albumkey(); the
+	// SonixLink app reads this same file on the phone, where that function does
+	// not exist, and finds an album's tracks by this column instead.
+	"ALTER TABLE MEDIA_TABLE ADD COLUMN album_key TEXT",
 	"ALTER TABLE ALBUM_TABLE ADD COLUMN sortkey TEXT",
 	"ALTER TABLE ARTIST_TABLE ADD COLUMN sortkey TEXT",
 	"ALTER TABLE ALBUM_ARTIST_TABLE ADD COLUMN sortkey TEXT",
@@ -264,6 +269,12 @@ static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
 // favourites are a table of their own precisely so that starring a track cannot
 // touch the index (see the FAVOURITES schema), and a single counter would let
 // the star button invalidate the handle the playback queue was built on.
+// A favourite's artist: the index's, where it has the track -- what the list
+// of all the tracks shows -- and the one stored with the star otherwise. A
+// track starred from a list is stored with no artist at all.
+#define FAV_ARTIST \
+	"COALESCE(NULLIF((SELECT m.artist FROM MEDIA_TABLE m WHERE m.path = FAVOURITES.path LIMIT 1), ''), artist)"
+
 typedef enum {
 	GEN_MEDIA = 0, // MEDIA_TABLE and the four lookup tables the scan fills
 	GEN_FAVOURITES,
@@ -1164,6 +1175,18 @@ static void album_groups_fill(void) {
 		   now_ms() - started_ms);
 }
 
+// The album_key column on an index written before it existed: one statement
+// over the tracks, once, the same as album_groups_fill() above. A scan writes
+// it with every row from then on.
+static void album_keys_fill(void) {
+	if (count_rows("SELECT 1 FROM MEDIA_TABLE WHERE album_key IS NULL LIMIT 1") == 0) {
+		return;
+	}
+	uint32_t started_ms = now_ms();
+	exec("UPDATE MEDIA_TABLE SET album_key = albumkey(album_artist, path) WHERE album_key IS NULL");
+	printf("library: album keys written down for %d tracks in %u ms\n", sqlite3_changes(db), now_ms() - started_ms);
+}
+
 bool library_open(const char *db_path) {
 	if (db) {
 		return true;
@@ -1236,6 +1259,7 @@ bool library_open(const char *db_path) {
 	}
 
 	album_groups_fill();
+	album_keys_fill();
 
 	pthread_mutex_lock(&db_lock);
 	bump_all_generations(); // a different card is a different set of row ids
@@ -1850,7 +1874,7 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 	const char *by_name = list_uses_sortkey(kind) ? "sortkey" : "name COLLATE listorder";
 
 	if (kind == LIBRARY_LIST_FAVOURITES) {
-		snprintf(sql, sizeof(sql), "SELECT name, path, artist FROM FAVOURITES ORDER BY added_at, rowid");
+		snprintf(sql, sizeof(sql), "SELECT name, path, %s FROM FAVOURITES ORDER BY added_at, rowid", FAV_ARTIST);
 	} else if (kind == LIBRARY_LIST_TRACKS) {
 		// Inside one album the disc order is the natural one; everywhere else
 		// the titles read best alphabetically.
@@ -2065,13 +2089,14 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		return;
 	}
 
-	// One artist's records, rather than one artist's tracks: the album list
-	// narrowed to the albums that artist appears on. ALBUM_GROUP_TABLE holds the
-	// albums and their sort keys, and which of them belong to an artist is a
-	// question for MEDIA_TABLE -- answered off media_artist_idx, once, so the
-	// subquery is a lookup and not a scan.
+	// One artist's or one genre's records, rather than their tracks: the album
+	// list narrowed to the albums with at least one track of theirs.
+	// ALBUM_GROUP_TABLE holds the albums and their sort keys, and which of them
+	// qualify is a question for MEDIA_TABLE -- answered off media_artist_idx,
+	// media_album_artist_idx or media_genre_sort_idx, once, so the subquery is
+	// a lookup and not a scan.
 	if (kind == LIBRARY_LIST_ALBUMS && col && value &&
-		(filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST)) {
+		(filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)) {
 		snprintf(sql, size,
 				 "SELECT %s FROM ALBUM_GROUP_TABLE WHERE album <> ''"
 				 " AND (album, album_key) IN (SELECT album, albumkey(album_artist, path) FROM MEDIA_TABLE WHERE %s)"
@@ -2166,7 +2191,7 @@ static const char *row_by_id_sql(library_list_t kind, const char *value, char *o
 	case LIBRARY_LIST_GENRES:
 		return "SELECT genre, NULL, NULL FROM GENRE_TABLE WHERE rowid=?";
 	case LIBRARY_LIST_FAVOURITES:
-		return "SELECT name, path, artist FROM FAVOURITES WHERE rowid=?";
+		return "SELECT name, path, " FAV_ARTIST " FROM FAVOURITES WHERE rowid=?";
 	default:
 		return NULL;
 	}
@@ -2204,11 +2229,11 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 
 	const char *col = filter_column(filter);
 	// The filtered lists take a bound value: a track list narrowed to one
-	// album/artist/genre, and an album list narrowed to one artist.
+	// album/artist/genre, and an album list narrowed to one artist or genre.
 	bool bound = col && value &&
 				 (kind == LIBRARY_LIST_TRACKS ||
-				  (kind == LIBRARY_LIST_ALBUMS &&
-				   (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST)));
+				  (kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
+												   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)));
 
 	char count_sql[512];
 	char rows_sql[512];
@@ -2881,8 +2906,8 @@ static bool prepare_statements(void) {
 						   "INSERT OR REPLACE INTO MEDIA_TABLE"
 						   "(id,path,name,album,artist,genre,year,dis_id,ck_id,has_child_file,begin_time,end_time,"
 						   "cue_id,character,size,sample_rate,bit_rate,bit,channel,format,quality,album_pic_path,"
-						   "lrc_path,track_gain,track_peak,album_artist,ctime,mtime,sortkey,disc)"
-						   " VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,?,0,?,0,?,\'\',NULL,NULL,0,0,?,?,?,?,?)",
+						   "lrc_path,track_gain,track_peak,album_artist,ctime,mtime,sortkey,disc,album_key)"
+						   " VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,?,0,?,0,?,\'\',NULL,NULL,0,0,?,?,?,?,?,?)",
 						   -1, &stmt_track, NULL) != SQLITE_OK) {
 		fprintf(stderr, "library: prepare failed: %s\n", sqlite3_errmsg(db));
 		return false;
@@ -2976,6 +3001,10 @@ static void insert_track(const char *path, const char *filename, const song_meta
 	// for those would put them on a shelf of their own, ahead of the disc they
 	// belong to.
 	sqlite3_bind_int(stmt_track, column++, tags->disc_number > 0 ? tags->disc_number : 1); // disc
+
+	char track_album_key[ALBUM_KEY_MAX];
+	album_key(album_artist, path, track_album_key, sizeof(track_album_key));
+	sqlite3_bind_text(stmt_track, column++, track_album_key, -1, SQLITE_TRANSIENT); // album_key
 
 	if (sqlite3_step(stmt_track) != SQLITE_DONE) {
 		fprintf(stderr, "library: insert failed: %s\n", sqlite3_errmsg(db));
@@ -3204,44 +3233,120 @@ static void scan_one_file(const char *child, const char *name, const struct stat
 // as they come, which costs no memory) keeping only the names of the
 // subdirectories, close it, and only then descend. One directory is open at any
 // depth, and what is carried down is names, a few dozen bytes each.
-// The folder filter, read from the config when a scan starts.
-#define SCAN_FOLDERS_MAX 64
-#define SCAN_FOLDERS_KEY_MAX (SCAN_FOLDERS_MAX * 64)
-static char scan_folder_names[SCAN_FOLDERS_MAX][256];
+// The folder filter: the chosen folders at the root of the card, one name per
+// line in scan_folders.txt beside device_config.ini, read when a scan starts.
+// Without that file the '/'-separated [library] scan_folders key is read.
+#define SCAN_FOLDERS_FILE "scan_folders.txt"
+static char **scan_folder_names;
 static int scan_folder_count;
 
-const char *library_scan_folders(void) { return config_get("library", "scan_folders", ""); }
-
-void library_scan_folders_set(const char *const *names, int count) {
-	static char joined[SCAN_FOLDERS_KEY_MAX];
-	size_t used = 0;
-	joined[0] = '\0';
-	for (int i = 0; names && i < count && used < sizeof(joined); i++) {
-		if (!names[i] || !names[i][0]) {
-			continue;
-		}
-		used += (size_t)snprintf(joined + used, sizeof(joined) - used, "%s%s", used ? "/" : "", names[i]);
+static void scan_folders_path(char *out, size_t size) {
+	const char *cfg = config_path();
+	const char *slash = cfg ? strrchr(cfg, '/') : NULL;
+	if (slash) {
+		snprintf(out, size, "%.*s/%s", (int)(slash - cfg), cfg, SCAN_FOLDERS_FILE);
+	} else {
+		snprintf(out, size, "%s", SCAN_FOLDERS_FILE);
 	}
-	if (used >= sizeof(joined)) {
-		joined[0] = '\0'; // too many to store: the whole card rather than a cut list
-	}
-	config_set("library", "scan_folders", joined);
-	config_save();
 }
 
-static void scan_folders_load(void) {
-	scan_folder_count = 0;
-	const char *p = library_scan_folders();
-	while (p && *p && scan_folder_count < SCAN_FOLDERS_MAX) {
+// Appends `name` to a growing array. False when memory runs out.
+static bool names_add(char ***names, int *count, int *capacity, const char *name, size_t len) {
+	if (*count == *capacity) {
+		int grown = *capacity ? *capacity * 2 : 32;
+		char **bigger = realloc(*names, (size_t)grown * sizeof(*bigger));
+		if (!bigger) {
+			return false;
+		}
+		*names = bigger;
+		*capacity = grown;
+	}
+	char *copy = malloc(len + 1);
+	if (!copy) {
+		return false;
+	}
+	memcpy(copy, name, len);
+	copy[len] = '\0';
+	(*names)[(*count)++] = copy;
+	return true;
+}
+
+char **library_scan_folders(int *count) {
+	*count = 0;
+	char **names = NULL;
+	int capacity = 0;
+
+	char path[512];
+	scan_folders_path(path, sizeof(path));
+	FILE *f = fopen(path, "r");
+	if (f) {
+		char *line = NULL;
+		size_t cap = 0;
+		ssize_t got;
+		while ((got = getline(&line, &cap, f)) >= 0) {
+			size_t len = strcspn(line, "\r\n");
+			if (len > 0 && !names_add(&names, count, &capacity, line, len)) {
+				break;
+			}
+		}
+		free(line);
+		fclose(f);
+		return names;
+	}
+
+	const char *p = config_get("library", "scan_folders", "");
+	while (p && *p) {
 		const char *end = strchr(p, '/');
 		size_t len = end ? (size_t)(end - p) : strlen(p);
-		if (len > 0 && len < sizeof(scan_folder_names[0])) {
-			memcpy(scan_folder_names[scan_folder_count], p, len);
-			scan_folder_names[scan_folder_count][len] = '\0';
-			scan_folder_count++;
+		if (len > 0 && !names_add(&names, count, &capacity, p, len)) {
+			break;
 		}
 		p = end ? end + 1 : NULL;
 	}
+	return names;
+}
+
+void library_scan_folders_free(char **names, int count) {
+	for (int i = 0; i < count; i++) {
+		free(names[i]);
+	}
+	free(names);
+}
+
+void library_scan_folders_set(const char *const *names, int count) {
+	char path[512];
+	scan_folders_path(path, sizeof(path));
+	char tmp[520];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+	// An empty file is the whole card, the same as no file, and keeps the
+	// config key from being read in its place.
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		fprintf(stderr, "library: cannot write %s: %s\n", tmp, strerror(errno));
+		return;
+	}
+	for (int i = 0; names && i < count; i++) {
+		if (names[i] && names[i][0]) {
+			fprintf(f, "%s\n", names[i]);
+		}
+	}
+	bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+	ok = fclose(f) == 0 && ok;
+	if (!ok || rename(tmp, path) != 0) {
+		fprintf(stderr, "library: cannot write %s\n", path);
+		unlink(tmp);
+		return;
+	}
+	if (config_get("library", "scan_folders", "")[0]) {
+		config_set("library", "scan_folders", "");
+		config_save();
+	}
+}
+
+static void scan_folders_load(void) {
+	library_scan_folders_free(scan_folder_names, scan_folder_count);
+	scan_folder_names = library_scan_folders(&scan_folder_count);
 }
 
 // With a filter, only the chosen folders at the root of the card are read.
