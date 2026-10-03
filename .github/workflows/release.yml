@@ -1,4 +1,4 @@
-name: Build SpotUI for HiBy R1 (Musl Loader Resolution Fix) (Final Toolchain Fix)
+name: Build SpotUI for HiBy R1 (Runtime Variable Fix) (Musl Loader Resolution Fix) (Final Toolchain Fix)
 
 on:
   push:
@@ -310,9 +310,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v8-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v9-r1-loader-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
           restore-keys: |
-            spotui-cargo-v8-r1-loader-${{ runner.os }}-
+            spotui-cargo-v9-r1-loader-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -552,7 +552,7 @@ jobs:
             echo "Alternative: $SYSROOT/usr/lib/ld-musl-mipsel.so.1"
             echo
             echo "Sysroot lib directory:"
-            ls -la "$SYSROOT/lib" 2>/dev/null || true
+            ls -la "$MUSL_SYSROOT/lib" 2>/dev/null || true
             echo
             echo "Sysroot usr/lib directory:"
             ls -la "$SYSROOT/usr/lib" 2>/dev/null || true
@@ -742,6 +742,7 @@ jobs:
           DAEMON="$DAEMON_TARGET_DIR/$RUST_TARGET/release/examples/spotui_daemon"
           RUNTIME_DIR="$RUNNER_TEMP/spotui-runtime"
           GCC="$MIPSEL_GCC"
+          SYSROOT="$MUSL_SYSROOT"
 
           test -s "$DAEMON"
           test -x "$GCC"
@@ -775,8 +776,8 @@ jobs:
 
                 # If the absolute link points at the runtime path,
                 # try the same path relative to the GCC sysroot.
-                if [ -z "$LOADER_SOURCE" ] && [ -f "$SYSROOT$LINK_TARGET" ]; then
-                  LOADER_SOURCE="$SYSROOT$LINK_TARGET"
+                if [ -z "$LOADER_SOURCE" ] && [ -f "$MUSL_SYSROOT$LINK_TARGET" ]; then
+                  LOADER_SOURCE="$MUSL_SYSROOT$LINK_TARGET"
                 fi
               else
                 # Relative symlink.
@@ -818,7 +819,7 @@ jobs:
             "$GCC" -print-file-name=libc.so || true
             echo
             echo "Sysroot lib listing:"
-            ls -la "$SYSROOT/lib" 2>/dev/null || true
+            ls -la "$MUSL_SYSROOT/lib" 2>/dev/null || true
             exit 1
           fi
 
