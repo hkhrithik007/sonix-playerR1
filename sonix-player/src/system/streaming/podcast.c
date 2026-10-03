@@ -52,7 +52,7 @@ static const char *interface_language_code(void) {
 		const char *code;
 	} MAP[] = {
 		{"Italiano", "it"}, {"English", "en"}, {"Deutsch", "de"}, {"Fran\xC3\xA7\x61is", "fr"},
-		{"Espa\xC3\xB1ol", "es"}, {"Japanese", "ja"}, {"Nederlands", "nl"},
+		{"Espa\xC3\xB1ol", "es"}, {"Japanese", "ja"}, {"Nederlands", "nl"}, {"Polski", "pl"},
 	};
 	const char *current = lang_current();
 	for (size_t i = 0; i < sizeof(MAP) / sizeof(MAP[0]); i++) {
@@ -397,6 +397,23 @@ int podcast_skip_forward(void) { return clamp_skip(config_get_int("podcast", "sk
 void podcast_set_skip_back(int seconds) { config_set_int("podcast", "skip_back", clamp_skip(seconds)); }
 
 void podcast_set_skip_forward(int seconds) { config_set_int("podcast", "skip_forward", clamp_skip(seconds)); }
+
+int podcast_speed_permille(void) {
+	long value = config_get_int("podcast", "speed", 1000);
+	if (value < 250 || value > 4000) {
+		value = 1000;
+	}
+	return (int)value;
+}
+
+void podcast_set_speed_permille(int permille) {
+	if (permille < 250 || permille > 4000) {
+		permille = 1000;
+	}
+	config_set_int("podcast", "speed", permille);
+}
+
+double podcast_speed(void) { return (double)podcast_speed_permille() / 1000.0; }
 
 bool podcast_stop_at_episode_end(void) { return config_get_int("podcast", "stop_episode_end", 0) != 0; }
 
