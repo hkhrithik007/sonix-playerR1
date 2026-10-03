@@ -16,20 +16,19 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ------------------------------------------------------------
+  # ============================================================
   # HiBy R1 target
-  # ------------------------------------------------------------
+  # ============================================================
   RUST_TARGET: mipsel-unknown-linux-musl
   LIBRESPOT_VERSION: v0.8.0
 
-  # Canonical SpotUI repository. This also lets the workflow be
-  # placed in another repository and still build the SpotUI tree.
+  # Canonical working SpotUI source.
   SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
   SPOTUI_REF: main
 
-  # ------------------------------------------------------------
-  # Toolchain/cache locations
-  # ------------------------------------------------------------
+  # ============================================================
+  # Build/cache locations
+  # ============================================================
   MIPSEL_TOOLCHAIN_DIR: ${{ github.workspace }}/.cache/mipsel-linux-musl-cross
   CARGO_HOME: ${{ github.workspace }}/.cache/cargo
   DAEMON_TARGET_DIR: ${{ github.workspace }}/.cache/spotui-daemon-target
@@ -96,13 +95,11 @@ jobs:
           }
 
           if is_spotui_tree "$GITHUB_WORKSPACE"; then
-            echo "Current checkout is SpotUI."
+            echo "Current checkout is the SpotUI repository."
             SPOTUI_ROOT="$GITHUB_WORKSPACE"
           else
-            echo "Current checkout is not SpotUI."
-            echo "Cloning:"
-            echo "  $SPOTUI_REPOSITORY"
-            echo "  ref: $SPOTUI_REF"
+            echo "Current checkout does not contain SpotUI."
+            echo "Cloning canonical SpotUI source..."
 
             SPOTUI_ROOT="$GITHUB_WORKSPACE/spotui-source"
 
@@ -117,7 +114,7 @@ jobs:
 
           for path in "${REQUIRED_FILES[@]}"; do
             test -f "$SPOTUI_ROOT/$path" || {
-              echo "ERROR: missing SpotUI file:"
+              echo "ERROR: Required SpotUI file missing:"
               echo "$SPOTUI_ROOT/$path"
               exit 1
             }
@@ -126,10 +123,9 @@ jobs:
           echo "SPOTUI_ROOT=$SPOTUI_ROOT" >> "$GITHUB_ENV"
 
           echo
-          echo "SpotUI source root:"
+          echo "SpotUI root:"
           echo "$SPOTUI_ROOT"
 
-          echo
           echo "SpotUI commit:"
           git -C "$SPOTUI_ROOT" rev-parse HEAD
 
@@ -145,73 +141,61 @@ jobs:
           test -f "$SPOTUI_ROOT/engine/ui/Cargo.toml"
           test -f "$SPOTUI_ROOT/engine/ui/src/main.rs"
 
-          echo "Canonical daemon:"
+          echo "SpotUI daemon source:"
           ls -lh "$SPOTUI_ROOT/apps/spotify/daemon/spotui_daemon.rs"
 
-          echo "UI manifest:"
+          echo "SpotUI UI manifest:"
           ls -lh "$SPOTUI_ROOT/engine/ui/Cargo.toml"
 
-          echo "UI source:"
+          echo "SpotUI UI source:"
           ls -lh "$SPOTUI_ROOT/engine/ui/src/main.rs"
 
-          echo "SpotUI project structure verified."
+          echo "SpotUI structure verified."
 
       # ============================================================
-      # CACHE MIPSEL TOOLCHAIN
-      # ============================================================
-      #
-      # IMPORTANT:
-      # Do NOT use musl.cc here. The previous run stalled at 0 B/s
-      # while waiting for musl.cc.
-      #
-      # This version uses the GitHub-hosted musl compiler release
-      # used by other current CI workflows:
-      # OpenListTeam/musl-compilers, 2025-06-12.
-      #
-      # GitHub-hosted Actions runners already have reliable access
-      # to GitHub release assets, and the downloader below has:
-      #   - connection timeout
-      #   - total timeout
-      #   - retries
-      #   - gzip integrity verification
+      # MIPS TOOLCHAIN CACHE
       # ============================================================
       - name: Restore MIPS toolchain cache
         id: mips-toolchain-cache
         uses: actions/cache/restore@v4
         with:
           path: .cache/mipsel-linux-musl-cross
-          key: spotui-mipsel-toolchain-v3-${{ runner.os }}-2025-06-12
+          key: spotui-mipsel-toolchain-v4-${{ runner.os }}-2025-06-12
 
+      # ============================================================
+      # INSTALL MIPS LITTLE-ENDIAN MUSL TOOLCHAIN
+      #
+      # IMPORTANT:
+      # Do not use musl.cc. The previous workflow stalled there.
+      # ============================================================
       - name: Install MIPS little-endian musl toolchain
         shell: bash
         run: |
           set -euo pipefail
 
           TOOLCHAIN_DIR="$MIPSEL_TOOLCHAIN_DIR"
-          TOOLCHAIN_ROOT="$TOOLCHAIN_DIR/bin"
-          TOOLCHAIN_URL="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/mipsel-linux-musl-cross.tgz"
           DOWNLOAD="$RUNNER_TEMP/mipsel-linux-musl-cross.tgz"
+
+          TOOLCHAIN_URL="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/mipsel-linux-musl-cross.tgz"
 
           mkdir -p "$TOOLCHAIN_DIR"
 
-          if [ -x "$TOOLCHAIN_ROOT/mipsel-linux-musl-gcc" ]; then
-            echo "Valid cached MIPS toolchain found."
+          if [ -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" ]; then
+            echo "Using cached MIPS toolchain."
           else
             echo "============================================"
             echo "DOWNLOADING MIPS TOOLCHAIN"
             echo "============================================"
-            echo "Source:"
             echo "$TOOLCHAIN_URL"
-            echo
 
             rm -rf "$TOOLCHAIN_DIR"
             mkdir -p "$TOOLCHAIN_DIR"
 
-            MAX_ATTEMPTS=5
             SUCCESS=0
 
-            for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-              echo "Download attempt $attempt/$MAX_ATTEMPTS..."
+            for attempt in 1 2 3 4 5; do
+              echo
+              echo "Download attempt $attempt/5..."
 
               rm -f "$DOWNLOAD"
 
@@ -226,33 +210,25 @@ jobs:
                 "$TOOLCHAIN_URL" \
                 --output "$DOWNLOAD"
               then
-                echo "Download finished."
-
                 if gzip -t "$DOWNLOAD" >/dev/null 2>&1; then
-                  echo "gzip integrity check passed."
                   SUCCESS=1
+                  echo "Archive downloaded and verified."
                   break
                 fi
-
-                echo "ERROR: downloaded archive failed gzip integrity check."
-              else
-                echo "Download failed."
               fi
 
-              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-                echo "Retrying in 10 seconds..."
+              echo "Download/integrity check failed."
+
+              if [ "$attempt" -lt 5 ]; then
                 sleep 10
               fi
             done
 
             if [ "$SUCCESS" -ne 1 ]; then
               echo
-              echo "ERROR: MIPS toolchain download failed after $MAX_ATTEMPTS attempts."
-              echo "The previous musl.cc downloader has been removed."
+              echo "ERROR: Could not obtain a valid MIPS toolchain."
               exit 1
             fi
-
-            echo "Extracting MIPS toolchain..."
 
             tar -xzf "$DOWNLOAD" \
               --strip-components=1 \
@@ -261,24 +237,14 @@ jobs:
             rm -f "$DOWNLOAD"
           fi
 
-          test -x "$TOOLCHAIN_ROOT/mipsel-linux-musl-gcc"
-          test -x "$TOOLCHAIN_ROOT/mipsel-linux-musl-strip"
-          test -x "$TOOLCHAIN_ROOT/mipsel-linux-musl-ar"
-          test -x "$TOOLCHAIN_ROOT/mipsel-linux-musl-ranlib"
+          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc"
+          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-strip"
+          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-ar"
+          test -x "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-ranlib"
 
           echo
           echo "MIPS compiler:"
-          "$TOOLCHAIN_ROOT/mipsel-linux-musl-gcc" --version | head -n 1
-
-          echo
-          echo "Compiler path:"
-          "$TOOLCHAIN_ROOT/mipsel-linux-musl-gcc" -print-prog-name=cc1
-
-          echo
-          echo "Toolchain directory:"
-          ls -lah "$TOOLCHAIN_DIR"
-
-          echo "MIPS toolchain verified."
+          "$TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" --version | head -n 1
 
       - name: Save MIPS toolchain cache
         if: success() && steps.mips-toolchain-cache.outputs.cache-hit != 'true'
@@ -298,9 +264,9 @@ jobs:
             .cache/cargo
             .cache/spotui-daemon-target
             .cache/spotui-ui-target
-          key: spotui-cargo-v3-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
+          key: spotui-cargo-v4-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'apps/spotify/daemon/spotui_daemon.rs') }}
           restore-keys: |
-            spotui-cargo-v3-${{ runner.os }}-
+            spotui-cargo-v4-${{ runner.os }}-
 
       # ============================================================
       # RUST NIGHTLY
@@ -320,7 +286,7 @@ jobs:
       # ============================================================
       # PREPARE LIBRESPOT 0.8.0
       # ============================================================
-      - name: Prepare librespot 0.8.0 build tree
+      - name: Prepare librespot 0.8.0
         shell: bash
         run: |
           set -euo pipefail
@@ -328,8 +294,6 @@ jobs:
           LIBRESPOT_ROOT="$RUNNER_TEMP/librespot"
 
           rm -rf "$LIBRESPOT_ROOT"
-
-          echo "Cloning librespot ${LIBRESPOT_VERSION}..."
 
           git clone \
             --depth 1 \
@@ -346,9 +310,84 @@ jobs:
           echo "LIBRESPOT_ROOT=$LIBRESPOT_ROOT" >> "$GITHUB_ENV"
 
       # ============================================================
+      # FIX MISSING SERDE_JSON DEPENDENCY
+      #
+      # The working SpotUI daemon directly uses serde_json::Value
+      # in its playlist-profile fallback. librespot 0.8.0 does not
+      # declare serde_json in its root package dependencies, so an
+      # example that references serde_json fails with E0433 unless
+      # the dependency is explicitly added.
+      #
+      # This is the exact failure shown in the previous run.
+      # ============================================================
+      - name: Add daemon serde_json dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="$LIBRESPOT_ROOT/Cargo.toml"
+
+          python3 - "$MANIFEST" <<'PY'
+          import sys
+          from pathlib import Path
+
+          manifest = Path(sys.argv[1])
+          text = manifest.read_text(encoding="utf-8")
+
+          lines = text.splitlines()
+
+          in_dependencies = False
+          already_present = False
+          insert_at = None
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  in_dependencies = stripped == "[dependencies]"
+                  continue
+
+              if in_dependencies:
+                  if stripped.startswith("serde_json"):
+                      already_present = True
+                      break
+
+                  if stripped and not stripped.startswith("#"):
+                      insert_at = i
+
+          if already_present:
+              print("serde_json is already declared.")
+              raise SystemExit(0)
+
+          if insert_at is None:
+              for i, line in enumerate(lines):
+                  if line.strip() == "[dependencies]":
+                      insert_at = i + 1
+                      break
+
+          if insert_at is None:
+              raise SystemExit("ERROR: [dependencies] section not found.")
+
+          lines.insert(insert_at, 'serde_json = "1.0"')
+
+          manifest.write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+
+          print("Added serde_json = \"1.0\" to librespot [dependencies].")
+          PY
+
+          echo
+          echo "Relevant Cargo.toml dependencies:"
+          grep -nE '^\s*(serde_json|tokio|url|env_logger)\s*=' "$MANIFEST" || true
+
+          grep -Eq '^[[:space:]]*serde_json[[:space:]]*=' "$MANIFEST"
+
+      # ============================================================
       # COPY CANONICAL DAEMON SOURCE
       # ============================================================
-      - name: Copy canonical daemon source
+      - name: Copy canonical SpotUI daemon source
         shell: bash
         run: |
           set -euo pipefail
@@ -361,20 +400,15 @@ jobs:
           SOURCE_SHA=$(sha256sum "$SOURCE" | awk '{print $1}')
           DEST_SHA=$(sha256sum "$DEST" | awk '{print $1}')
 
-          echo "Canonical source SHA256:"
-          echo "$SOURCE_SHA"
-
-          echo "Build tree source SHA256:"
-          echo "$DEST_SHA"
+          echo "Canonical daemon SHA256: $SOURCE_SHA"
+          echo "Build-tree daemon SHA256: $DEST_SHA"
 
           test "$SOURCE_SHA" = "$DEST_SHA"
-
-          echo "Daemon source hashes match."
 
       # ============================================================
       # CONFIGURE CARGO MIPS LINKER
       # ============================================================
-      - name: Configure MIPS Rust linker
+      - name: Configure MIPS Cargo linker
         shell: bash
         run: |
           set -euo pipefail
@@ -397,12 +431,8 @@ jobs:
           echo "librespot Cargo config:"
           cat "$LIBRESPOT_ROOT/.cargo/config.toml"
 
-          echo
-          echo "SpotUI UI Cargo config:"
-          cat "$SPOTUI_ROOT/engine/ui/.cargo/config.toml"
-
       # ============================================================
-      # BUILD DAEMON
+      # BUILD SPOTUI DAEMON
       # ============================================================
       - name: Build SpotUI daemon
         shell: bash
@@ -441,25 +471,22 @@ jobs:
             echo
             echo "SPOTUI DAEMON BUILD FAILED"
             echo
+            echo "The previous E0433 serde_json failure should be resolved."
+            echo
             echo "Rust:"
             rustup run nightly rustc --version || true
             echo
             echo "Cargo:"
             rustup run nightly cargo --version || true
             echo
-            echo "MIPS compiler:"
+            echo "MIPS GCC:"
             "$MIPSEL_TOOLCHAIN_DIR/bin/mipsel-linux-musl-gcc" --version | head -n 1 || true
+            echo
+            echo "Cargo.toml serde_json declaration:"
+            grep -nE '^[[:space:]]*serde_json[[:space:]]*=' "$LIBRESPOT_ROOT/Cargo.toml" || true
             echo
             echo "Expected output:"
             echo "$DAEMON"
-            echo
-            echo "Relevant cargo metadata:"
-            find "$LIBRESPOT_ROOT" \
-              -maxdepth 3 \
-              -type f \
-              \( -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-              -print \
-              | sort
             exit "$STATUS"
           fi
 
@@ -470,7 +497,7 @@ jobs:
           echo "Daemon:"
           ls -lh "$DAEMON"
 
-          echo "File type:"
+          echo "File:"
           file "$DAEMON"
 
           echo "SHA256:"
@@ -523,7 +550,7 @@ jobs:
           echo "UI:"
           ls -lh "$UI"
 
-          echo "File type:"
+          echo "File:"
           file "$UI"
 
           echo "SHA256:"
@@ -543,7 +570,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       # ============================================================
-      # PREPARE DEVICE DEPLOYMENT PAYLOAD
+      # CREATE DEVICE DEPLOYMENT PAYLOAD
       # ============================================================
       - name: Create SpotUI deployment payload
         shell: bash
@@ -567,12 +594,9 @@ jobs:
             dist/usr/data/spotui_daemon \
             dist/usr/data/spotui-ui-poc
 
-          # --------------------------------------------------------
-          # Autorun helper
-          #
-          # This ONLY starts the Spotify daemon.
-          # It does not replace the stock HiBy player or UI.
-          # --------------------------------------------------------
+          # ========================================================
+          # Spotify daemon autorun
+          # ========================================================
           cat > dist/usr/bin/spotui_daemon_autostart.sh <<'EOF'
           #!/bin/sh
 
@@ -584,12 +608,11 @@ jobs:
               exit 0
           fi
 
-          # Avoid duplicate daemon instances.
           if pidof spotui_daemon >/dev/null 2>&1; then
               exit 0
           fi
 
-          # Wait for wlan0/default route.
+          # Wait for the R1 network/default route.
           n=0
           while [ "$n" -lt "$MAX_WAIT" ]; do
               if grep -q '^wlan0[[:space:]][^[:space:]]*[[:space:]]00000000[[:space:]]' \
@@ -617,9 +640,9 @@ jobs:
 
           chmod 0755 dist/usr/bin/spotui_daemon_autostart.sh
 
-          # --------------------------------------------------------
-          # Boot init script
-          # --------------------------------------------------------
+          # ========================================================
+          # Boot init hook
+          # ========================================================
           cat > dist/etc/init.d/S91_spotui_daemon <<'EOF'
           #!/bin/sh
 
@@ -652,9 +675,9 @@ jobs:
           find dist -type f -printf '%M %s %p\n' | sort
 
       # ============================================================
-      # VERIFY OUTPUTS
+      # VERIFY MIPS BINARIES + AUTORUN
       # ============================================================
-      - name: Verify MIPS binaries and autorun
+      - name: Verify SpotUI binaries and autorun
         shell: bash
         run: |
           set -euo pipefail
@@ -668,21 +691,19 @@ jobs:
           test -x dist/usr/bin/spotui_daemon_autostart.sh
           test -x dist/etc/init.d/S91_spotui_daemon
 
-          echo "Daemon file:"
+          echo "Daemon:"
           file dist/usr/data/spotui_daemon
           file dist/usr/data/spotui_daemon | grep -qi 'MIPS'
 
           echo
-          echo "UI file:"
+          echo "UI:"
           file dist/usr/data/spotui-ui-poc
           file dist/usr/data/spotui-ui-poc | grep -qi 'MIPS'
 
           echo
-          echo "Autorun init script:"
+          echo "Autorun:"
           sed -n '1,120p' dist/etc/init.d/S91_spotui_daemon
-
           echo
-          echo "Autorun helper:"
           sed -n '1,160p' dist/usr/bin/spotui_daemon_autostart.sh
 
           echo
@@ -723,22 +744,22 @@ jobs:
             echo "Rust target: ${RUST_TARGET}"
             echo "librespot target: ${LIBRESPOT_VERSION}"
             echo
-            echo "Runtime:"
-            echo "  /usr/data/spotui_daemon"
-            echo "  /usr/data/spotui-ui-poc"
-            echo "  /tmp/spotui.sock"
+            echo "Daemon: /usr/data/spotui_daemon"
+            echo "UI: /usr/data/spotui-ui-poc"
+            echo "Socket: /tmp/spotui.sock"
             echo
             echo "Autorun:"
             echo "  /usr/bin/spotui_daemon_autostart.sh"
             echo "  /etc/init.d/S91_spotui_daemon"
             echo
+            echo "serde_json dependency: explicitly added for SpotUI daemon."
             echo "Credentials are provisioned separately."
           } > dist/build-info.txt
 
           cat dist/build-info.txt
 
       # ============================================================
-      # UPLOAD ARTIFACT
+      # ARTIFACT
       # ============================================================
       - name: Upload SpotUI build artifact
         uses: actions/upload-artifact@v4
@@ -779,6 +800,13 @@ jobs:
             echo "- Target: \`${RUST_TARGET}\`"
             echo "- librespot: \`${LIBRESPOT_VERSION}\`"
             echo
+            echo "### Fixes"
+            echo
+            echo "- MIPS toolchain downloaded from GitHub instead of stalled musl.cc endpoint"
+            echo "- SpotUI source auto-resolved"
+            echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
+            echo "- Spotify daemon autorun included"
+            echo
             echo "### Artifacts"
             echo
             echo "- \`spotui_daemon\`"
@@ -787,11 +815,6 @@ jobs:
             echo "- \`spotui_daemon_autostart.sh\`"
             echo "- \`SHA256SUMS\`"
             echo "- \`build-info.txt\`"
-            echo
-            echo "### Toolchain fix"
-            echo
-            echo "Uses the GitHub-hosted OpenListTeam mipsel musl toolchain"
-            echo "instead of the stalled musl.cc download endpoint."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "SpotUI HiBy R1 build completed successfully."
