@@ -17,6 +17,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/topbar.h"
 #include "src/gui/shell/toast.h"
 #include "src/system/library/audiobookdb.h"
 #include "src/system/playback/playlist.h"
@@ -43,8 +44,8 @@ static void show_finished(int found) {
 	lv_label_set_text_fmt(count_label, "%d", found);
 	lv_label_set_text(status_label, found == 1 ? tr("libraryscan_track_found") : tr("libraryscan_tracks_found"));
 
-	lv_obj_add_flag(cancel_button, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_remove_flag(ok_button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(cancel_button, true);
+	lv_obj_set_hidden(ok_button, false);
 
 	// The scan is over; the screen may go back to timing out.
 	power_hold_screen_on(false);
@@ -90,14 +91,14 @@ static void cancel_cb(lv_event_t *e) {
 void libraryscan_begin(void) {
 	lv_label_set_text(count_label, "0");
 	lv_label_set_text(status_label, tr("libraryscan_tracks_found"));
-	lv_obj_add_flag(ok_button, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_remove_flag(cancel_button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(ok_button, true);
+	lv_obj_set_hidden(cancel_button, false);
 
 	if (!library_scan_start(sd_root)) {
 		// Nothing to scan (no card, or a scan is somehow already going).
 		lv_label_set_text(status_label, tr("no_card_to_scan"));
-		lv_obj_add_flag(cancel_button, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_remove_flag(ok_button, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(cancel_button, true);
+		lv_obj_set_hidden(ok_button, false);
 		return;
 	}
 
@@ -232,7 +233,7 @@ static void pick_row_cb(lv_event_t *e) {
 	}
 }
 
-static void pick_close(void) { lv_obj_add_flag(pick_veil, LV_OBJ_FLAG_HIDDEN); }
+static void pick_close(void) { lv_obj_set_hidden(pick_veil, true); }
 
 static void pick_veil_cb(lv_event_t *e) {
 	if (lv_event_get_target(e) == pick_veil) {
@@ -297,8 +298,9 @@ static void pick_build(void) {
 	lv_obj_set_style_border_width(pick_veil, 0, 0);
 	lv_obj_set_style_radius(pick_veil, 0, 0);
 	lv_obj_set_style_pad_all(pick_veil, 0, 0);
-	lv_obj_remove_flag(pick_veil, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(pick_veil, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(pick_veil, false);
+	lv_obj_set_clickable(pick_veil, true);
+	lv_obj_set_hidden(pick_veil, true);
 	lv_obj_add_event_cb(pick_veil, pick_veil_cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *card = lv_obj_create(pick_veil);
@@ -310,9 +312,9 @@ static void pick_build(void) {
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 20, 0);
 	lv_obj_set_style_pad_row(card, 12, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(card, false);
+	lv_obj_set_clickable(card, true);
+	lv_obj_set_event_bubble(card, false);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_align(card, LV_ALIGN_CENTER, 0, cfg->top_bar_height / 2);
 
@@ -367,7 +369,7 @@ static void pick_append(int n) {
 		lv_obj_set_style_pad_column(row, 10, 0);
 		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-		lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+		lv_obj_set_scroll_on_focus(row, true);
 		lv_obj_add_event_cb(row, pick_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
 		lv_obj_t *folder = lv_image_create(row);
@@ -415,7 +417,7 @@ void libraryscan_choose_folders(void) {
 	pick_fill();
 	lv_obj_scroll_to_y(pick_list, 0, LV_ANIM_OFF);
 	pick_paint();
-	lv_obj_remove_flag(pick_veil, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(pick_veil, false);
 	lv_obj_move_foreground(pick_veil);
 }
 
@@ -443,12 +445,13 @@ static lv_obj_t *make_button(lv_obj_t *parent, const char *text, lv_color_t colo
 }
 
 // ---------------------------------------------------------------------------
-// Detect changes: what the user is told about a run (see library_card_returned)
+// What the user is told about the runs on the scan thread
 //
-// A card with a spinner for as long as the run lasts -- the walk takes a while
-// on a full card, and a notice that turned up minutes after the card came back
-// would be a surprise -- then the outcome. A tap off the card puts it away; the
-// run carries on and the outcome still comes.
+// Detect changes works in the background: a glyph in the status bar while it
+// looks over the card, a check mark for a few seconds when it is done, and no
+// notice either way. Filing the index again after the scan options changed was
+// asked for on that page, so it keeps its notice and its outcome; filed again
+// on its own, at the end of a Detect changes run, it says nothing.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -458,71 +461,54 @@ typedef struct {
 	int updated;
 } update_note_t;
 
+static bool checking;	   // a Detect changes run is under way
+static bool reorganizing;  // library_reorganize() put its notice up
+
 static void update_note_cb(void *user) {
 	update_note_t *note = user;
-	char text[160];
 
 	switch (note->event) {
 	case LIBRARY_UPDATE_LOOKING:
-		toast_busy_dismissable("libraryscan_looking_for_changes");
+		checking = true;
+		topbar_set_library_check(TOPBAR_LIBRARY_CHECKING);
 		break;
 
 	case LIBRARY_UPDATE_ADDING:
-		if (toast_busy_showing()) {
-			// The new files when there are some, the changed ones otherwise.
-			if (note->added == 1) {
-				toast_busy_dismissable("libraryscan_adding_one_track");
-			} else if (note->added > 1) {
-				snprintf(text, sizeof(text), tr("libraryscan_adding_d_tracks"), note->added);
-				toast_busy_dismissable(text);
-			} else if (note->updated == 1) {
-				toast_busy_dismissable("libraryscan_updating_one_track");
-			} else {
-				snprintf(text, sizeof(text), tr("libraryscan_updating_d_tracks"), note->updated);
-				toast_busy_dismissable(text);
-			}
-		}
+		break;
+
+	case LIBRARY_UPDATE_FINISHED:
+		checking = false;
+		topbar_set_library_check(TOPBAR_LIBRARY_CHECKED);
 		break;
 
 	case LIBRARY_UPDATE_STOPPED:
-		toast_busy_end();
+		if (reorganizing) {
+			reorganizing = false;
+			toast_busy_end();
+		} else if (checking) {
+			checking = false;
+			topbar_set_library_check(TOPBAR_LIBRARY_IDLE);
+		}
 		break;
 
 	case LIBRARY_UPDATE_REORGANIZING:
+		reorganizing = true;
 		toast_busy_dismissable("libraryscan_reorganizing");
 		break;
 
 	case LIBRARY_UPDATE_REORGANIZED:
-		toast_busy_end();
-		toast_success("libraryscan_reorganized");
+		if (reorganizing) {
+			reorganizing = false;
+			toast_busy_end();
+			toast_success("libraryscan_reorganized");
+		}
 		break;
 
-	case LIBRARY_UPDATE_FINISHED:
-		toast_busy_end();
-		if (note->updated > 0 && (note->added > 0 || note->removed > 0)) {
-			snprintf(text, sizeof(text), tr("libraryscan_d_added_d_removed_d_updated"), note->added, note->removed,
-					 note->updated);
-			toast_success(text);
-		} else if (note->updated == 1) {
-			toast_success("libraryscan_one_track_updated");
-		} else if (note->updated > 1) {
-			snprintf(text, sizeof(text), tr("libraryscan_d_tracks_updated"), note->updated);
-			toast_success(text);
-		} else if (note->added > 0 && note->removed > 0) {
-			snprintf(text, sizeof(text), tr("libraryscan_d_added_d_removed"), note->added, note->removed);
-			toast_success(text);
-		} else if (note->added == 1) {
-			toast_success("libraryscan_one_track_added");
-		} else if (note->added > 1) {
-			snprintf(text, sizeof(text), tr("libraryscan_d_tracks_added"), note->added);
-			toast_success(text);
-		} else if (note->removed == 1) {
-			toast_success("libraryscan_one_track_removed");
-		} else if (note->removed > 1) {
-			snprintf(text, sizeof(text), tr("libraryscan_d_tracks_removed"), note->removed);
-			toast_success(text);
-		} else {
-			toast_success("libraryscan_no_changes");
+	case LIBRARY_UPDATE_SCANNED:
+		// The first scan there has ever been turns Detect changes on, unless it
+		// was already set either way.
+		if (!library_detect_changes_chosen()) {
+			library_set_detect_changes(true);
 		}
 		break;
 	}
@@ -542,6 +528,24 @@ static void update_listener(library_update_event_t event, int added, int removed
 	if (!gui_post(update_note_cb, note)) {
 		free(note);
 	}
+}
+
+// How long after startup the card is looked over: past the first screen and
+// the track being restored, which want the card first.
+#define BOOT_CHECK_DELAY_MS 5000
+
+// What library_card_returned() does for a card that comes back: Detect changes
+// when it is on, and the index filed again if it was filed under other
+// settings. A card mounted only after startup goes through it when it is
+// attached instead (storage), and finds the library closed here.
+static void boot_check_cb(lv_timer_t *timer) {
+	(void)timer;
+	// A library scanned before Detect changes came on by itself gets it the
+	// same way, unless it was set either way since.
+	if (!library_detect_changes_chosen() && library_is_open() && library_track_count() > 0) {
+		library_set_detect_changes(true);
+	}
+	library_card_returned(sd_root);
 }
 
 void libraryscan_init(gui_config_t *cfg) {
@@ -565,7 +569,7 @@ void libraryscan_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(container, 0, 0);
 	lv_obj_set_style_pad_all(container, cfg->padding, 0);
 	lv_obj_set_style_pad_gap(container, 10, 0);
-	lv_obj_remove_flag(container, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(container, false);
 	lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -591,12 +595,12 @@ void libraryscan_init(gui_config_t *cfg) {
 	// once it is done.
 	cancel_button = make_button(libraryscan_screen, "cancel", lv_color_make(210, 66, 58), cancel_cb, cfg);
 	ok_button = make_button(libraryscan_screen, "ok", theme()->accent, ok_cb, cfg);
-	lv_obj_add_flag(ok_button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(ok_button, true);
 
 	poll_timer = lv_timer_create(poll_cb, SCAN_POLL_MS, NULL);
 	lv_timer_pause(poll_timer);
 
-	// The index opened at boot may have been filed under settings changed
-	// since; the listener is in place now to say so.
-	library_organize_check();
+	// The card may have been written while the player was off.
+	lv_timer_t *boot_check = lv_timer_create(boot_check_cb, BOOT_CHECK_DELAY_MS, NULL);
+	lv_timer_set_repeat_count(boot_check, 1);
 }
