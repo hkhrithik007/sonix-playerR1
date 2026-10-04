@@ -33,6 +33,7 @@
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/library/library.h"
+#include "src/system/library/metadata.h"
 
 lv_obj_t *musicsettings_screen;
 
@@ -167,11 +168,11 @@ static void reset_button_enabled(lv_obj_t *btn, bool enabled) {
 	}
 	if (enabled) {
 		lv_obj_remove_state(btn, LV_STATE_DISABLED);
-		lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_clickable(btn, true);
 		lv_obj_set_style_opa(btn, LV_OPA_COVER, 0);
 	} else {
 		lv_obj_add_state(btn, LV_STATE_DISABLED);
-		lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_clickable(btn, false);
 		lv_obj_set_style_opa(btn, LV_OPA_40, 0);
 	}
 }
@@ -402,11 +403,11 @@ static void crossfeed_refresh(void) {
 	// that affect nothing, and leaving them there to be dragged is worse than
 	// hiding them.
 	if (on) {
-		lv_obj_remove_flag(crossfeed_detail_card, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_remove_flag(crossfeed_delay_card, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(crossfeed_detail_card, false);
+		lv_obj_set_hidden(crossfeed_delay_card, false);
 	} else {
-		lv_obj_add_flag(crossfeed_detail_card, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(crossfeed_delay_card, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(crossfeed_detail_card, true);
+		lv_obj_set_hidden(crossfeed_delay_card, true);
 	}
 }
 
@@ -562,10 +563,10 @@ static void rg_refresh(void) {
 
 	if (on) {
 		lv_obj_add_state(rg_switch, LV_STATE_CHECKED);
-		lv_obj_remove_flag(rg_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(rg_pills, false);
 	} else {
 		lv_obj_remove_state(rg_switch, LV_STATE_CHECKED);
-		lv_obj_add_flag(rg_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(rg_pills, true);
 	}
 	settingsrow_pill_active(rg_track_pill, mode == REPLAYGAIN_TRACK);
 	settingsrow_pill_active(rg_album_pill, mode == REPLAYGAIN_ALBUM);
@@ -626,10 +627,10 @@ static void dsd_gain_refresh(void) {
 
 	if (on) {
 		lv_obj_add_state(dsd_gain_switch, LV_STATE_CHECKED);
-		lv_obj_remove_flag(dsd_gain_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(dsd_gain_pills, false);
 	} else {
 		lv_obj_remove_state(dsd_gain_switch, LV_STATE_CHECKED);
-		lv_obj_add_flag(dsd_gain_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(dsd_gain_pills, true);
 	}
 	for (int i = 0; i < DSD_GAIN_MAX_DB; i++) {
 		settingsrow_pill_active(dsd_gain_pill[i], i + 1 == index);
@@ -754,8 +755,8 @@ static void build_mseb_page(gui_config_t *cfg) {
 		lv_obj_set_style_shadow_width(card, 0, 0);
 		lv_obj_set_style_pad_hor(card, 20, 0);
 		lv_obj_set_style_pad_ver(card, 12, 0);
-		lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_scrollable(card, false);
+		lv_obj_set_event_bubble(card, true);
 
 		lv_obj_t *name = lv_label_create(card);
 		lv_label_set_text(name, tr(mseb_band_name[i]));
@@ -798,7 +799,7 @@ static void build_mseb_page(gui_config_t *cfg) {
 		// would move a band. With ADV_HITTEST the slider only answers a press
 		// that begins on the knob; anywhere else on the track the press goes to
 		// the card behind it and scrolls the page.
-		lv_obj_add_flag(slider, LV_OBJ_FLAG_ADV_HITTEST);
+		lv_obj_set_adv_hittest(slider, true);
 		// The knob is 24 px across, and with ADV_HITTEST the extended click area
 		// belongs to the knob alone rather than padding the whole track.
 		lv_obj_set_ext_click_area(slider, 18);
@@ -938,7 +939,7 @@ static void build_eq_page(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 14, 0);
 	lv_obj_set_style_pad_gap(card, 0, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(card, false);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -949,7 +950,7 @@ static void build_eq_page(gui_config_t *cfg) {
 		lv_obj_set_style_border_width(column, 0, 0);
 		lv_obj_set_style_pad_all(column, 0, 0);
 		lv_obj_set_style_pad_gap(column, 8, 0);
-		lv_obj_remove_flag(column, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_scrollable(column, false);
 		lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
 		lv_obj_set_flex_align(column, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -1127,6 +1128,7 @@ static lv_obj_t *scan_screen;
 static lv_obj_t *keep_articles_switch;
 static lv_obj_t *detect_changes_switch;
 static lv_obj_t *display_screen;
+static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
 static lv_obj_t *quality_badges_switch;
 static lv_obj_t *go_to_current_switch;
@@ -1170,8 +1172,16 @@ static lv_obj_t *retagged_row, *retagged_note;
 
 static void retagged_show(void) {
 	bool on = library_detect_changes();
-	lv_obj_set_flag(retagged_row, LV_OBJ_FLAG_HIDDEN, !on);
-	lv_obj_set_flag(retagged_note, LV_OBJ_FLAG_HIDDEN, !on);
+	lv_obj_set_hidden(retagged_row, !on);
+	lv_obj_set_hidden(retagged_note, !on);
+}
+
+// Detect changes can be turned on behind the page's back, by the first scan
+// (libraryscan.c), so the switch is read again each time the page comes up.
+static void scan_page_loading_cb(lv_event_t *e) {
+	(void)e;
+	lv_obj_set_state(detect_changes_switch, LV_STATE_CHECKED, library_detect_changes());
+	retagged_show();
 }
 
 static void detect_changes_cb(lv_event_t *e) {
@@ -1225,13 +1235,13 @@ static void organize_refresh(void) {
 	unsigned g = library_genre_separators();
 
 	lv_obj_set_state(split_artists_switch, LV_STATE_CHECKED, artists);
-	lv_obj_set_flag(split_artists_pills, LV_OBJ_FLAG_HIDDEN, !artists);
-	lv_obj_set_flag(unsplit_row, LV_OBJ_FLAG_HIDDEN, !artists);
+	lv_obj_set_hidden(split_artists_pills, !artists);
+	lv_obj_set_hidden(unsplit_row, !artists);
 	for (int i = 0; i < SPLIT_ARTIST_COUNT; i++) {
 		settingsrow_pill_active(split_artist_pill[i], (a & SPLIT_ARTIST_PILLS[i].bit) != 0);
 	}
 	lv_obj_set_state(split_genres_switch, LV_STATE_CHECKED, genres);
-	lv_obj_set_flag(split_genres_pills, LV_OBJ_FLAG_HIDDEN, !genres);
+	lv_obj_set_hidden(split_genres_pills, !genres);
 	for (int i = 0; i < SPLIT_GENRE_COUNT; i++) {
 		settingsrow_pill_active(split_genre_pill[i], (g & SPLIT_GENRE_PILLS[i].bit) != 0);
 	}
@@ -1334,6 +1344,7 @@ static void build_scan_page(gui_config_t *cfg) {
 	option_note(container, "musicsettings_join_albums_note");
 
 	organize_refresh();
+	lv_obj_add_event_cb(scan_screen, scan_page_loading_cb, LV_EVENT_SCREEN_LOAD_START, NULL);
 	lv_obj_add_event_cb(scan_screen, organize_leave_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	lv_obj_add_event_cb(artistexceptions_screen, organize_leave_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
@@ -1343,10 +1354,11 @@ static void build_scan_page(gui_config_t *cfg) {
 // ---------------------------------------------------------------------------
 // Display options
 //
-// What the lists show, as opposed to what playback does with them. A page of
-// its own rather than rows on the music page: it is the third such question --
-// how a name is filed, what happens after a track, what a list shows -- and the
-// other two already have one.
+// What the lists and the now-playing page show, as opposed to what playback
+// does with them. A page of its own rather than rows on the music page: it is
+// the third such question -- how a name is filed, what happens after a track,
+// what a list shows -- and the other two already have one. How the library's
+// own lists look is one page further in, under Library.
 // ---------------------------------------------------------------------------
 
 static void album_view_cb(lv_event_t *e) {
@@ -1400,10 +1412,10 @@ static void artist_refresh(void) {
 	int lists = medialist_artist_lists();
 	if (on) {
 		lv_obj_add_state(artist_switch, LV_STATE_CHECKED);
-		lv_obj_remove_flag(artist_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(artist_pills, false);
 	} else {
 		lv_obj_remove_state(artist_switch, LV_STATE_CHECKED);
-		lv_obj_add_flag(artist_pills, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(artist_pills, true);
 	}
 	for (int i = 0; i < ARTIST_PILLS; i++) {
 		settingsrow_pill_active(artist_pill[i], (lists & ARTIST_PILL_BITS[i]) != 0);
@@ -1427,6 +1439,13 @@ static void artist_pick_cb(lv_event_t *e) {
 	}
 	medialist_set_show_artist(medialist_show_artist(), lists);
 	artist_refresh();
+}
+
+static lv_obj_t *track_artist_switch;
+
+static void track_artist_cb(lv_event_t *e) {
+	metadata_set_track_artist(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+	player_refresh_artist();
 }
 
 static lv_obj_t *coverflow_switch;
@@ -1467,10 +1486,18 @@ static void layout_pick_cb(lv_event_t *e) {
 	layout_refresh();
 }
 
-static void build_display_page(gui_config_t *cfg) {
-	display_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(display_screen, cfg, "musicsettings_display_options");
-	settingsrow_title_corner_slots(settingsrow_page_title(display_screen), cfg, 0);
+// ---------------------------------------------------------------------------
+// Library
+//
+// How the library's lists are drawn: what an artist opens on, what a row says
+// under its title, and which tile the Music page leads with. Inside Display
+// options, which keeps what concerns the now-playing page and the rest.
+// ---------------------------------------------------------------------------
+
+static void build_library_page(gui_config_t *cfg) {
+	library_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(library_screen, cfg, "musicsettings_library");
+	settingsrow_title_corner_slots(settingsrow_page_title(library_screen), cfg, 0);
 
 	// On: an artist is a list of their records. Off: a flat list of their
 	// tracks, with the grouping button in the corner.
@@ -1478,23 +1505,6 @@ static void build_display_page(gui_config_t *cfg) {
 	option_note(container, "musicsettings_artist_opens_albums_note");
 	if (medialist_album_view()) {
 		lv_obj_add_state(album_view_switch, LV_STATE_CHECKED);
-	}
-
-	// The library lists open on what is playing: the track in All tracks, what
-	// it belongs to in the others.
-	settingsrow_toggle(container, "musicsettings_go_to_current", &go_to_current_switch, go_to_current_cb);
-	option_note(container, "musicsettings_go_to_current_note");
-	if (medialist_go_to_current()) {
-		lv_obj_add_state(go_to_current_switch, LV_STATE_CHECKED);
-	}
-
-	// A small mark under a track's title saying what the file is. It comes from
-	// what the scan wrote down, so a library indexed by an older build wears no
-	// badges until it is scanned again.
-	settingsrow_toggle(container, "audio_quality", &quality_badges_switch, quality_badges_cb);
-	option_note(container, "musicsettings_shows_the_tracks_audio_quality_wi");
-	if (medialist_quality_badges()) {
-		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
 	}
 
 	// Who a row is by, under its title, on the lists picked here.
@@ -1506,6 +1516,49 @@ static void build_display_page(gui_config_t *cfg) {
 	option_note(container, "musicsettings_show_artist_note");
 	artist_refresh();
 	theme_register_refresh(artist_refresh);
+
+	settingsrow_toggle(container, "musicsettings_playlists_first", &playlists_first_switch, playlists_first_cb);
+	option_note(container, "musicsettings_playlists_first_note");
+	if (musicsettings_playlists_first()) {
+		lv_obj_add_state(playlists_first_switch, LV_STATE_CHECKED);
+	}
+
+	// A small mark under a track's title saying what the file is. It comes from
+	// what the scan wrote down, so a library indexed by an older build wears no
+	// badges until it is scanned again.
+	settingsrow_toggle(container, "audio_quality", &quality_badges_switch, quality_badges_cb);
+	option_note(container, "musicsettings_shows_the_tracks_audio_quality_wi");
+	if (medialist_quality_badges()) {
+		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
+	}
+
+	switcher_attach_back_gesture(library_screen);
+}
+
+static void build_display_page(gui_config_t *cfg) {
+	display_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(display_screen, cfg, "musicsettings_display_options");
+	settingsrow_title_corner_slots(settingsrow_page_title(display_screen), cfg, 0);
+
+	build_library_page(cfg);
+	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
+
+	// Whose name goes under the title on the now-playing page, in the control
+	// centre and on the screensaver: the album's artist, as the record is
+	// filed, or the track's own. Off by default -- see metadata_shown_artist().
+	settingsrow_toggle(container, "musicsettings_track_artist", &track_artist_switch, track_artist_cb);
+	option_note(container, "musicsettings_track_artist_note");
+	if (metadata_track_artist()) {
+		lv_obj_add_state(track_artist_switch, LV_STATE_CHECKED);
+	}
+
+	// The library lists open on what is playing: the track in All tracks, what
+	// it belongs to in the others.
+	settingsrow_toggle(container, "musicsettings_go_to_current", &go_to_current_switch, go_to_current_cb);
+	option_note(container, "musicsettings_go_to_current_note");
+	if (medialist_go_to_current()) {
+		lv_obj_add_state(go_to_current_switch, LV_STATE_CHECKED);
+	}
 
 	// The album carousel. Off by default: it is a second way into the records,
 	// not a replacement for the list, and the covers it draws are decoded at a
@@ -1536,14 +1589,6 @@ static void build_display_page(gui_config_t *cfg) {
 	// stream from a phone and an audiobook all get the standard one whatever
 	// this says. Studio asks for less and takes all of them.
 	option_note(container, "musicsettings_local_only_note");
-
-	// Under the layout, because it is the other thing on this page about where
-	// something is rather than about what it says.
-	settingsrow_toggle(container, "musicsettings_playlists_first", &playlists_first_switch, playlists_first_cb);
-	option_note(container, "musicsettings_playlists_first_note");
-	if (musicsettings_playlists_first()) {
-		lv_obj_add_state(playlists_first_switch, LV_STATE_CHECKED);
-	}
 
 	// Whether a start with a remembered track lands on the now-playing page
 	// rather than on the home screen. Read once, at startup (main.c).

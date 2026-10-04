@@ -192,8 +192,8 @@ static void back_underlay_build(void) {
 	lv_obj_set_style_border_width(back_underlay, 0, 0);
 	lv_obj_set_style_radius(back_underlay, 0, 0);
 	lv_obj_set_style_pad_all(back_underlay, 0, 0);
-	lv_obj_remove_flag(back_underlay, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_remove_flag(back_underlay, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_scrollable(back_underlay, false);
+	lv_obj_set_clickable(back_underlay, false);
 
 	lv_obj_t *target = NULL;
 	bool going_to_player = false;
@@ -220,13 +220,13 @@ static void back_underlay_build(void) {
 	}
 
 	if (target) {
-		bool was_hidden = lv_obj_has_flag(target, LV_OBJ_FLAG_HIDDEN);
+		bool was_hidden = lv_obj_is_hidden(target);
 		if (was_hidden) {
-			lv_obj_remove_flag(target, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(target, false);
 		}
 		back_snapshot = lv_snapshot_take(target, LV_COLOR_FORMAT_RGB565);
 		if (was_hidden) {
-			lv_obj_add_flag(target, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(target, true);
 		}
 		if (back_snapshot) {
 			lv_obj_t *img = lv_image_create(back_underlay);
@@ -262,8 +262,8 @@ static void back_underlay_build(void) {
 	lv_obj_set_style_bg_opa(veil, LV_OPA_30, 0);
 	lv_obj_set_style_border_width(veil, 0, 0);
 	lv_obj_set_style_radius(veil, 0, 0);
-	lv_obj_remove_flag(veil, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_remove_flag(veil, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_scrollable(veil, false);
+	lv_obj_set_clickable(veil, false);
 }
 
 static void back_anim_exec_cb(void *var, int32_t v) {
@@ -398,7 +398,7 @@ void switcher_attach_back_gesture(lv_obj_t *obj) {
 	if (!obj) {
 		return;
 	}
-	lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_clickable(obj, true);
 	lv_obj_add_event_cb(obj, back_drag_cb, LV_EVENT_PRESSED, NULL);
 	lv_obj_add_event_cb(obj, back_drag_cb, LV_EVENT_PRESSING, NULL);
 	lv_obj_add_event_cb(obj, back_drag_cb, LV_EVENT_RELEASED, NULL);
@@ -451,6 +451,18 @@ void switch_screen(lv_obj_t *target_screen) {
 	load_screen(target_screen);
 }
 
+// A page with its own close button up -- a full-screen dialog drawn on the page
+// itself -- names its screen here; see back_btn_hide_on_screen().
+static lv_obj_t *chevron_hidden_on;
+
+// The pages the chevron is never drawn on: the main menu has nowhere to go
+// back to, the scan pages exit through their own buttons, and a page showing
+// a dialog with a close button already has its way out.
+static bool page_has_no_chevron(lv_obj_t *screen) {
+	return screen == main_menu_screen || screen == libraryscan_screen || screen == audiobookscan_screen ||
+		   (screen && screen == chevron_hidden_on);
+}
+
 static void load_screen(lv_obj_t *target_screen) {
 	// Every page keeps the status bar. The player is not a page -- it slides
 	// over the top of one -- so nothing here has to make room for it.
@@ -459,11 +471,10 @@ static void load_screen(lv_obj_t *target_screen) {
 	if (back_btn) {
 		// The scan pages have their own way out (cancel / OK) and must not be
 		// left halfway through by the chevron.
-		if (target_screen == main_menu_screen || target_screen == libraryscan_screen ||
-			target_screen == audiobookscan_screen) {
-			lv_obj_add_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+		if (page_has_no_chevron(target_screen)) {
+			lv_obj_set_hidden(back_btn, true);
 		} else {
-			lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(back_btn, false);
 		}
 
 		place_back_btn(true);
@@ -660,29 +671,37 @@ void back_btn_force_hidden(bool hidden) {
 	back_btn_sync_visibility();
 }
 
+void back_btn_hide_on_screen(lv_obj_t *screen, bool hidden) {
+	if (hidden) {
+		chevron_hidden_on = screen;
+	} else if (chevron_hidden_on == screen) {
+		chevron_hidden_on = NULL;
+	}
+	back_btn_sync_visibility();
+}
+
 // The one rule for the chevron's visibility, re-applied after any animation
-// completes: the open player always shows it, the main menu and the scan pages
-// never do, every other page keeps it. Keeping this idempotent and running it
-// last means no unlucky ordering inside a transition can leave a stray chevron
-// painted on the menu, even for a single frame.
+// completes: the open player always shows it, the pages in
+// page_has_no_chevron() never do, every other page keeps it. Keeping this
+// idempotent and running it last means no unlucky ordering inside a transition
+// can leave a stray chevron painted on the menu, even for a single frame.
 void back_btn_sync_visibility(void) {
 	if (!back_btn) {
 		return;
 	}
 	if (chevron_forced_hidden) {
-		lv_obj_add_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(back_btn, true);
 		return;
 	}
 	if (player_sheet_is_open()) {
-		lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(back_btn, false);
 		return;
 	}
-	lv_obj_t *screen = lv_screen_active();
-	if (screen == main_menu_screen || screen == libraryscan_screen || screen == audiobookscan_screen) {
-		lv_obj_add_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+	if (page_has_no_chevron(lv_screen_active())) {
+		lv_obj_set_hidden(back_btn, true);
 		lv_obj_set_style_translate_x(back_btn, 0, 0);
 	} else {
-		lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(back_btn, false);
 	}
 }
 
@@ -697,14 +716,11 @@ void back_btn_player_mode(bool in_player) {
 	}
 
 	if (chevron_forced_hidden) {
-		lv_obj_add_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(back_btn, true);
 	} else if (in_player) {
-		lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
-	} else {
-		lv_obj_t *screen = lv_screen_active();
-		if (screen == main_menu_screen || screen == libraryscan_screen || screen == audiobookscan_screen) {
-			lv_obj_add_flag(back_btn, LV_OBJ_FLAG_HIDDEN);
-		}
+		lv_obj_set_hidden(back_btn, false);
+	} else if (page_has_no_chevron(lv_screen_active())) {
+		lv_obj_set_hidden(back_btn, true);
 	}
 	chevron_in_player = in_player;
 	chevron_apply_color();
