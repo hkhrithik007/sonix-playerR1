@@ -861,6 +861,19 @@ static void albumkey_sql(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 #define ALBUM_GROUP_NEWEST                                                                                            \
 	"(SELECT MAX(m.ctime) FROM MEDIA_TABLE m WHERE m.album = g.album AND m.album_key = g.album_key)"
 
+// The year of the ALBUM_GROUP_TABLE row `g`: the latest its tracks carry, NULL
+// when none of them carries one. A reissue tagged track by track with the
+// original year and one bonus track with its own still files under the reissue.
+#define ALBUM_GROUP_YEAR                                                                                              \
+	"(SELECT MAX(CASE WHEN m.year > 0 THEN m.year END) FROM MEDIA_TABLE m"                                           \
+	" WHERE m.album = g.album AND m.album_key = g.album_key)"
+
+// A year as a sort key that sends the rows without one to the end, whichever
+// way the years run: past any real year going up, below any going down.
+#define YEAR_KEY_UP(expr) "IFNULL(" expr ", 1000000)"
+#define YEAR_KEY_DOWN(expr) "IFNULL(" expr ", -1) DESC"
+#define TRACK_YEAR "(CASE WHEN year > 0 THEN year END)"
+
 // The first track of the ALBUM_GROUP_TABLE row `g`, by disc and track number,
 // with the columns asked for: the one whose cover and artist the row shows.
 #define ALBUM_GROUP_FIRST(columns)                                                                                    \
@@ -1950,10 +1963,31 @@ int library_for_each(library_list_t kind, library_filter_t filter, const char *v
 	return library_for_each_ordered(kind, filter, value, LIBRARY_ORDER_DEFAULT, cb, user);
 }
 
+// The ORDER BY of a track list. Inside one album the disc order is the natural
+// one; everywhere else the titles read best alphabetically. The orders asked
+// for are the other cases: an artist's tracks with each record kept together
+// and in its own running order, every track by when it arrived, and every
+// track by year -- each year's records kept together and in their running
+// order, so playing the list plays the records through.
+static void track_order_sql(char *out, size_t size, library_order_t order, bool in_album, const char *by_name) {
+	if (order == LIBRARY_ORDER_ALBUM) {
+		snprintf(out, size, "album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s", by_name);
+	} else if (order == LIBRARY_ORDER_ADDED) {
+		snprintf(out, size, TRACK_ORDER_ADDED ", %s", by_name);
+	} else if (order == LIBRARY_ORDER_YEAR || order == LIBRARY_ORDER_YEAR_DESC) {
+		snprintf(out, size, "%s, album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s",
+				 order == LIBRARY_ORDER_YEAR ? YEAR_KEY_UP(TRACK_YEAR) : YEAR_KEY_DOWN(TRACK_YEAR), by_name);
+	} else if (in_album) {
+		snprintf(out, size, TRACK_ORDER_IN_ALBUM ", %s", by_name);
+	} else {
+		snprintf(out, size, "%s", by_name);
+	}
+}
+
 int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order,
 							 library_row_cb cb, void *user) {
-	if (!cb) {
-		return 0;
+	if (!cb || filter == LIBRARY_FILTER_SEARCH) {
+		return 0; // a search is read through a handle
 	}
 
 	char sql[512];
@@ -1965,23 +1999,8 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 	if (kind == LIBRARY_LIST_FAVOURITES) {
 		snprintf(sql, sizeof(sql), "SELECT name, path, %s FROM FAVOURITES ORDER BY added_at, rowid", FAV_ARTIST);
 	} else if (kind == LIBRARY_LIST_TRACKS) {
-		// Inside one album the disc order is the natural one; everywhere else
-		// the titles read best alphabetically.
-		//
-		// LIBRARY_ORDER_ALBUM is the third case: an artist's tracks with each
-		// record kept together and in its own running order, which is how a
-		// person thinks about an artist's work and not how an alphabetical list
-		// of titles presents it.
-		char order_sql[128];
-		if (order == LIBRARY_ORDER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), "album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else if (order == LIBRARY_ORDER_ADDED) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_ADDED ", %s", by_name);
-		} else if (col && value && filter == LIBRARY_FILTER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else {
-			snprintf(order_sql, sizeof(order_sql), "%s", by_name);
-		}
+		char order_sql[256];
+		track_order_sql(order_sql, sizeof(order_sql), order, col && value && filter == LIBRARY_FILTER_ALBUM, by_name);
 		if (col && value) {
 			snprintf(sql, sizeof(sql), "SELECT name, path, artist FROM MEDIA_TABLE WHERE %s ORDER BY %s",
 					 filter_where(filter), order_sql);
@@ -2136,9 +2155,61 @@ static bool playlist_table(const char *name, char *out, size_t out_size) {
 
 // The ordered query behind a list, as SQL. `select` is what to ask for, so the
 // same builder serves both the row-id pass and the streaming reader.
+// The LIKE pattern a query becomes: folded the way foldcase() folds the rows,
+// wrapped in wildcards, and with LIKE's own two wildcards escaped -- a query is
+// a piece of a name, so a user typing "_" means an underscore and not "any
+// character". False for a query that folds to nothing.
+static bool search_pattern(const char *query, char *out, size_t size) {
+	char folded[256];
+	if (!query || size < 3 || fold_text(query, folded, sizeof(folded)) == 0) {
+		return false;
+	}
+	size_t at = 0;
+	out[at++] = '%';
+	for (size_t i = 0; folded[i] && at + 3 < size; i++) {
+		if (folded[i] == '%' || folded[i] == '_' || folded[i] == '\\') {
+			out[at++] = '\\';
+		}
+		out[at++] = folded[i];
+	}
+	out[at++] = '%';
+	out[at] = '\0';
+	return true;
+}
+
 static void list_sql(char *sql, size_t size, const char *select, library_list_t kind, library_filter_t filter,
 					 const char *value, library_order_t order) {
 	const char *col = filter_column(filter);
+
+	// A search: the names that contain the query, in list order, with the
+	// pattern bound as ?1. Tracks, albums and artists only.
+	if (filter == LIBRARY_FILTER_SEARCH) {
+		static const struct {
+			library_list_t kind;
+			const char *table;
+			const char *column;
+		} SEARCHED[] = {
+			{LIBRARY_LIST_TRACKS, "MEDIA_TABLE", "name"},
+			{LIBRARY_LIST_ALBUMS, "ALBUM_GROUP_TABLE", "album"},
+			{LIBRARY_LIST_ARTISTS, "ARTIST_TABLE", "artist"},
+		};
+		sql[0] = '\0';
+		for (size_t i = 0; i < sizeof(SEARCHED) / sizeof(SEARCHED[0]); i++) {
+			if (SEARCHED[i].kind != kind) {
+				continue;
+			}
+			if (list_uses_sortkey(kind)) {
+				snprintf(sql, size, "SELECT %s FROM %s WHERE %s <> '' AND foldcase(%s) LIKE ?1 ESCAPE '\\' ORDER BY sortkey",
+						 select, SEARCHED[i].table, SEARCHED[i].column, SEARCHED[i].column);
+			} else {
+				snprintf(sql, size,
+						 "SELECT %s FROM %s WHERE %s <> '' AND foldcase(%s) LIKE ?1 ESCAPE '\\'"
+						 " ORDER BY %s COLLATE listorder",
+						 select, SEARCHED[i].table, SEARCHED[i].column, SEARCHED[i].column, SEARCHED[i].column);
+			}
+		}
+		return;
+	}
 
 	if (kind == LIBRARY_LIST_FAVOURITES) {
 		snprintf(sql, size, "SELECT %s FROM FAVOURITES ORDER BY added_at, rowid", select);
@@ -2169,20 +2240,8 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 	const char *by_name = list_uses_sortkey(kind) ? "sortkey" : "name COLLATE listorder";
 
 	if (kind == LIBRARY_LIST_TRACKS) {
-		// Inside one album the disc order is the natural one; everywhere else
-		// the titles read best alphabetically. LIBRARY_ORDER_ALBUM is the third
-		// case: an artist's tracks with each record kept together and in its
-		// own running order.
-		char order_sql[128];
-		if (order == LIBRARY_ORDER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), "album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else if (order == LIBRARY_ORDER_ADDED) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_ADDED ", %s", by_name);
-		} else if (col && value && filter == LIBRARY_FILTER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else {
-			snprintf(order_sql, sizeof(order_sql), "%s", by_name);
-		}
+		char order_sql[256];
+		track_order_sql(order_sql, sizeof(order_sql), order, col && value && filter == LIBRARY_FILTER_ALBUM, by_name);
 		if (col && value) {
 			snprintf(sql, size, "SELECT %s FROM MEDIA_TABLE WHERE %s ORDER BY %s", select, filter_where(filter),
 					 order_sql);
@@ -2218,6 +2277,13 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		snprintf(sql, size, "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' ORDER BY " ALBUM_GROUP_NEWEST
 				 ", %s",
 				 select, list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
+		return;
+	}
+	// Every record by year, the albums of one year by name.
+	if ((order == LIBRARY_ORDER_YEAR || order == LIBRARY_ORDER_YEAR_DESC) && kind == LIBRARY_LIST_ALBUMS) {
+		snprintf(sql, size, "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' ORDER BY %s, %s", select,
+				 order == LIBRARY_ORDER_YEAR ? YEAR_KEY_UP(ALBUM_GROUP_YEAR) : YEAR_KEY_DOWN(ALBUM_GROUP_YEAR),
+				 list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
 		return;
 	}
 	if (order == LIBRARY_ORDER_ADDED && (kind == LIBRARY_LIST_ARTISTS || kind == LIBRARY_LIST_ALBUM_ARTISTS)) {
@@ -2343,6 +2409,16 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 				 (kind == LIBRARY_LIST_TRACKS ||
 				  (kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
 												   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)));
+	// A search binds the pattern the value becomes, not the value.
+	char pattern[2 * 256 + 3];
+	if (filter == LIBRARY_FILTER_SEARCH) {
+		if (!search_pattern(value, pattern, sizeof(pattern))) {
+			free(ix);
+			return NULL;
+		}
+		bound = true;
+		value = pattern;
+	}
 
 	char count_sql[PLAYLIST_TABLE_MAX + 256];
 	char rows_sql[PLAYLIST_TABLE_MAX + 256];
@@ -2448,7 +2524,8 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 		// album by disc position, an artist's records by album -- three lists
 		// whose order has nothing to do with the alphabet.
 		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST &&
-					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED &&
+					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED && order != LIBRARY_ORDER_YEAR &&
+					   order != LIBRARY_ORDER_YEAR_DESC &&
 					   !(kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_ALBUM);
 		ix->buckets_valid = by_name && ix->count > 0;
 	}
@@ -7034,25 +7111,10 @@ int library_search(const char *query, int per_category, library_search_cb_t cb, 
 		return 0;
 	}
 
-	// The pattern, folded the way foldcase() folds the rows, and with LIKE's own
-	// two wildcards escaped: a query is a piece of a name, so a user typing "_"
-	// means an underscore and not "any character".
-	char folded[256];
-	if (fold_text(query, folded, sizeof(folded)) == 0) {
+	char like[2 * 256 + 3];
+	if (!search_pattern(query, like, sizeof(like))) {
 		return 0;
 	}
-
-	char like[2 * sizeof(folded) + 3];
-	size_t at = 0;
-	like[at++] = '%';
-	for (size_t i = 0; folded[i]; i++) {
-		if (folded[i] == '%' || folded[i] == '_' || folded[i] == '\\') {
-			like[at++] = '\\';
-		}
-		like[at++] = folded[i];
-	}
-	like[at++] = '%';
-	like[at] = '\0';
 
 	int total = 0;
 
