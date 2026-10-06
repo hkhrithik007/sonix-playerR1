@@ -410,6 +410,42 @@ static char *line_body(char *line) {
 	return line;
 }
 
+// Takes the "." and ".." segments and doubled separators out of an absolute
+// path, in place and without touching the disk: the library stores paths in
+// this form, and "Playlist/../Music/a.flac" has to match its "Music/a.flac".
+// ".." at the root stays at the root.
+static void collapse_dots(char *path) {
+	if (path[0] != '/') {
+		return;
+	}
+	size_t len = 1; // the result so far, always starting with '/'
+	const char *seg = path + 1;
+	while (*seg) {
+		const char *end = strchr(seg, '/');
+		size_t n = end ? (size_t)(end - seg) : strlen(seg);
+		bool dot = n == 1 && seg[0] == '.';
+		if (n == 2 && seg[0] == '.' && seg[1] == '.') {
+			while (len > 1 && path[len - 1] != '/') {
+				len--;
+			}
+			if (len > 1) {
+				len--; // the separator in front of the segment dropped
+			}
+		} else if (n > 0 && !dot) {
+			if (len > 1) {
+				path[len++] = '/';
+			}
+			memmove(path + len, seg, n);
+			len += n;
+		}
+		if (!end) {
+			break;
+		}
+		seg = end + 1;
+	}
+	path[len] = '\0';
+}
+
 // Turns one line of a playlist into a path this player can open.
 //
 // The stock HiBy player writes its own playlists the Windows way, with a drive
@@ -459,6 +495,7 @@ static void resolve_entry(const char *line, const char *base, char *out, size_t 
 			*c = '/';
 		}
 	}
+	collapse_dots(out);
 }
 
 // Whether the file an entry points at is actually there. Asked once, when the
@@ -786,13 +823,9 @@ static void consider_candidate(const char *folder, const char *file_name, enum P
 	}
 	playlists_candidate_t *slot = &out[*count];
 	name_from_file(file_name, slot->name, sizeof(slot->name));
-	// In the Playlist folder, whatever the player already has is not offered:
-	// the folder holds backups, and a backup of a playlist that is still there
-	// would be a second copy of it. What is left is the useful case -- the
-	// backup of one that was deleted, and anybody else's file.
-	if (playlist_location && library_playlist_exists(slot->name)) {
-		return;
-	}
+	// A file named like a playlist that is already there is offered all the
+	// same, marked, since importing it replaces that playlist.
+	slot->exists = library_playlist_exists(slot->name);
 	copy_capped(slot->path, sizeof(slot->path), full);
 	slot->playlist_location = playlist_location;
 	(*count)++;
@@ -907,7 +940,7 @@ static bool import_name(const char *stem, char *name_out, size_t name_size) {
 	return false;
 }
 
-bool playlists_import(const char *source_path, playlists_import_result_t *out) {
+bool playlists_import(const char *source_path, bool overwrite, playlists_import_result_t *out) {
 	if (!source_path || !source_path[0] || !out) {
 		return false;
 	}
@@ -1059,8 +1092,17 @@ bool playlists_import(const char *source_path, playlists_import_result_t *out) {
 	const char *slash = strrchr(source_path, '/');
 	name_from_file(slash ? slash + 1 : source_path, stem, sizeof(stem));
 
+	// Replacing: the rows go into a playlist of their own beside the old one,
+	// which is only dropped once they are all in. A leftover from an import cut
+	// short is cleared first.
 	char name[201];
-	if (!import_name(stem, name, sizeof(name))) {
+	bool replacing = overwrite && name_is_usable(stem) && library_playlist_exists(stem);
+	if (replacing) {
+		snprintf(name, sizeof(name), "%.180s (import)", stem);
+		if (library_playlist_exists(name)) {
+			library_playlist_drop(name);
+		}
+	} else if (!import_name(stem, name, sizeof(name))) {
 		import_entries_free(entries, count);
 		return false;
 	}
@@ -1105,7 +1147,17 @@ bool playlists_import(const char *source_path, playlists_import_result_t *out) {
 	ok = library_playlist_write_end(writer, ok && written > 0);
 	import_entries_free(entries, count);
 	if (!ok) {
+		if (replacing) {
+			library_playlist_drop(name); // the old playlist stays as it was
+		}
 		return false;
+	}
+
+	// The new rows are complete: they take the old playlist's place. Should
+	// that fail, they stay under the name they were written to rather than
+	// being lost.
+	if (replacing && library_playlist_drop(stem) && library_playlist_rename(name, stem)) {
+		copy_capped(name, sizeof(name), stem);
 	}
 
 	copy_capped(out->name, sizeof(out->name), name);

@@ -273,7 +273,13 @@ static unsigned sort_desc_mask;
 // Which lists run by when their files arrived rather than by name. Same shape
 // as sort_desc_mask, and the two combine: "newest first" is by date, reversed.
 static unsigned sort_added_mask;
-static bool artist_album_order; // an artist's tracks grouped by record
+// Which lists run by release year. Same shape again; a list is by year or by
+// date or by name, never two of them, and the direction bit says which way.
+static unsigned sort_year_mask;
+// The disc button on an artist's own lists: on, an artist opened as a track
+// list -- from the search, or from the Artists list with Album view off --
+// opens as their records instead.
+static bool artist_records;
 
 // Whether an artist opens as a list of their records. On by default: an artist
 // with a dozen albums is a dozen rows this way and four hundred the other.
@@ -292,8 +298,7 @@ static bool go_to_current;
 // artist_lists (MEDIALIST_ARTIST_* bits). Off by default, with all of them
 // picked so that switching it on shows something at once.
 static bool show_artist;
-static int artist_lists =
-	MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES;
+static int artist_lists = MEDIALIST_ARTIST_ALL;
 
 // Both are read on first use rather than in medialist_init(): the music
 // settings page is built before it (see gui_init), so a switch built from these
@@ -366,6 +371,18 @@ static void sort_set_added(library_list_t kind, bool added) {
 	config_save();
 }
 
+static bool sort_is_year(library_list_t kind) { return (sort_year_mask & (1u << (unsigned)kind)) != 0; }
+
+static void sort_set_year(library_list_t kind, bool year) {
+	if (year) {
+		sort_year_mask |= 1u << (unsigned)kind;
+	} else {
+		sort_year_mask &= ~(1u << (unsigned)kind);
+	}
+	config_set_int("library", "sort_year", (long)sort_year_mask);
+	config_save();
+}
+
 // The lists that can run by date as well as by name: every track, every
 // record, every artist and every album artist -- the last three by their
 // newest file, so an artist with a new record comes up with it. Genres have no
@@ -375,6 +392,31 @@ static bool sort_can_date(library_list_t kind, library_filter_t filter) {
 	return (kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_ALBUMS || kind == LIBRARY_LIST_ARTISTS ||
 			kind == LIBRARY_LIST_ALBUM_ARTISTS) &&
 		   filter == LIBRARY_FILTER_NONE;
+}
+
+// The lists that can run by release year: every track and every record. An
+// artist has no year of their own -- the first record and the last are both
+// fair answers -- so the name lists stay out.
+static bool sort_can_year(library_list_t kind, library_filter_t filter) {
+	return (kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_ALBUMS) && filter == LIBRARY_FILTER_NONE;
+}
+
+// The order a list is opened with, and whether the handle reads it backwards.
+// Z-A and newest first are the ascending list read backwards; by year the
+// database runs it either way itself, so the rows without a year stay at the
+// end in both.
+static void sort_order_for(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc) {
+	bool reversed = sort_is_desc(kind);
+	if (sort_can_year(kind, filter) && sort_is_year(kind)) {
+		*order = reversed ? LIBRARY_ORDER_YEAR_DESC : LIBRARY_ORDER_YEAR;
+		*desc = false;
+	} else if (sort_can_date(kind, filter) && sort_is_added(kind)) {
+		*order = LIBRARY_ORDER_ADDED;
+		*desc = reversed;
+	} else {
+		*order = LIBRARY_ORDER_DEFAULT;
+		*desc = reversed;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -806,9 +848,9 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 }
 
 // Whether this list is one "Show artist" is on for: all the tracks, the albums
-// and the tracks inside one, a genre's albums and tracks, or the favourites. Not an artist's own
-// lists, where the name is the page's title already, and not the name lists,
-// whose rows are artists or genres themselves.
+// and the tracks inside one, a genre's albums and tracks, the favourites, or a
+// playlist. Not an artist's own lists, where the name is the page's title
+// already, and not the name lists, whose rows are artists or genres themselves.
 static bool panel_shows_artist(const panel_t *p) {
 	if (!show_artist || p->from_paths) {
 		return false;
@@ -825,6 +867,9 @@ static bool panel_shows_artist(const panel_t *p) {
 	}
 	if (p->kind == LIBRARY_LIST_FAVOURITES) {
 		return (artist_lists & MEDIALIST_ARTIST_FAVOURITES) != 0;
+	}
+	if (p->kind == LIBRARY_LIST_PLAYLIST) {
+		return (artist_lists & MEDIALIST_ARTIST_PLAYLISTS) != 0;
 	}
 	return false;
 }
@@ -2008,14 +2053,21 @@ static void reorder_icon_paint(panel_t *p) {
 // Whether this panel's list runs by date rather than by name.
 static bool sort_by_date(const panel_t *p) { return sort_can_date(p->kind, p->filter) && sort_is_added(p->kind); }
 
-// The sort button's glyph says how the list runs now: by name or by date, and
-// which way. The arrow points the way the list reads in both.
+// Whether it runs by release year.
+static bool sort_by_year(const panel_t *p) { return sort_can_year(p->kind, p->filter) && sort_is_year(p->kind); }
+
+// The sort button's glyph says how the list runs now: by name, by date or by
+// year, and which way. By name and by date the arrow points the way the list
+// reads; the year glyphs have theirs the other way round, down for the years
+// going up.
 static void sort_icon_paint(panel_t *p) {
 	if (!p->sort_icon) {
 		return;
 	}
 	bool desc = sort_is_desc(p->kind);
-	if (sort_by_date(p)) {
+	if (sort_by_year(p)) {
+		lv_image_set_src(p->sort_icon, desc ? &icon_sort_year_desc : &icon_sort_year_asc);
+	} else if (sort_by_date(p)) {
 		lv_image_set_src(p->sort_icon, desc ? &icon_sort_date_new : &icon_sort_date_old);
 	} else {
 		lv_image_set_src(p->sort_icon, desc ? &icon_sort_za : &icon_sort_az);
@@ -2228,7 +2280,8 @@ static void row_clicked_cb(lv_event_t *e) {
 	// off. An album: the tracks.
 	bool grouped = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS ||
 				   p->kind == LIBRARY_LIST_GENRES;
-	if (grouped && medialist_album_view()) {
+	bool artist_row = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS;
+	if (grouped && (medialist_album_view() || (artist_row && artist_records))) {
 		medialist_open(name, LIBRARY_LIST_ALBUMS, filter_for(p->kind), name);
 		return;
 	}
@@ -2513,10 +2566,14 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	selection_stop(lv_event_get_user_data(e));
 }
 
+// Set while a list is reopened under a new ordering: it comes back at the top,
+// not on what is playing. A new order is something to read from the start of;
+// the next time the list is entered, it opens on the current track again.
+static bool reopening_resorted;
+
 // Reopens whatever this panel is showing, under whatever the ordering now is.
-// The signature is cleared first so the list comes back at the top, or on what
-// is playing (see current_row): after a re-sort the old scroll position points
-// at nothing in particular.
+// The signature is cleared first so the list comes back at the top: after a
+// re-sort the old scroll position points at nothing in particular.
 static void reload_current(panel_t *p) {
 	if (p->from_paths) {
 		return;
@@ -2527,16 +2584,22 @@ static void reload_current(panel_t *p) {
 	snprintf(value, sizeof(value), "%s", p->filter_value);
 
 	p->signature[0] = '\0';
+	reopening_resorted = true;
 	medialist_open(title, p->kind, p->filter, value[0] ? value : NULL);
+	reopening_resorted = false;
 }
 
-// The four ways a datable list can run, as the menu offers them. Each is a
-// pair of bits, and the menu's tick is whichever pair is set now.
+// The ways a datable list can run, as the menu offers them -- the last two only
+// on the lists that have a year. Each is a set of bits, and the menu's tick is
+// whichever set is on now.
 typedef enum {
 	SORT_NAME_AZ,
 	SORT_NAME_ZA,
 	SORT_ADDED_NEW,
 	SORT_ADDED_OLD,
+	SORT_YEAR_UP,
+	SORT_YEAR_DOWN,
+	SORT_CHOICES,
 } sort_choice_t;
 
 static panel_t *sort_menu_panel;
@@ -2548,7 +2611,8 @@ static void sort_picked(void *user) {
 	}
 	sort_choice_t choice = (sort_choice_t)(intptr_t)user;
 	sort_set_added(p->kind, choice == SORT_ADDED_NEW || choice == SORT_ADDED_OLD);
-	sort_set_desc(p->kind, choice == SORT_NAME_ZA || choice == SORT_ADDED_NEW);
+	sort_set_year(p->kind, choice == SORT_YEAR_UP || choice == SORT_YEAR_DOWN);
+	sort_set_desc(p->kind, choice == SORT_NAME_ZA || choice == SORT_ADDED_NEW || choice == SORT_YEAR_DOWN);
 	reload_current(p);
 }
 
@@ -2565,22 +2629,26 @@ static void sort_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	bool added = sort_is_added(p->kind);
 	bool desc = sort_is_desc(p->kind);
-	sort_choice_t current = added ? (desc ? SORT_ADDED_NEW : SORT_ADDED_OLD) : (desc ? SORT_NAME_ZA : SORT_NAME_AZ);
+	sort_choice_t current = desc ? SORT_NAME_ZA : SORT_NAME_AZ;
+	if (sort_by_year(p)) {
+		current = desc ? SORT_YEAR_DOWN : SORT_YEAR_UP;
+	} else if (sort_by_date(p)) {
+		current = desc ? SORT_ADDED_NEW : SORT_ADDED_OLD;
+	}
 
-	static const char *const labels[] = {
-		[SORT_NAME_AZ] = "medialist_sort_name_az",
-		[SORT_NAME_ZA] = "medialist_sort_name_za",
-		[SORT_ADDED_NEW] = "medialist_sort_added_new",
-		[SORT_ADDED_OLD] = "medialist_sort_added_old",
+	static const char *const labels[SORT_CHOICES] = {
+		[SORT_NAME_AZ] = "medialist_sort_name_az",	   [SORT_NAME_ZA] = "medialist_sort_name_za",
+		[SORT_ADDED_NEW] = "medialist_sort_added_new", [SORT_ADDED_OLD] = "medialist_sort_added_old",
+		[SORT_YEAR_UP] = "medialist_sort_year_up",	   [SORT_YEAR_DOWN] = "medialist_sort_year_down",
 	};
-	popover_item_t items[4];
-	for (int i = 0; i < 4; i++) {
+	int n = sort_can_year(p->kind, p->filter) ? SORT_CHOICES : SORT_YEAR_UP;
+	popover_item_t items[SORT_CHOICES];
+	for (int i = 0; i < n; i++) {
 		items[i] = (popover_item_t){labels[i], sort_picked, (void *)(intptr_t)i, i == (int)current};
 	}
 	sort_menu_panel = p;
-	popover_show(lv_event_get_current_target(e), items, 4);
+	popover_show(lv_event_get_current_target(e), items, n);
 }
 
 // Favourites reversed: the most recently starred track on top. The database
@@ -2599,15 +2667,35 @@ static void reverse_clicked_cb(lv_event_t *e) {
 	reload_current(p);
 }
 
+// Set while the disc button swaps an artist's tracks for their records or back:
+// the new page takes the old one's place instead of going on top of it, so the
+// way back leads to wherever the artist was opened from.
+static bool open_replacing;
+
 static void album_order_clicked_cb(lv_event_t *e) {
 	panel_t *p = lv_event_get_user_data(e);
-	if (!p) {
+	if (!p || p->from_paths) {
 		return;
 	}
-	artist_album_order = !artist_album_order;
-	config_set_int("library", "artist_album_order", artist_album_order ? 1 : 0);
+	bool to_records = p->kind == LIBRARY_LIST_TRACKS;
+	artist_records = to_records;
+	config_set_int("library", "artist_records", artist_records ? 1 : 0);
 	config_save();
-	reload_current(p);
+
+	char title[sizeof(p->title)];
+	char value[sizeof(p->filter_value)];
+	snprintf(title, sizeof(title), "%s", p->title);
+	snprintf(value, sizeof(value), "%s", p->filter_value);
+	open_replacing = true;
+	medialist_open(title, to_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, p->filter, value);
+	open_replacing = false;
+}
+
+void medialist_open_artist(const char *name) {
+	if (!name || !name[0]) {
+		return;
+	}
+	medialist_open(name, artist_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ARTIST, name);
 }
 
 // Copies the path of the one row a window was asked for.
@@ -3391,7 +3479,7 @@ static void show_corner(lv_obj_t *btn, bool shown) {
 // the option is off, the list is not one of those five, or nothing in it is
 // playing.
 static int current_row(panel_t *p) {
-	if (!medialist_go_to_current() || !p->ix) {
+	if (!medialist_go_to_current() || !p->ix || reopening_resorted) {
 		return -1;
 	}
 	np_cache_refresh();
@@ -3467,17 +3555,18 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 
 	// Which of the corner buttons this list has a use for.
 	//
-	// An artist's own track list gets the album grouping; the four flat
-	// alphabetical lists get the direction switch; Favourites gets shuffle. A
-	// list ordered by album has no alphabetical direction to invert, so the
-	// two never appear together.
+	// An artist's own tracks and records get the disc button that swaps one for
+	// the other; the four flat alphabetical lists get the direction switch;
+	// Favourites gets shuffle.
 	bool artist_tracks =
 		kind == LIBRARY_LIST_TRACKS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
+	bool artist_records_page =
+		artist_albums && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
 	bool sortable = (kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_NONE) ||
 					(kind == LIBRARY_LIST_ALBUMS && !artist_albums) || kind == LIBRARY_LIST_ARTISTS ||
 					kind == LIBRARY_LIST_ALBUM_ARTISTS;
 
-	bool want_album = artist_tracks;
+	bool want_album = artist_tracks || artist_records_page;
 	// The circle-play menu, wherever "play all of this" is a question worth
 	// asking: an artist's records, an artist's tracks, all the records, all the
 	// tracks, the favourites, a playlist, inside one album. Not on the name lists,
@@ -3488,7 +3577,7 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 					  (filter == LIBRARY_FILTER_NONE || filter == LIBRARY_FILTER_ARTIST ||
 					   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_ALBUM));
 
-	bool want_sort = sortable && !(artist_tracks && artist_album_order);
+	bool want_sort = sortable;
 	bool want_reverse = kind == LIBRARY_LIST_FAVOURITES;
 	// A playlist is the only list whose order belongs to the user. Every other
 	// one comes back from the database in an order the database decides, and
@@ -3516,17 +3605,17 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	settingsrow_title_corner_slots(p->title_label, p->cfg, corner_buttons);
 
 	if (p->album_btn) {
-		// Lit in the accent while the grouping is on: the button is a state,
-		// not an action that happens once.
+		// Lit in the accent on the records: the button is a state, not an
+		// action that happens once.
 		lv_obj_set_style_image_recolor(lv_obj_get_child(p->album_btn, 0),
-									   artist_album_order ? theme()->accent : theme()->text_primary, 0);
+									   artist_albums ? theme()->accent : theme()->text_primary, 0);
 	}
 	if (p->reverse_btn) {
 		// Lit in the accent colour for as long as the list is reversed.
 		lv_obj_set_style_image_recolor(lv_obj_get_child(p->reverse_btn, 0),
 									   fav_reversed ? theme()->accent : theme()->text_primary, 0);
 	}
-	bool by_date = sort_by_date(p);
+	bool by_date = sort_by_date(p) || sort_by_year(p);
 	sort_icon_paint(p);
 	lv_obj_move_foreground(p->corner);
 
@@ -3538,9 +3627,9 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	}
 
 	model_clear(p);
-	library_order_t order = (artist_tracks && artist_album_order) ? LIBRARY_ORDER_ALBUM
-							: by_date							   ? LIBRARY_ORDER_ADDED
-																   : LIBRARY_ORDER_DEFAULT;
+	library_order_t order = LIBRARY_ORDER_DEFAULT;
+	bool sort_desc = false;
+	sort_order_for(kind, filter, &order, &sort_desc);
 
 	// Z-A is the same list read backwards. The database has already done the
 	// hard part -- the collation groups by script, folds case and accents and
@@ -3549,7 +3638,7 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	// again. Reversed favourites are the same list read backwards as well: the
 	// database returns it oldest-starred first, and with the button on, the
 	// newest belongs on top.
-	bool desc = (sortable && sort_is_desc(kind)) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
+	bool desc = (sortable && sort_desc) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
 
 	p->from_paths = false;
 	p->list_order = order;
@@ -3594,7 +3683,11 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	p->saved_scroll = target_scroll;
 	window_update(p);
 
-	switch_screen(p->screen);
+	if (open_replacing) {
+		switch_screen_no_history(p->screen);
+	} else {
+		switch_screen(p->screen);
+	}
 }
 
 // A track list built from paths handed in rather than queried: a playlist's
@@ -3691,7 +3784,8 @@ void medialist_init(gui_config_t *cfg) {
 
 	sort_desc_mask = (unsigned)config_get_int("library", "sort_desc", 0);
 	sort_added_mask = (unsigned)config_get_int("library", "sort_added", 0);
-	artist_album_order = config_get_int("library", "artist_album_order", 0) != 0;
+	sort_year_mask = (unsigned)config_get_int("library", "sort_year", 0);
+	artist_records = config_get_int("library", "artist_records", 0) != 0;
 	load_view_settings();
 	fav_reversed = config_get_int("library", "fav_reversed", 0) != 0;
 
@@ -3702,6 +3796,11 @@ void medialist_init(gui_config_t *cfg) {
 	build_panel(&panel_names, cfg, false, SLOT_BASE_NAMES);
 	build_panel(&panel_tracks, cfg, true, SLOT_BASE_TRACKS);
 	build_panel(&panel_artist_albums, cfg, false, SLOT_BASE_ARTIST_ALBUMS);
+	// The records of one artist carry the disc button too, lit, to go back to
+	// the tracks; leftmost, as on the track list.
+	panel_artist_albums.album_btn =
+		corner_button(panel_artist_albums.corner, &icon_album_corner, album_order_clicked_cb, &panel_artist_albums);
+	lv_obj_move_to_index(panel_artist_albums.album_btn, 0);
 
 	thumb_timer = lv_timer_create(thumb_timer_cb, THUMB_POLL_MS, NULL);
 	lv_timer_pause(thumb_timer);
@@ -3721,34 +3820,36 @@ void medialist_init(gui_config_t *cfg) {
 // ---------------------------------------------------------------------------
 
 // The same decisions the corner buttons make in the list itself: which lists
-// can be reversed or put by date, and an artist's tracks by record.
+// can be reversed or put by date or by year.
 void medialist_list_order(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc) {
-	bool artist_tracks =
-		kind == LIBRARY_LIST_TRACKS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
 	bool sortable = (kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_NONE) ||
 					(kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_NONE) || kind == LIBRARY_LIST_ARTISTS ||
 					kind == LIBRARY_LIST_ALBUM_ARTISTS;
-	bool by_date = sort_can_date(kind, filter) && sort_is_added(kind);
+	library_order_t sort_order = LIBRARY_ORDER_DEFAULT;
+	bool sort_desc = false;
+	sort_order_for(kind, filter, &sort_order, &sort_desc);
 	if (order) {
-		*order = (artist_tracks && artist_album_order) ? LIBRARY_ORDER_ALBUM
-				 : by_date							   ? LIBRARY_ORDER_ADDED
-													   : LIBRARY_ORDER_DEFAULT;
+		*order = sort_order;
 	}
 	if (desc) {
-		*desc = (sortable && !(artist_tracks && artist_album_order) && sort_is_desc(kind)) ||
-				(kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
+		*desc = (sortable && sort_desc) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
 	}
 }
 
 void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artist_by_album, bool *favourites_reversed) {
+	// The app knows names and dates, not years: a list the player runs by year
+	// is described to it as A-Z rather than as a direction it would apply to
+	// the names.
 	if (desc_mask) {
-		*desc_mask = sort_desc_mask;
+		*desc_mask = sort_desc_mask & ~sort_year_mask;
 	}
 	if (added_mask) {
 		*added_mask = sort_added_mask;
 	}
+	// An artist's tracks always run by title now; their records are a page of
+	// their own.
 	if (artist_by_album) {
-		*artist_by_album = artist_album_order;
+		*artist_by_album = false;
 	}
 	if (favourites_reversed) {
 		*favourites_reversed = fav_reversed;

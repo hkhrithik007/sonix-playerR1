@@ -130,6 +130,10 @@ ICONS = [
     # the arrow points the way the list reads, as it does on A-Z and Z-A.
     ("calendar-arrow-up.svg", "sort_date_old", 34),
     ("calendar-arrow-down.svg", "sort_date_new", 34),
+    # By release year, the same size: arrow down while the years go up, arrow
+    # up while they come down.
+    ("year-arrow-down.svg", "sort_year_asc", 34),
+    ("year-arrow-up.svg", "sort_year_desc", 34),
     # The audiobook lists also run by when a book was last listened to, and a
     # series by the number of each book in it.
     ("history.svg", "sort_played", 34),
@@ -205,11 +209,18 @@ ICONS = [
     ("sleep-timer-music.svg", "sleep_music_quick", 46),
     ("sleep-timer-audiobook.svg", "sleep_audiobook_quick", 46),
     ("sleep-timer-podcast.svg", "sleep_podcast_quick", 46),
+    # Gapless: two drawings and not one recoloured, because what changes is
+    # the gap itself -- the two halves apart while off, closed up while on.
+    ("gapless-on-quick.svg", "gapless_on_quick", 46),
+    ("gapless-off-quick.svg", "gapless_off_quick", 46),
     # File types, in the file manager and on the web page: one glyph per
     # family, at the size of the folder beside them.
     ("files-music.svg", "files_music", 32),
     ("files-audiobook.svg", "files_audiobook", 32),
     ("files-playlist.svg", "files_playlist", 32),
+    # On an import row whose name a playlist already has: importing it
+    # replaces that playlist.
+    ("playlist-overwrite-alert.svg", "playlist_overwrite_alert", 32),
     ("files-image.svg", "files_image", 32),
     ("files-text.svg", "files_text", 32),
     ("files-update.svg", "files_update", 32),
