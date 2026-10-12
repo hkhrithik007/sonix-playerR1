@@ -2,11 +2,32 @@
 
 | patch | script | what it fixes |
 |---|---|---|
-| Touchscreen multitouch | `tools/gt9xx_multitouch_patch.py` | the panel reports five fingers, the driver lets one out |
-| Touchscreen multitouch, R1 | `tools/cst8xx_multitouch_patch.py` | the panel reports two fingers, the driver lets one out |
+| Touchscreen multitouch | `tools/gt9xx_multitouch_patch.py` | the panel reports five fingers, the stock driver lets one out. **Not needed** with the open-source `gt9xx_touch.ko` the packer ships |
+| Touchscreen multitouch, R1 | `tools/cst8xx_multitouch_patch.py` | the panel reports two fingers, the stock driver lets one out. **Not needed** with the open-source `cst8xx_touch.ko` the packer ships |
 
 
 ## Touchscreen multitouch
+
+### Not needed with the open-source driver
+
+The packer's `assets/R3PII/module_driver/` now holds the open-source
+`gt9xx_touch.ko` from
+[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), not
+HiBy's module, and that one has neither of the two problems below:
+
+* a frame with more contacts than `gtp_max_touch_number` reports the first
+  ones instead of being dropped, and the I2C read is sized for up to ten;
+* there is no rate limit: every contact of a frame is reported.
+
+`gt9xx_touch.sh` in the assets already passes `gtp_max_touch_number=5`, so
+five fingers come out as they are, with no patch. The events are the same
+protocol A sequence as the patched stock module's, so what follows about the
+player still holds.
+
+The script is for HiBy's module only. On the open-source one it finds neither
+the stock nor the patched instruction sequence, says so and writes nothing; its
+`--check` then reports "NOT in place", which here means nothing is missing.
+Run it only on a module taken from the stock firmware.
 
 ### What the hardware actually does
 
@@ -154,6 +175,27 @@ either way.
 
 ## Touchscreen multitouch, R1
 
+### Not needed with the open-source driver
+
+The packer's `assets/R1/module_driver/` now holds the open-source
+`cst8xx_touch.ko` from
+[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), not
+HiBy's module, and that one has neither of the two problems below:
+
+* it reads `cst_max_touch_number`, kept between 1 and 2, and sizes the I2C read,
+  the buffers and the parse loop from it;
+* `cst8xx_touch.sh` in the assets already passes `cst_max_touch_number=2`.
+
+So two fingers come out as they are, with no patch. The events are the same
+protocol A sequence as the stock module's, so "What the player does with it"
+below still holds.
+
+The script is for HiBy's module only. On the open-source one it finds neither
+the stock nor the patched instruction pair, says so and writes nothing; its
+`--check` then reports "NOT in place", which here means nothing is missing.
+Run it only on a module taken from the stock firmware.
+
+The rest of this section describes the stock module.
 
 ### What the hardware actually does
 
@@ -261,7 +303,8 @@ Both files are copied to `*.orig` beside themselves before the first write, and
 running the script twice does nothing the second time.
 
 Note that the packer copies `module_driver/` as it finds it and does not run
-this script, so the patched module is what has to live in the assets tree.
+this script: the module in the assets tree is the one that runs, today the
+open-source one.
 
 ### What the player does with it
 

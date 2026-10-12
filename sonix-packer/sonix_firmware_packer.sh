@@ -11,6 +11,9 @@
 #   sonix_player               the binary to install, the same one for both
 #   sonix_launch               waits for the player and reboots when it exits
 #                              (optional: without it the launcher's shell does)
+#   kernel/xImage-R3PII        a kernel to install instead of the stock one
+#   kernel/xImage-R1           (optional, per model: without it the stock
+#                              kernel stays, untouched)
 #   assets/
 #       R3PII/
 #       R1/
@@ -60,6 +63,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 PLAYER_BIN="$SCRIPT_DIR/sonix_player"
 LAUNCH_BIN="$SCRIPT_DIR/sonix_launch"
+
+# Kernels to install, one per model folder name: kernel/xImage-R3PII and so on.
+# Not under assets/, which is copied into the rootfs.
+KERNEL_DIR="$SCRIPT_DIR/kernel"
 
 # The models, one line each: the assets folder, the stock firmware to start
 # from, the image to write, and the device-name the player will read out of
@@ -152,6 +159,62 @@ rename_player_in() {
 	fi
 	say "    $label: $before occurrence(s) of hiby_player replaced"
 	grep -n "sonix_player" "$file" | sed 's/^/        /'
+}
+
+# Copies FS_data, the HBC3000's FPGA configuration, out of the stock
+# sa_sound_hbc3000.ko into a file: the array named by the module's symbol table,
+# in its own section. perl because macOS and Linux both have it.
+hbc3000_firmware() {
+	perl -e '
+		local $/;
+		open(my $f, "<:raw", $ARGV[0]) or die "$ARGV[0]: $!\n";
+		my $e = <$f>;
+		substr($e, 0, 6) eq "\x7fELF\x01\x01" or die "$ARGV[0]: not a 32-bit little-endian ELF\n";
+		my $shoff = unpack("V", substr($e, 0x20, 4));
+		my ($shentsize, $shnum) = unpack("vv", substr($e, 0x2e, 4));
+		my @sh = map { [unpack("V10", substr($e, $shoff + $_ * $shentsize, 40))] } 0 .. $shnum - 1;
+		for my $s (grep { $_->[1] == 2 } @sh) {
+			my $strtab = $sh[$s->[6]]->[4];
+			for (my $o = 0; $o < $s->[5]; $o += 16) {
+				my ($name, $value, $size, $info, $other, $shndx) =
+					unpack("VVVCCv", substr($e, $s->[4] + $o, 16));
+				next unless unpack("Z*", substr($e, $strtab + $name)) eq "FS_data";
+				open(my $out, ">:raw", $ARGV[1]) or die "$ARGV[1]: $!\n";
+				print $out substr($e, $sh[$shndx]->[4] + $value, $size);
+				exit 0;
+			}
+		}
+		die "$ARGV[0]: no FS_data\n";
+	' "$1" "$2"
+}
+
+# Writes an image into the OTA folder the way the updater reads it: 512 KiB
+# chunks named NAME.NNNN.<md5 of the previous chunk>, the first one named after
+# the md5 of the whole image, and ota_md5_NAME.<md5 of the whole image> listing
+# the md5 of every chunk in order. The image itself is consumed.
+write_chunks() {
+	local name="$1" image="$2"
+	local whole_sum current_sum md5_file count suffix chunk f
+
+	whole_sum="$(get_md5 "$image")"
+	split -b 524288 -a 4 "$image" "$OTA_DIR/temp_chunk_"
+	rm -f "$image"
+
+	md5_file="$OTA_DIR/ota_md5_$name.$whole_sum"
+	: > "$md5_file"
+
+	count=0
+	current_sum="$whole_sum"
+	for f in "$OTA_DIR/temp_chunk_"*; do
+		[ -e "$f" ] || continue
+		suffix="$(printf "%04d" $count)"
+		chunk="$OTA_DIR/$name.$suffix.$current_sum"
+		mv "$f" "$chunk"
+		current_sum="$(get_md5 "$chunk")"
+		echo "$current_sum" >> "$md5_file"
+		count=$((count + 1))
+	done
+	say "    $name: $count chunks"
 }
 
 # ==========================================================================
@@ -310,6 +373,74 @@ build_one() {
 	say ""
 
 	# ==========================================================================
+	# 4b. The HBC3000's configuration
+	# ==========================================================================
+	#
+	# The open sa_sound_hbc3000.ko loads the FPGA's configuration from
+	# lib/firmware/hbc3000.fw. The configuration is HiBy's and is not in the
+	# assets: it is taken here from the stock module, before the overlay puts
+	# the open one in its place.
+	if [ -f "$ASSETS_DIR/$MODEL_DIR/module_driver/sa_sound_hbc3000.ko" ]; then
+		step "[$MODEL_NAME] taking the HBC3000 configuration from the stock module"
+
+		command -v perl >/dev/null 2>&1 || die "perl is needed to read the stock sa_sound_hbc3000.ko."
+		STOCK_HBC="$SQUASH_DIR/module_driver/sa_sound_hbc3000.ko"
+		[ -f "$STOCK_HBC" ] || die "the stock firmware has no module_driver/sa_sound_hbc3000.ko.
+	  The open one would have no configuration to load: the outputs would stay silent."
+		mkdir -p "$SQUASH_DIR/lib/firmware"
+		hbc3000_firmware "$STOCK_HBC" "$SQUASH_DIR/lib/firmware/hbc3000.fw" ||
+			die "no configuration in the stock sa_sound_hbc3000.ko."
+		say "    lib/firmware/hbc3000.fw: $(wc -c < "$SQUASH_DIR/lib/firmware/hbc3000.fw" | tr -d ' ') bytes"
+		say ""
+	fi
+
+	# ==========================================================================
+	# 4c. Room for the system libraries in the assets
+	# ==========================================================================
+	#
+	# assets/MODEL/usr/lib holds libraries rebuilt from newer sources under
+	# their sonames (tools/system-libs in sonix-player). In the stock image a
+	# soname is usually a symlink to a versioned file, which the overlay would
+	# leave behind beside the new library: the symlink and that file go, and
+	# every other symlink to the file (libfoo.so) is pointed at the soname.
+	LIB_ASSETS="$(cd "$ASSETS_DIR/$MODEL_DIR" && find usr/lib -maxdepth 1 -type f -name 'lib*.so.*' 2>/dev/null | sort)"
+	if [ -n "$LIB_ASSETS" ]; then
+		step "[$MODEL_NAME] making room for the updated system libraries"
+
+		for rel in $LIB_ASSETS; do
+			soname="$(basename "$rel")"
+			dst="$SQUASH_DIR/$rel"
+			[ -L "$dst" ] || continue
+			target="$(readlink "$dst")"
+			rm -f "$dst"
+			case "$target" in
+			*/*) continue ;; # outside usr/lib: not this library's file
+			esac
+			if [ -f "$SQUASH_DIR/usr/lib/$target" ] && [ ! -L "$SQUASH_DIR/usr/lib/$target" ]; then
+				rm -f "$SQUASH_DIR/usr/lib/$target"
+				say "    usr/lib/$target removed: $soname replaces it"
+			fi
+			for link in "$SQUASH_DIR"/usr/lib/*; do
+				[ -L "$link" ] && [ "$(readlink "$link")" = "$target" ] || continue
+				ln -sfn "$soname" "$link"
+				say "    usr/lib/$(basename "$link") -> $soname"
+			done
+		done
+
+		# The assets' ntfs-3g has libntfs-3g linked in, and nothing else in
+		# the image uses the stock library.
+		NTFS_ASSET="$ASSETS_DIR/$MODEL_DIR/usr/bin/ntfs-3g"
+		if [ -f "$NTFS_ASSET" ] && ! LC_ALL=C grep -aq 'libntfs-3g\.so\.' "$NTFS_ASSET"; then
+			for f in "$SQUASH_DIR"/usr/lib/libntfs-3g.so*; do
+				[ -e "$f" ] || [ -L "$f" ] || continue
+				rm -f "$f"
+				say "    usr/lib/$(basename "$f") removed: the new ntfs-3g carries it"
+			done
+		fi
+		say ""
+	fi
+
+	# ==========================================================================
 	# 5. The overlay
 	# ==========================================================================
 	step "[$MODEL_NAME] copying the overlay onto the root of the rootfs"
@@ -332,6 +463,20 @@ build_one() {
 	fi
 	if [ ! -f "$SQUASH_DIR/usr/resource/sonix/components/streaming-keys.bin" ]; then
 		warn "no streaming-keys.bin in $MODEL_DIR: Tidal, Qobuz and podcasts will be off"
+	fi
+
+	# The stock Wi-Fi/Bluetooth driver goes once bcm_wlbt_power and brcmfmac
+	# have taken its place: only when the module list no longer loads it.
+	DRIVER_LIST="$SQUASH_DIR/module_driver/driver_default_init_script.sh"
+	if [ -f "$ASSETS_DIR/$MODEL_DIR/module_driver/bcm_wlbt_power.ko" ] &&
+		grep -q '^sh bcm_wlbt_power\.sh' "$DRIVER_LIST" 2>/dev/null &&
+		! grep -q 'cywdhd' "$DRIVER_LIST"; then
+		for rel in module_driver/cywdhd.ko module_driver/cywdhd.sh; do
+			if [ -f "$SQUASH_DIR/$rel" ]; then
+				rm -f "$SQUASH_DIR/$rel"
+				say "    $rel removed (bcm_wlbt_power and brcmfmac replace it)"
+			fi
+		done
 	fi
 
 	# What the other model's tree carries and this one does not. Nothing is
@@ -372,6 +517,18 @@ build_one() {
 	# enough to cause it, which is why this is checked rather than assumed.
 	step "[$MODEL_NAME] making the boot path executable"
 
+	# Readable by everyone first, as the stock tree is. tar brings every mode
+	# along -- the directories' too, the top one included -- so an assets folder
+	# checked out under a strict umask (700 directories, 600 files) makes those
+	# parts of the image readable by root alone. Some of what reads them checks
+	# for "others" whoever it runs as: thttpd answers 403 "not world-readable"
+	# for the Wi-Fi transfer page in a directory like that. Only read, and
+	# execute where a directory or the owner already has it, is added; nothing
+	# is taken away. Not through symlinks: chmod follows them, and their
+	# targets are paths on the device, not in the image.
+	( cd "$ASSETS_DIR/$MODEL_DIR" && find . ! -type l -print0 ) | ( cd "$SQUASH_DIR" && xargs -0 chmod go+rX )
+	say "    everything the assets added is readable by all"
+
 	for rel in "$NEW_LAUNCHER" "$INIT_SCRIPT" usr/bin/bluealsa usr/bin/shairport_on.sh etc/init.d/S80_bt_init; do
 		if [ -f "$SQUASH_DIR/$rel" ]; then
 			chmod 755 "$SQUASH_DIR/$rel"
@@ -379,9 +536,9 @@ build_one() {
 		fi
 	done
 
-	# Anything else the overlay put in a directory of executables, and the
-	# kernel-module scripts with it.
-	for rel in $(cd "$ASSETS_DIR/$MODEL_DIR" && find usr/bin module_driver -type f 2>/dev/null); do
+	# Anything else the overlay put in a directory of executables, the
+	# libraries, the kernel-module scripts and the init scripts with it.
+	for rel in $(cd "$ASSETS_DIR/$MODEL_DIR" && find usr/bin usr/lib module_driver etc/init.d -type f 2>/dev/null); do
 		[ -f "$SQUASH_DIR/$rel" ] || continue
 		chmod 755 "$SQUASH_DIR/$rel"
 	done
@@ -496,6 +653,7 @@ build_one() {
 	find "$SQUASH_DIR" -name '*.packer.tmp' -type f -delete 2>/dev/null || true
 
 	ROOTFS_NEW="$OTA_DIR/rootfs.squashfs"
+	KERNEL_NEW="$KERNEL_DIR/xImage-$MODEL_DIR"
 
 	step "[$MODEL_NAME] building the filesystem"
 	mksquashfs "$SQUASH_DIR" "$ROOTFS_NEW" -comp lzo -all-root > /dev/null
@@ -505,13 +663,26 @@ build_one() {
 	say "    rootfs.squashfs: $SIZE bytes, md5 $ORIGINAL_SUM"
 
 	step "[$MODEL_NAME] updating ota_update.in"
-	# The kernel is not touched, so its two lines are carried over exactly as they
-	# were: recomputing them from a file this script never writes would be a way of
-	# getting them wrong.
-	X_SIZE="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_size' | cut -d= -f2 | tr -d '\r ')"
-	X_MD5="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_md5' | cut -d= -f2 | tr -d '\r ')"
-
-	[ -n "$X_SIZE" ] && [ -n "$X_MD5" ] || die "cannot read the kernel entry from ota_update.in."
+	if [ -f "$KERNEL_NEW" ]; then
+		# A kernel of our own: it replaces the stock one, chunks and md5 chain
+		# alike. It may not be bigger than the stock one -- that is all the
+		# room the kernel partition is known to have.
+		STOCK_X_SIZE="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_size' | cut -d= -f2 | tr -d '\r ')"
+		X_SIZE="$(get_size "$KERNEL_NEW")"
+		X_MD5="$(get_md5 "$KERNEL_NEW")"
+		[ -n "$STOCK_X_SIZE" ] || die "cannot read the kernel entry from ota_update.in."
+		[ "$X_SIZE" -le "$STOCK_X_SIZE" ] ||
+			die "kernel/xImage-$MODEL_DIR is $X_SIZE bytes, the stock kernel $STOCK_X_SIZE: it may not fit."
+		say "    xImage: kernel/xImage-$MODEL_DIR, $X_SIZE bytes, md5 $X_MD5 (stock: $STOCK_X_SIZE bytes)"
+	else
+		# The stock kernel stays, so its two lines are carried over exactly as
+		# they were: recomputing them from a file this script never writes
+		# would be a way of getting them wrong.
+		X_SIZE="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_size' | cut -d= -f2 | tr -d '\r ')"
+		X_MD5="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_md5' | cut -d= -f2 | tr -d '\r ')"
+		[ -n "$X_SIZE" ] && [ -n "$X_MD5" ] || die "cannot read the kernel entry from ota_update.in."
+		say "    xImage: the stock kernel, unchanged"
+	fi
 
 	cat > "$OTA_DIR/ota_update.in" <<-EOF
 	ota_version=0
@@ -527,25 +698,13 @@ build_one() {
 	img_md5=$ORIGINAL_SUM
 	EOF
 
-	step "[$MODEL_NAME] splitting into chunks and building the md5 chain"
-	split -b 524288 -a 4 "$ROOTFS_NEW" "$OTA_DIR/temp_chunk_"
-	rm -f "$ROOTFS_NEW"
-
-	MD5_FILE="$OTA_DIR/ota_md5_rootfs.squashfs.$ORIGINAL_SUM"
-	: > "$MD5_FILE"
-
-	count=0
-	CURRENT_SUM="$ORIGINAL_SUM"
-	for f in "$OTA_DIR/temp_chunk_"*; do
-		[ -e "$f" ] || continue
-		suffix="$(printf "%04d" $count)"
-		NEW_FILENAME="$OTA_DIR/rootfs.squashfs.$suffix.$CURRENT_SUM"
-		mv "$f" "$NEW_FILENAME"
-		CURRENT_SUM="$(get_md5 "$NEW_FILENAME")"
-		echo "$CURRENT_SUM" >> "$MD5_FILE"
-		count=$((count + 1))
-	done
-	say "    $count chunks"
+	step "[$MODEL_NAME] splitting into chunks and building the md5 chains"
+	write_chunks rootfs.squashfs "$ROOTFS_NEW"
+	if [ -f "$KERNEL_NEW" ]; then
+		rm -f "$OTA_DIR/ota_md5_xImage."* "$OTA_DIR/xImage."*
+		cp "$KERNEL_NEW" "$OTA_DIR/xImage"
+		write_chunks xImage "$OTA_DIR/xImage"
+	fi
 	say ""
 
 	# ==========================================================================

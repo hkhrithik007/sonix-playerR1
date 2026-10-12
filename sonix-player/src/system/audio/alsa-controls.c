@@ -9,6 +9,7 @@
 #include "src/system/device/sysinfo.h"
 
 #include <alsa/asoundlib.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -125,14 +126,12 @@ bool usbc_port_attached(void) { return usbc_attached(); }
 // value powers it down. So on this board the route is always 2, written once,
 // with none of the HBC3000's re-init around it.
 //
-// Its codec driver (codec_cs43131.ko) has no DRE_EN and no NOS_EN, and the
-// handler of its "Digital Filter" control returns without writing anything.
-// The filter goes through the driver's register node instead: see
-// set_dac_filter().
+// Its codec driver (codec_cs43131.ko, the open one from hiby-custom-kernel)
+// has "Digital Filter" and "NOS_EN" as on the CS43198, and no DRE_EN.
 // ---------------------------------------------------------------------------
 
-// "<register> <value>", both hex. Written to the chip when it is powered, and
-// always into the table the driver replays at every stream start.
+// The codec's register node: its presence names the board when sysinfo does
+// not.
 #define CS43131_REG_NODE "/sys/bus/i2c/devices/3-0030/write_reg_val"
 
 bool alsa_board_is_cs43131(void) {
@@ -297,11 +296,54 @@ void alsa_list_controls(char *out, size_t out_size) {
 	snd_ctl_close(ctl);
 }
 
+// ---------------------------------------------------------------------------
+// The route re-init after mem (see alsa-controls.h)
+//
+// Its route write powers the HBC3000 and reloads it, a few hundred
+// milliseconds inside the driver, and until it is done the card must not be
+// opened. The gate is closed from the parking of the route before mem to the
+// end of that write.
+// ---------------------------------------------------------------------------
+static pthread_mutex_t reinit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reinit_cond = PTHREAD_COND_INITIALIZER;
+static bool reinit_running;
+static __thread bool reinit_thread; // true on the re-init thread itself
+
+void alsa_output_reinit_begin(void) {
+	pthread_mutex_lock(&reinit_lock);
+	reinit_running = true;
+	pthread_mutex_unlock(&reinit_lock);
+}
+
+void alsa_output_reinit_enter_thread(void) { reinit_thread = true; }
+
+void alsa_output_reinit_leave_thread(void) { reinit_thread = false; }
+
+void alsa_output_reinit_end(void) {
+	pthread_mutex_lock(&reinit_lock);
+	reinit_running = false;
+	pthread_cond_broadcast(&reinit_cond);
+	pthread_mutex_unlock(&reinit_lock);
+}
+
+void alsa_wait_output_reinit(void) {
+	if (reinit_thread) {
+		return;
+	}
+	pthread_mutex_lock(&reinit_lock);
+	while (reinit_running) {
+		pthread_cond_wait(&reinit_cond, &reinit_lock);
+	}
+	pthread_mutex_unlock(&reinit_lock);
+}
+
 int alsa_set_control(const char *name, long value) {
 	snd_ctl_t *ctl;
 	snd_ctl_elem_id_t *id;
 	snd_ctl_elem_value_t *elem;
 	int err;
+
+	alsa_wait_output_reinit();
 
 	err = snd_ctl_open(&ctl, "hw:0", 0);
 	if (err < 0) {
@@ -369,29 +411,11 @@ static bool want_balance_lineout(void) { return lineout_on && detect_output() ==
 // would leave the stream on the old configuration until the next track.
 int alsa_output_key(void) { return detect_output() * 2 + (want_balance_lineout() ? 1 : 0); }
 
-// The CS43198's four digital interpolation filters, the ALSA "Digital
-// Filter" control the stock player writes (0..3):
+// The DAC's four digital interpolation filters, the ALSA "Digital Filter"
+// control the stock player writes (0..3), on both boards:
 //   0 fast roll-off, low latency      1 fast roll-off, phase compensated
 //   2 slow roll-off, low latency      3 slow roll-off, phase compensated
 static int current_filter = -1;
-
-// The same four on the CS43131, in its PCM filter option register (0x090000):
-// bit 7 slow roll-off, bit 6 phase compensated, bit 5 NOS (kept off), bit 1
-// the high-pass filter the driver's own table turns on, bit 0 de-emphasis
-// (off). The bit positions are those of Linux's cs43130 driver, which covers
-// the CS43131.
-static int write_cs43131_filter(int filter) {
-	unsigned value = 0x02u | ((filter & 2) ? 0x80u : 0) | ((filter & 1) ? 0x40u : 0);
-	FILE *f = fopen(CS43131_REG_NODE, "w");
-	if (!f) {
-		return -1;
-	}
-	bool ok = fprintf(f, "90000 %x", value) > 0;
-	if (fclose(f) != 0) {
-		ok = false;
-	}
-	return ok ? 0 : -1;
-}
 
 void set_dac_filter(int filter) {
 	if (filter < 0 || filter > 3) {
@@ -401,11 +425,6 @@ void set_dac_filter(int filter) {
 		return; // same reasoning as the output switch: never poke it idly
 	}
 	current_filter = filter;
-	if (alsa_board_is_cs43131()) {
-		int rc = write_cs43131_filter(filter);
-		fprintf(stderr, "set dac filter to %d (cs43131 register%s)\n", filter, rc < 0 ? " NOT written" : "");
-		return;
-	}
 	alsa_set_control("Digital Filter", filter);
 	printf("set dac filter to %d\n", filter);
 }
@@ -417,8 +436,8 @@ int get_dac_filter(void) { return current_filter < 0 ? 0 : current_filter; }
 // filter and the output route: never poke the codec idly mid-stream.
 static int current_dre = -1;
 
-// Neither DRE nor NOS exists on the CS43131 board: both stay off there and
-// nothing is written.
+// DRE does not exist on the CS43131 board: it stays off there and nothing is
+// written.
 void set_dac_dre(int enabled) {
 	enabled = enabled && !alsa_board_is_cs43131() ? 1 : 0;
 	if (enabled == current_dre) {
@@ -444,14 +463,11 @@ int get_dac_dre(void) {
 static int current_nos = -1;
 
 void set_dac_nos(int enabled) {
-	enabled = enabled && !alsa_board_is_cs43131() ? 1 : 0;
+	enabled = enabled ? 1 : 0;
 	if (enabled == current_nos) {
 		return;
 	}
 	current_nos = enabled;
-	if (alsa_board_is_cs43131()) {
-		return;
-	}
 	alsa_set_control("NOS_EN", enabled);
 	printf("set dac NOS to %d\n", enabled);
 }
@@ -631,11 +647,10 @@ int get_dac_dop(void) { return current_dop < 0 ? 0 : current_dop; }
 // driver's two PM callbacks are empty returns. Volume, digital filter, DRE and
 // NOS all survive, so there is nothing to write again.
 //
-// What does go down is the HBC3000 audio bridge, whose suspend callback
-// disables it and whose resume is a no-op on this platform. That is handled
-// elsewhere: audio_force_output_reinit_after_resume() forces a real route
-// transition on the way out of "mem", which makes the machine driver run
-// hbc3000_enable() again.
+// What does go down is the HBC3000 audio bridge. Its suspend callback powers
+// it off and the card's suspend_pre resets the driver's route to 0, so the
+// first route write after "mem" is a real change and runs hbc3000_enable()
+// again: audio_start_output_reinit_after_resume() makes that write.
 //
 // Calling this would mean i2c traffic to the codec on a bit-banged bus whose
 // pins nothing reprograms at resume, for no gain.
@@ -709,6 +724,8 @@ static int write_output_route(int route) {
 // seconds and ending it in "write error: Input/output error". The
 // current_output cache is what keeps the route from being touched mid-track.
 void auto_set_output(void) {
+	alsa_wait_output_reinit();
+
 	// The CS43131 board: one route, no line-out flag, no transition to force.
 	if (alsa_board_is_cs43131()) {
 		int route = detect_output();
@@ -762,10 +779,27 @@ void auto_set_output(void) {
 }
 
 // Realigns the route cache after something else wrote "Output Port Switch"
-// directly (the re-init test after mem does, to force a real route change in
-// the kernel), so the next auto_set_output() sees the right route already
-// cached and does not rewrite it for nothing.
+// directly (the route parked before mem), so the cache never claims a route
+// the driver does not hold.
 void alsa_controls_note_output(int value) { current_output = value; }
+
+void alsa_controls_rewrite_output(void) {
+	alsa_wait_output_reinit();
+
+	int output = detect_output();
+	int flag = (lineout_on && output == 3) ? 1 : 0;
+
+	// The flag first: the driver reads it while applying route 3.
+	current_balance_lineout = -1;
+	if (alsa_set_control("Balance Lineout En", flag) >= 0) {
+		current_balance_lineout = flag;
+	}
+	current_output = -1;
+	if (alsa_set_control("Output Port Switch", output) >= 0) {
+		current_output = output;
+	}
+	printf("set output to %d after suspend (balanced line out %d)\n", output, flag);
+}
 
 // Raw CS43198 attenuation, 0-255, applied to both channels.
 void set_volume(long volume) {
@@ -822,11 +856,117 @@ static const char *PROFILE_NAMES[VOLUME_OUTPUT_COUNT] = {
 
 static bool output_in_range(volume_output_t out) { return out >= 0 && out < VOLUME_OUTPUT_COUNT; }
 
+// ---------------------------------------------------------------------------
+// The volume limit (see alsa-controls.h)
+// ---------------------------------------------------------------------------
+
+static bool limit_loaded;
+static bool limit_on;
+static int limit_level[VOLUME_OUTPUT_COUNT] = {100, 100, 100, 100};
+
+static const char *const LIMIT_KEYS[VOLUME_OUTPUT_COUNT] = {
+	[VOLUME_OUTPUT_PHONES] = "volume_limit_phones",
+	[VOLUME_OUTPUT_BALANCED] = "volume_limit_balanced",
+	[VOLUME_OUTPUT_USB] = "volume_limit_usb",
+};
+
+static int limit_clamp_value(int percent) {
+	return percent < VOLUME_LIMIT_MIN ? VOLUME_LIMIT_MIN : (percent > 100 ? 100 : percent);
+}
+
+// Read on first use rather than at init: the first level is applied by
+// audio_init(), after the config is loaded but before anything here is set up.
+static void limit_load(void) {
+	if (limit_loaded) {
+		return;
+	}
+	limit_loaded = true;
+	limit_on = config_get_int("audio", "volume_limit", 0) != 0;
+	for (int i = 0; i < VOLUME_OUTPUT_COUNT; i++) {
+		if (LIMIT_KEYS[i]) {
+			limit_level[i] = limit_clamp_value((int)config_get_int("audio", LIMIT_KEYS[i], 100));
+		}
+	}
+}
+
+// The ceiling in force for `out` right now: 100 with the limit off and for the
+// outputs it does not cover.
+static int limit_ceiling(volume_output_t out) {
+	limit_load();
+	if (!limit_on || !output_in_range(out) || !LIMIT_KEYS[out]) {
+		return 100;
+	}
+	return limit_level[out];
+}
+
+bool volume_limit_enabled(void) {
+	limit_load();
+	return limit_on;
+}
+
+int volume_limit(volume_output_t out) {
+	limit_load();
+	if (!output_in_range(out) || !LIMIT_KEYS[out]) {
+		return 100;
+	}
+	return limit_level[out];
+}
+
+static void apply_volume_hw(int percent);
+
+// Brings the remembered level of `out` under its ceiling, and the hardware with
+// it when that is the output playing. Line out holds its own level and keeps
+// it; the user's level underneath it is what comes down.
+static void limit_enforce(volume_output_t out) {
+	int ceiling = limit_ceiling(out);
+	if (level[out] > ceiling) {
+		level[out] = ceiling;
+		profile_dirty = true;
+	}
+	if (out != profile_out) {
+		return;
+	}
+	if (lineout_on) {
+		if (lineout_saved_percent > ceiling) {
+			lineout_saved_percent = ceiling;
+		}
+	} else if (current_percent > ceiling) {
+		profile_dirty = true;
+		apply_volume_hw(ceiling);
+	}
+}
+
+void volume_limit_set_enabled(bool on) {
+	limit_load();
+	limit_on = on;
+	config_set_int("audio", "volume_limit", on ? 1 : 0);
+	config_save();
+	if (on) {
+		limit_enforce(VOLUME_OUTPUT_PHONES);
+		limit_enforce(VOLUME_OUTPUT_BALANCED);
+		limit_enforce(VOLUME_OUTPUT_USB);
+		volume_profile_persist();
+	}
+}
+
+void volume_limit_set(volume_output_t out, int percent) {
+	limit_load();
+	if (!output_in_range(out) || !LIMIT_KEYS[out]) {
+		return;
+	}
+	limit_level[out] = limit_clamp_value(percent);
+	config_set_int("audio", LIMIT_KEYS[out], limit_level[out]);
+	limit_enforce(out);
+}
+
 void volume_profile_set_level(volume_output_t out, int percent) {
 	if (!output_in_range(out)) {
 		return;
 	}
 	level[out] = (percent >= 0 && percent <= 100) ? percent : -1;
+	if (level[out] > limit_ceiling(out)) {
+		level[out] = limit_ceiling(out);
+	}
 }
 
 void volume_profile_init(int wired_percent, int bt_percent) {
@@ -961,6 +1101,12 @@ void set_volume_percent(int percent) {
 	// from pulling the output off the index the mode exists to hold.
 	if (lineout_on) {
 		return;
+	}
+
+	// And no higher than the ceiling of the socket in use.
+	int ceiling = limit_ceiling(profile_out);
+	if (percent > ceiling) {
+		percent = ceiling;
 	}
 
 	if (current_percent != percent || level[profile_out] != percent) {

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1 // strcasestr
 #include "radio.h"
 
 #include <errno.h>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 #include "src/system/audio/audio.h"
+#include "src/system/audio/eq.h"
 #include "src/system/core/config.h"
 #include "src/system/decode/aacdec.h"
 #include "src/system/net/hls.h"
@@ -1081,6 +1083,8 @@ bool radio_recent_get(int index, radio_station_t *out) {
 // ---------------------------------------------------------------------------
 
 static radio_station_t custom[RADIO_CUSTOM_MAX];
+// The heading each station opens, empty for the ones that open none.
+static char custom_heading[RADIO_CUSTOM_MAX][RADIO_NAME_MAX];
 static int custom_count;
 static bool custom_present;
 static pthread_mutex_t custom_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1102,9 +1106,27 @@ static char *trim(char *s) {
 // What a line is.
 typedef enum {
 	CUSTOM_LINE_STATION,
+	CUSTOM_LINE_HEADING, // "[ROCK]": the stations below belong to it
 	CUSTOM_LINE_IGNORED, // blank, or a comment: not something to complain about
 	CUSTOM_LINE_BAD,
 } custom_line_t;
+
+// A heading is a whole line in square brackets with something inside. A
+// station whose name starts with a bracket ("[Live] Radio, http://...") does
+// not end with one, so it stays a station. `heading` receives the text.
+static bool custom_parse_heading(char *text, char *heading, size_t heading_size) {
+	size_t len = strlen(text);
+	if (len < 3 || text[0] != '[' || text[len - 1] != ']') {
+		return false;
+	}
+	text[len - 1] = '\0';
+	char *inside = trim(text + 1);
+	if (!inside[0]) {
+		return false;
+	}
+	snprintf(heading, heading_size, "%s", inside);
+	return true;
+}
 
 // One line into a station.
 //
@@ -1112,10 +1134,13 @@ typedef enum {
 // after it: an address cannot contain a comma before its scheme, and a station
 // called "Radio Uno, Roma" is more likely than one whose URL needs the split to
 // happen later.
-static custom_line_t custom_parse_line(char *line, radio_station_t *out) {
+static custom_line_t custom_parse_line(char *line, radio_station_t *out, char *heading, size_t heading_size) {
 	char *text = trim(line);
 	if (!text[0] || text[0] == '#') {
 		return CUSTOM_LINE_IGNORED;
+	}
+	if (custom_parse_heading(text, heading, heading_size)) {
+		return CUSTOM_LINE_HEADING;
 	}
 
 	char *comma = strchr(text, ',');
@@ -1161,10 +1186,21 @@ void radio_custom_reload(void) {
 
 	char line[RADIO_URL_MAX + RADIO_NAME_MAX + 8];
 	int bad = 0;
+	int headings = 0;
+	// A heading waits for the station under it; two in a row, the second wins,
+	// and one with no station after it shows nothing.
+	char pending[RADIO_NAME_MAX] = "";
 	while (custom_count < RADIO_CUSTOM_MAX && fgets(line, sizeof(line), f)) {
-		switch (custom_parse_line(line, &custom[custom_count])) {
+		char heading[RADIO_NAME_MAX];
+		switch (custom_parse_line(line, &custom[custom_count], heading, sizeof(heading))) {
 		case CUSTOM_LINE_STATION:
+			snprintf(custom_heading[custom_count], sizeof(custom_heading[0]), "%s", pending);
+			pending[0] = '\0';
 			custom_count++;
+			break;
+		case CUSTOM_LINE_HEADING:
+			snprintf(pending, sizeof(pending), "%s", heading);
+			headings++;
 			break;
 		case CUSTOM_LINE_BAD:
 			bad++;
@@ -1177,7 +1213,8 @@ void radio_custom_reload(void) {
 
 	// Only the lines somebody meant as a station and got wrong are counted:
 	// blanks and comments are how the file is meant to be written.
-	fprintf(stderr, "radio: %s -- %d stations, %d unreadable lines\n", path, custom_count, bad);
+	fprintf(stderr, "radio: %s -- %d stations, %d headings, %d unreadable lines\n", path, custom_count, headings,
+			bad);
 	pthread_mutex_unlock(&custom_lock);
 }
 
@@ -1196,6 +1233,20 @@ bool radio_custom_get(int index, radio_station_t *out) {
 	bool ok = index >= 0 && index < custom_count;
 	if (ok) {
 		*out = custom[index];
+	}
+	pthread_mutex_unlock(&custom_lock);
+	return ok;
+}
+
+bool radio_custom_heading(int index, char *out, size_t out_size) {
+	if (!out || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	pthread_mutex_lock(&custom_lock);
+	bool ok = index >= 0 && index < custom_count && custom_heading[index][0];
+	if (ok) {
+		snprintf(out, out_size, "%s", custom_heading[index]);
 	}
 	pthread_mutex_unlock(&custom_lock);
 	return ok;
@@ -1856,20 +1907,47 @@ static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine) {
 	printf("radio: %d KB buffered before the first frame\n", level / 1024);
 }
 
+static bool is_png(const unsigned char *b, size_t len) {
+	return len >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G';
+}
+
+// The biggest picture inside a Windows icon that is a PNG, which is how icons
+// of any size have been made for years; the older bitmap kind is not drawn.
+// False when there is none.
+static bool ico_png(const unsigned char *b, size_t len, size_t *at, size_t *size) {
+	if (len < 6 || b[0] != 0 || b[1] != 0 || b[2] != 1 || b[3] != 0) {
+		return false;
+	}
+	int count = b[4] | (b[5] << 8);
+	size_t best = 0;
+	for (int i = 0; i < count && 6 + (size_t)(i + 1) * 16 <= len; i++) {
+		const unsigned char *e = b + 6 + (size_t)i * 16;
+		size_t bytes = (size_t)e[8] | ((size_t)e[9] << 8) | ((size_t)e[10] << 16) | ((size_t)e[11] << 24);
+		size_t offset = (size_t)e[12] | ((size_t)e[13] << 8) | ((size_t)e[14] << 16) | ((size_t)e[15] << 24);
+		if (offset < len && bytes <= len - offset && bytes > best && is_png(b + offset, bytes)) {
+			best = bytes;
+			*at = offset;
+			*size = bytes;
+		}
+	}
+	return best > 0;
+}
+
+// The icon of the station before, deleted when the next one's comes in. Under
+// now_lock.
+static char favicon_file[64];
+
 // Pulls the station's icon down so the player has something to show. Best
 // effort in every sense: no icon, an icon that is not an image, a server that
 // does not answer -- all of them just mean the radio placeholder stays up.
+//
+// Over HTTPS as well as HTTP, which is how most of the directory's icons are
+// served now: the same connection code as the stations' own, so wherever a
+// station on HTTPS plays, its icon comes.
 static void fetch_favicon(const char *url) {
-	if (!url || strncasecmp(url, "http://", 7) != 0) {
+	bool secure = url && strncasecmp(url, "https://", 8) == 0;
+	if (!url || (!secure && strncasecmp(url, "http://", 7) != 0) || (secure && !tls_available())) {
 		return;
-	}
-
-	const char *ext = ".jpg";
-	const char *dot = strrchr(url, '.');
-	if (dot && (strcasecmp(dot, ".png") == 0)) {
-		ext = ".png";
-	} else if (dot && strcasecmp(dot, ".gif") == 0) {
-		return; // nothing here decodes GIF covers
 	}
 
 	char *body = NULL;
@@ -1880,29 +1958,49 @@ static void fetch_favicon(const char *url) {
 	}
 
 	// Trust the bytes, not the file name: half the favicons in the directory
-	// are called .png and are JPEGs, or the other way round.
+	// are called .png and are JPEGs, or the other way round. A GIF is kept
+	// under .png too, because a picture file is told apart by its extension
+	// and only .jpg and .png are looked at; what decodes it goes by the bytes.
 	const unsigned char *b = (const unsigned char *)body;
-	if (b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') {
+	const char *ext = NULL;
+	size_t at = 0, size = len;
+	if (is_png(b, len)) {
 		ext = ".png";
 	} else if (b[0] == 0xFF && b[1] == 0xD8) {
 		ext = ".jpg";
+	} else if (memcmp(b, "GIF8", 4) == 0) {
+		ext = ".png";
+	} else if (ico_png(b, len, &at, &size)) {
+		ext = ".png";
 	} else {
 		free(body);
 		return; // not something the cover decoder can read
 	}
 
-	char path[256];
-	snprintf(path, sizeof(path), "/tmp/sonix-radio-cover%s", ext);
+	// One name per icon, from its address: the player compares the path to
+	// tell a new picture from the one it is showing, and two stations with
+	// the same kind of icon must not look like the same picture to it.
+	uint32_t hash = 2166136261u;
+	for (const char *p = url; *p; p++) {
+		hash = (hash ^ (uint8_t)*p) * 16777619u;
+	}
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/sonix-radio-cover-%08x%s", (unsigned)hash, ext);
 
 	FILE *f = fopen(path, "wb");
 	if (f) {
-		fwrite(body, 1, len, f);
-		fclose(f);
-
-		pthread_mutex_lock(&now_lock);
-		snprintf(now_state.cover_path, sizeof(now_state.cover_path), "%s", path);
-		now_touch();
-		pthread_mutex_unlock(&now_lock);
+		bool ok = fwrite(body + at, 1, size, f) == size;
+		ok = fclose(f) == 0 && ok;
+		if (ok) {
+			pthread_mutex_lock(&now_lock);
+			if (favicon_file[0] && strcmp(favicon_file, path) != 0) {
+				unlink(favicon_file);
+			}
+			snprintf(favicon_file, sizeof(favicon_file), "%s", path);
+			snprintf(now_state.cover_path, sizeof(now_state.cover_path), "%s", path);
+			now_touch();
+			pthread_mutex_unlock(&now_lock);
+		}
 	}
 	free(body);
 }
@@ -1979,13 +2077,19 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 		pthread_mutex_unlock(&now_lock);
 	}
 
+	// The equaliser, the parametric one and MSEB, on the stereo pair about to
+	// be written -- the same chain a track from the card goes through, and a
+	// no-op when all three are off. A station is not a file, but what the
+	// listener has tuned is for the headphones, not for the source.
 	if (channels == 1) {
 		for (int i = frames - 1; i >= 0; i--) {
 			stereo[2 * i] = pcm[i];
 			stereo[2 * i + 1] = pcm[i];
 		}
+		eq_process(stereo, frames, 2, rate);
 		audio_external_write(stereo, frames);
 	} else if (channels == 2) {
+		eq_process(pcm, frames, 2, rate);
 		audio_external_write(pcm, frames);
 	} else {
 		// More than two channels, which on a radio station is AAC carrying 5.1.
@@ -2003,6 +2107,7 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 			stereo[2 * i] = (short)(left / pairs);
 			stereo[2 * i + 1] = (short)(right / pairs);
 		}
+		eq_process(stereo, frames, 2, rate);
 		audio_external_write(stereo, frames);
 	}
 	return true;
@@ -2147,7 +2252,7 @@ static bool play_hls(const char *url, unsigned mine) {
 	hls_t *h = hls_open(url, why, sizeof(why));
 	if (!h) {
 		pthread_mutex_lock(&now_lock);
-		snprintf(now_state.error, sizeof(now_state.error), "%s",
+		snprintf(now_state.error, sizeof(now_state.error), "%.*s", (int)sizeof(now_state.error) - 1,
 				 why[0] ? why : tr("radio_unreadable"));
 		now_state.playing = false;
 		now_state.connecting = false;

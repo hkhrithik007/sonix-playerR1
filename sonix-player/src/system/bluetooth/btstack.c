@@ -1117,6 +1117,26 @@ bool btstack_trust(const char *address, bool on) {
 	return set_bool_property(path, BLUEZ_DEVICE_IFACE, "Trusted", on);
 }
 
+bool btstack_set_device_alias(const char *address, const char *alias) {
+	pthread_mutex_lock(&lock);
+	dbus_conn_t *c = conn;
+	pthread_mutex_unlock(&lock);
+	char path[OBJECT_PATH_MAX];
+	if (!c || !alias || !device_path(address, path, sizeof(path))) {
+		return false;
+	}
+	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, PROPS_IFACE, "Set", "ssv");
+	dbus_w_string(w, BLUEZ_DEVICE_IFACE);
+	dbus_w_string(w, "Alias");
+	dbus_w_variant_string(w, alias);
+	char err[DBUS_NAME_MAX];
+	if (dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+		return true;
+	}
+	fprintf(stderr, "btstack: alias of %s -> %s\n", address, err[0] ? err : "no reply");
+	return false;
+}
+
 bool btstack_remove(const char *address) {
 	pthread_mutex_lock(&lock);
 	dbus_conn_t *c = conn;
@@ -1189,13 +1209,15 @@ void btstack_refresh_audio(void) {
 	}
 
 	pthread_mutex_lock(&lock);
+	// %.*s: the compiler cannot see that each row of found[] is terminated,
+	// and warns that an address could run on into the next one.
 	pcm_count = count;
 	for (int i = 0; i < count; i++) {
-		snprintf(pcm_addr[i], BT_ADDR_MAX, "%s", found[i]);
+		snprintf(pcm_addr[i], BT_ADDR_MAX, "%.*s", BT_ADDR_MAX - 1, found[i]);
 	}
 	rx_count = count_rx;
 	for (int i = 0; i < count_rx; i++) {
-		snprintf(rx_addr[i], BT_ADDR_MAX, "%s", found_rx[i]);
+		snprintf(rx_addr[i], BT_ADDR_MAX, "%.*s", BT_ADDR_MAX - 1, found_rx[i]);
 	}
 	pthread_mutex_unlock(&lock);
 }

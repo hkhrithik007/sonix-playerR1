@@ -1,4 +1,5 @@
 #include "musicsettings.h"
+#include "musictiles.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,11 +19,12 @@
 #include "src/gui/settings/artistexceptions.h"
 #include "src/gui/settings/lastfmsettings.h"
 #include "src/gui/library/medialist.h"
-#include "src/gui/library/music.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/audio/alsa-controls.h"
+#include "src/gui/shell/topbar.h"
+#include "src/system/device/sysinfo.h"
 #include "src/system/playback/sleeptimer.h"
 #include "src/system/audio/audio.h"
 #include "src/system/bluetooth/bluetooth.h"
@@ -106,12 +108,24 @@ static lv_obj_t *dre_switch;
 // that does not go through them is unaffected.
 static lv_obj_t *gapless_switch;
 
+bool musicsettings_gapless_enabled(void) { return audio_get_gapless(); }
+
+void musicsettings_set_gapless_enabled(bool enabled) {
+	config_set_int("audio", "gapless", enabled ? 1 : 0);
+	config_save();
+	audio_set_gapless(enabled);
+	if (gapless_switch) {
+		if (enabled) {
+			lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
+		} else {
+			lv_obj_remove_state(gapless_switch, LV_STATE_CHECKED);
+		}
+	}
+}
+
 static void gapless_toggle_cb(lv_event_t *e) {
 	(void)e;
-	bool on = lv_obj_has_state(gapless_switch, LV_STATE_CHECKED);
-	config_set_int("audio", "gapless", on ? 1 : 0);
-	config_save();
-	audio_set_gapless(on);
+	musicsettings_set_gapless_enabled(lv_obj_has_state(gapless_switch, LV_STATE_CHECKED));
 }
 
 static void dre_toggle_cb(lv_event_t *e) {
@@ -544,6 +558,104 @@ static void build_balance_page(gui_config_t *cfg) {
 
 	balance_refresh();
 	switcher_attach_back_gesture(balance_screen);
+}
+
+// ---------------------------------------------------------------------------
+// Volume limit
+//
+// A switch, and while it is on one ceiling per output: the level cannot be
+// raised past it from anywhere (see alsa-controls.h). One each because the two
+// sockets and USB-C are three different things to listen through, and keep
+// three levels for the same reason. The R1 has no 4.4 mm socket, and so no
+// slider for it.
+// ---------------------------------------------------------------------------
+
+static void refresh_active_chevrons(void);
+
+static lv_obj_t *vlimit_screen;
+static lv_obj_t *vlimit_switch;
+#define VLIMIT_OUTPUT_COUNT 3
+static lv_obj_t *vlimit_cards[VLIMIT_OUTPUT_COUNT], *vlimit_values[VLIMIT_OUTPUT_COUNT],
+	*vlimit_sliders[VLIMIT_OUTPUT_COUNT];
+static const volume_output_t VLIMIT_OUTPUTS[VLIMIT_OUTPUT_COUNT] = {VOLUME_OUTPUT_PHONES, VOLUME_OUTPUT_BALANCED,
+																	 VOLUME_OUTPUT_USB};
+
+#define VLIMIT_STEPS (100 - VOLUME_LIMIT_MIN + 1)
+
+static bool vlimit_has_balanced(void) { return !sysinfo_model()->cs43131; }
+
+static void vlimit_refresh(void) {
+	bool on = volume_limit_enabled();
+	if (on) {
+		lv_obj_add_state(vlimit_switch, LV_STATE_CHECKED);
+	} else {
+		lv_obj_remove_state(vlimit_switch, LV_STATE_CHECKED);
+	}
+	for (int i = 0; i < VLIMIT_OUTPUT_COUNT; i++) {
+		int limit = volume_limit(VLIMIT_OUTPUTS[i]);
+		lv_label_set_text_fmt(vlimit_values[i], "%d", limit);
+		lv_slider_set_value(vlimit_sliders[i], limit - VOLUME_LIMIT_MIN, LV_ANIM_OFF);
+		bool absent = VLIMIT_OUTPUTS[i] == VOLUME_OUTPUT_BALANCED && !vlimit_has_balanced();
+		lv_obj_set_hidden(vlimit_cards[i], !on || absent);
+	}
+}
+
+// The level may just have come down under a new ceiling, and the number in
+// the status bar is the one place on screen that says what it is.
+static void vlimit_level_moved(void) { topbar_refresh_volume(get_volume_percent()); }
+
+static void vlimit_toggle_cb(lv_event_t *e) {
+	(void)e;
+	volume_limit_set_enabled(lv_obj_has_state(vlimit_switch, LV_STATE_CHECKED));
+	vlimit_refresh();
+	vlimit_level_moved();
+	refresh_active_chevrons();
+}
+
+static void vlimit_slider_cb(lv_event_t *e) {
+	int i = (int)(intptr_t)lv_event_get_user_data(e);
+	int limit = VOLUME_LIMIT_MIN + (int)lv_slider_get_value(vlimit_sliders[i]);
+	volume_limit_set(VLIMIT_OUTPUTS[i], limit);
+	lv_label_set_text_fmt(vlimit_values[i], "%d", volume_limit(VLIMIT_OUTPUTS[i]));
+	vlimit_level_moved();
+}
+
+static void vlimit_released_cb(lv_event_t *e) {
+	(void)e;
+	config_save();
+}
+
+static void vlimit_loaded_cb(lv_event_t *e) {
+	(void)e;
+	vlimit_refresh();
+}
+
+static void build_volume_limit_page(gui_config_t *cfg) {
+	vlimit_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(vlimit_screen, cfg, "musicsettings_volume_limit");
+
+	settingsrow_toggle(container, "on", &vlimit_switch, vlimit_toggle_cb);
+
+	static const char *const NAMES[VLIMIT_OUTPUT_COUNT] = {"musicsettings_volume_limit_phones",
+														   "musicsettings_volume_limit_balanced",
+														   "musicsettings_volume_limit_usb"};
+	for (int i = 0; i < VLIMIT_OUTPUT_COUNT; i++) {
+		vlimit_cards[i] = settingsrow_slider(container, NAMES[i], VLIMIT_STEPS, &vlimit_values[i], &vlimit_sliders[i],
+											 NULL);
+		lv_obj_add_event_cb(vlimit_sliders[i], vlimit_slider_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+		lv_obj_add_event_cb(vlimit_sliders[i], vlimit_released_cb, LV_EVENT_RELEASED, NULL);
+	}
+
+	lv_obj_t *note = lv_label_create(container);
+	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(note, lv_pct(100));
+	lv_obj_add_style(note, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(note, &font_ui_22, 0);
+	lv_label_set_text(note, tr("musicsettings_volume_limit_note"));
+
+	vlimit_refresh();
+	lv_obj_add_event_cb(vlimit_screen, vlimit_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	switcher_attach_back_gesture(vlimit_screen);
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1177,7 @@ void musicsettings_set_eq_enabled(bool enabled) {
 		}
 	}
 	eq_apply_sliders_enabled(enabled);
+	reset_button_enabled(eq_reset_btn, enabled);
 	refresh_active_chevrons();
 }
 
@@ -1078,13 +1191,14 @@ void musicsettings_set_mseb_enabled(bool enabled) {
 		}
 	}
 	mseb_apply_sliders_enabled(enabled);
+	reset_button_enabled(mseb_reset_btn, enabled);
 	refresh_active_chevrons();
 }
 
 // The rows whose chevron says whether what lies behind it is on. Every row
 // that can be switched off, not a selection of them: a green chevron on MSEB
 // and a grey one on an enabled fade is not a nuance, it is a lie.
-static lv_obj_t *eq_row, *peq_row, *mseb_row, *soundfield_row, *crossfeed_row, *fade_row, *balance_row;
+static lv_obj_t *eq_row, *peq_row, *mseb_row, *soundfield_row, *crossfeed_row, *fade_row, *balance_row, *vlimit_row;
 
 static void refresh_active_chevrons(void) {
 	settingsrow_chevron_active(eq_row, eq_get_enabled());
@@ -1094,6 +1208,7 @@ static void refresh_active_chevrons(void) {
 	settingsrow_chevron_active(crossfeed_row, crossfeed_get_enabled());
 	settingsrow_chevron_active(fade_row, musicsettings_fade_enabled());
 	settingsrow_chevron_active(balance_row, balance_get_enabled());
+	settingsrow_chevron_active(vlimit_row, volume_limit_enabled());
 }
 
 static void screen_loaded_cb(lv_event_t *e) {
@@ -1127,9 +1242,11 @@ static lv_obj_t *folder_chain_switch;
 static lv_obj_t *scan_screen;
 static lv_obj_t *keep_articles_switch;
 static lv_obj_t *detect_changes_switch;
-static lv_obj_t *display_screen;
+static lv_obj_t *nowplaying_screen;
+static lv_obj_t *allow_delete_switch;
 static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
+static lv_obj_t *album_head_switch;
 static lv_obj_t *quality_badges_switch;
 static lv_obj_t *go_to_current_switch;
 
@@ -1203,6 +1320,7 @@ static void organize_touched(void) { organize_changed = true; }
 static lv_obj_t *split_artists_switch, *split_artists_pills;
 static lv_obj_t *split_genres_switch, *split_genres_pills;
 static lv_obj_t *unsplit_row;
+static lv_obj_t *split_album_artists_row, *split_album_artists_switch;
 static lv_obj_t *join_albums_switch;
 
 typedef struct {
@@ -1217,6 +1335,10 @@ static const split_pill_t SPLIT_ARTIST_PILLS[] = {
 	{",", LIBRARY_SPLIT_COMMA},
 	{"feat.", LIBRARY_SPLIT_FEAT},
 	{"vs.", LIBRARY_SPLIT_VS},
+	{"x", LIBRARY_SPLIT_X},
+	{"+", LIBRARY_SPLIT_PLUS},
+	{"with", LIBRARY_SPLIT_WITH},
+	{"and", LIBRARY_SPLIT_AND},
 };
 static const split_pill_t SPLIT_GENRE_PILLS[] = {
 	{";", LIBRARY_SPLIT_SEMICOLON},
@@ -1237,6 +1359,8 @@ static void organize_refresh(void) {
 	lv_obj_set_state(split_artists_switch, LV_STATE_CHECKED, artists);
 	lv_obj_set_hidden(split_artists_pills, !artists);
 	lv_obj_set_hidden(unsplit_row, !artists);
+	lv_obj_set_hidden(split_album_artists_row, !artists);
+	lv_obj_set_state(split_album_artists_switch, LV_STATE_CHECKED, library_split_album_artists());
 	for (int i = 0; i < SPLIT_ARTIST_COUNT; i++) {
 		settingsrow_pill_active(split_artist_pill[i], (a & SPLIT_ARTIST_PILLS[i].bit) != 0);
 	}
@@ -1252,6 +1376,11 @@ static void split_artists_cb(lv_event_t *e) {
 	library_set_split_artists(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 	organize_touched();
 	organize_refresh();
+}
+
+static void split_album_artists_cb(lv_event_t *e) {
+	library_set_split_album_artists(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+	organize_touched();
 }
 
 static void split_genres_cb(lv_event_t *e) {
@@ -1329,6 +1458,8 @@ static void build_scan_page(gui_config_t *cfg) {
 		split_artist_pill[i] = settingsrow_pill_text(split_artists_pills, SPLIT_ARTIST_PILLS[i].text, (int)SPLIT_ARTIST_PILLS[i].bit,
 											   split_artist_pill_cb);
 	}
+	split_album_artists_row = settingsrow_toggle(container, "musicsettings_split_album_artists",
+												 &split_album_artists_switch, split_album_artists_cb);
 	unsplit_row = settingsrow_add(container, "musicsettings_unsplit_artists", NULL, switch_screen_cb,
 								  artistexceptions_screen);
 
@@ -1352,30 +1483,19 @@ static void build_scan_page(gui_config_t *cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Display options
+// Library and Now Playing
 //
 // What the lists and the now-playing page show, as opposed to what playback
-// does with them. A page of its own rather than rows on the music page: it is
-// the third such question -- how a name is filed, what happens after a track,
-// what a list shows -- and the other two already have one. How the library's
-// own lists look is one page further in, under Library.
+// does with them: two pages, one for the library's lists and one for the page
+// of the track that is playing. Their switches first, the pages further down.
 // ---------------------------------------------------------------------------
 
 static void album_view_cb(lv_event_t *e) {
 	medialist_set_album_view(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
-// Which of Browse and Playlists the Music page puts on its sixth tile. Kept
-// here with the rest of the display options; the Music page reads it and paints
-// itself.
-static lv_obj_t *playlists_first_switch;
-
-bool musicsettings_playlists_first(void) { return config_get_bool("music", "playlists_first", false); }
-
-static void playlists_first_cb(lv_event_t *e) {
-	config_set_bool("music", "playlists_first", lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
-	config_save();
-	music_refresh_layout();
+static void album_head_cb(lv_event_t *e) {
+	medialist_set_album_head(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 static lv_obj_t *nowplaying_at_boot_switch;
@@ -1399,10 +1519,11 @@ static void quality_badges_cb(lv_event_t *e) {
 // on: a switch that is on and shows nothing anywhere is one nobody can read.
 static lv_obj_t *artist_switch;
 static lv_obj_t *artist_pills;
-#define ARTIST_PILLS 4
+#define ARTIST_PILLS 5
 static lv_obj_t *artist_pill[ARTIST_PILLS];
 static const int ARTIST_PILL_BITS[ARTIST_PILLS] = {MEDIALIST_ARTIST_TRACKS, MEDIALIST_ARTIST_ALBUMS,
-												   MEDIALIST_ARTIST_GENRES, MEDIALIST_ARTIST_FAVOURITES};
+												   MEDIALIST_ARTIST_GENRES, MEDIALIST_ARTIST_FAVOURITES,
+												   MEDIALIST_ARTIST_PLAYLISTS};
 
 static void artist_refresh(void) {
 	if (!artist_switch) {
@@ -1433,8 +1554,7 @@ static void artist_pick_cb(lv_event_t *e) {
 		return;
 	}
 	int lists = medialist_artist_lists() ^ (int)(intptr_t)lv_event_get_user_data(e);
-	if ((lists & (MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES |
-				  MEDIALIST_ARTIST_FAVOURITES)) == 0) {
+	if ((lists & MEDIALIST_ARTIST_ALL) == 0) {
 		return; // the last one stays on
 	}
 	medialist_set_show_artist(medialist_show_artist(), lists);
@@ -1452,6 +1572,12 @@ static lv_obj_t *coverflow_switch;
 
 static void coverflow_cb(lv_event_t *e) {
 	coverflow_set_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static lv_obj_t *cover_accent_switch;
+
+static void cover_accent_cb(lv_event_t *e) {
+	player_cover_accent_set(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,76 +1615,24 @@ static void layout_pick_cb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 // Library
 //
-// How the library's lists are drawn: what an artist opens on, what a row says
-// under its title, and which tile the Music page leads with. Inside Display
-// options, which keeps what concerns the now-playing page and the rest.
+// Everything about finding the music: the Music page's tiles and Cover Flow,
+// what an artist opens on, how an album's page and a list's rows are drawn,
+// where a list opens, and whether tracks can be deleted from it. Now Playing,
+// beside it, keeps what concerns the page of the track that is playing.
 // ---------------------------------------------------------------------------
+
+static void allow_delete_cb(lv_event_t *e) {
+	medialist_set_allow_delete(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
 
 static void build_library_page(gui_config_t *cfg) {
 	library_screen = lv_obj_create(NULL);
 	lv_obj_t *container = settingsrow_page(library_screen, cfg, "musicsettings_library");
 	settingsrow_title_corner_slots(settingsrow_page_title(library_screen), cfg, 0);
 
-	// On: an artist is a list of their records. Off: a flat list of their
-	// tracks, with the grouping button in the corner.
-	settingsrow_toggle(container, "musicsettings_album_view", &album_view_switch, album_view_cb);
-	option_note(container, "musicsettings_artist_opens_albums_note");
-	if (medialist_album_view()) {
-		lv_obj_add_state(album_view_switch, LV_STATE_CHECKED);
-	}
-
-	// Who a row is by, under its title, on the lists picked here.
-	settingsrow_toggle_pills(container, "musicsettings_show_artist", artist_toggle_cb, &artist_switch, &artist_pills);
-	artist_pill[0] = settingsrow_pill(artist_pills, "music_all_tracks", MEDIALIST_ARTIST_TRACKS, artist_pick_cb);
-	artist_pill[1] = settingsrow_pill(artist_pills, "albums", MEDIALIST_ARTIST_ALBUMS, artist_pick_cb);
-	artist_pill[2] = settingsrow_pill(artist_pills, "music_genres", MEDIALIST_ARTIST_GENRES, artist_pick_cb);
-	artist_pill[3] = settingsrow_pill(artist_pills, "favourites", MEDIALIST_ARTIST_FAVOURITES, artist_pick_cb);
-	option_note(container, "musicsettings_show_artist_note");
-	artist_refresh();
-	theme_register_refresh(artist_refresh);
-
-	settingsrow_toggle(container, "musicsettings_playlists_first", &playlists_first_switch, playlists_first_cb);
-	option_note(container, "musicsettings_playlists_first_note");
-	if (musicsettings_playlists_first()) {
-		lv_obj_add_state(playlists_first_switch, LV_STATE_CHECKED);
-	}
-
-	// A small mark under a track's title saying what the file is. It comes from
-	// what the scan wrote down, so a library indexed by an older build wears no
-	// badges until it is scanned again.
-	settingsrow_toggle(container, "audio_quality", &quality_badges_switch, quality_badges_cb);
-	option_note(container, "musicsettings_shows_the_tracks_audio_quality_wi");
-	if (medialist_quality_badges()) {
-		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
-	}
-
-	switcher_attach_back_gesture(library_screen);
-}
-
-static void build_display_page(gui_config_t *cfg) {
-	display_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(display_screen, cfg, "musicsettings_display_options");
-	settingsrow_title_corner_slots(settingsrow_page_title(display_screen), cfg, 0);
-
-	build_library_page(cfg);
-	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
-
-	// Whose name goes under the title on the now-playing page, in the control
-	// centre and on the screensaver: the album's artist, as the record is
-	// filed, or the track's own. Off by default -- see metadata_shown_artist().
-	settingsrow_toggle(container, "musicsettings_track_artist", &track_artist_switch, track_artist_cb);
-	option_note(container, "musicsettings_track_artist_note");
-	if (metadata_track_artist()) {
-		lv_obj_add_state(track_artist_switch, LV_STATE_CHECKED);
-	}
-
-	// The library lists open on what is playing: the track in All tracks, what
-	// it belongs to in the others.
-	settingsrow_toggle(container, "musicsettings_go_to_current", &go_to_current_switch, go_to_current_cb);
-	option_note(container, "musicsettings_go_to_current_note");
-	if (medialist_go_to_current()) {
-		lv_obj_add_state(go_to_current_switch, LV_STATE_CHECKED);
-	}
+	// Which tiles the Music page shows, and in what order.
+	musictiles_init(cfg);
+	settingsrow_add(container, "musicsettings_rearrange_main_page", NULL, switch_screen_cb, musictiles_screen);
 
 	// The album carousel. Off by default: it is a second way into the records,
 	// not a replacement for the list, and the covers it draws are decoded at a
@@ -1569,6 +1643,75 @@ static void build_display_page(gui_config_t *cfg) {
 	if (coverflow_enabled()) {
 		lv_obj_add_state(coverflow_switch, LV_STATE_CHECKED);
 	}
+
+	// On: an artist, a genre or a year is a list of its records. Off: a flat
+	// list of its tracks, with the grouping button in the corner on an
+	// artist's.
+	settingsrow_toggle(container, "musicsettings_album_view", &album_view_switch, album_view_cb);
+	option_note(container, "musicsettings_artist_opens_albums_note");
+	if (medialist_album_view()) {
+		lv_obj_add_state(album_view_switch, LV_STATE_CHECKED);
+	}
+
+	// How an album's own page is laid out: the plain list, or the cover and
+	// what the record is at the top with the tracks under it.
+	settingsrow_toggle(container, "musicsettings_album_head", &album_head_switch, album_head_cb);
+	option_note(container, "musicsettings_album_head_note");
+	if (medialist_album_head()) {
+		lv_obj_add_state(album_head_switch, LV_STATE_CHECKED);
+	}
+
+	// Who a row is by, under its title, on the lists picked here.
+	settingsrow_toggle_pills(container, "musicsettings_show_artist", artist_toggle_cb, &artist_switch, &artist_pills);
+	artist_pill[0] = settingsrow_pill(artist_pills, "music_all_tracks", MEDIALIST_ARTIST_TRACKS, artist_pick_cb);
+	artist_pill[1] = settingsrow_pill(artist_pills, "albums", MEDIALIST_ARTIST_ALBUMS, artist_pick_cb);
+	artist_pill[2] = settingsrow_pill(artist_pills, "music_genres", MEDIALIST_ARTIST_GENRES, artist_pick_cb);
+	artist_pill[3] = settingsrow_pill(artist_pills, "favourites", MEDIALIST_ARTIST_FAVOURITES, artist_pick_cb);
+	artist_pill[4] = settingsrow_pill(artist_pills, "playlists", MEDIALIST_ARTIST_PLAYLISTS, artist_pick_cb);
+	option_note(container, "musicsettings_show_artist_note");
+	artist_refresh();
+	theme_register_refresh(artist_refresh);
+
+	// A small mark under a track's title saying what the file is. It comes from
+	// what the scan wrote down, so a library indexed by an older build wears no
+	// badges until it is scanned again.
+	settingsrow_toggle(container, "audio_quality", &quality_badges_switch, quality_badges_cb);
+	option_note(container, "musicsettings_shows_the_tracks_audio_quality_wi");
+	if (medialist_quality_badges()) {
+		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
+	}
+
+	// The library lists open on what is playing: the track in All tracks, what
+	// it belongs to in the others.
+	settingsrow_toggle(container, "musicsettings_go_to_current", &go_to_current_switch, go_to_current_cb);
+	option_note(container, "musicsettings_go_to_current_note");
+	if (medialist_go_to_current()) {
+		lv_obj_add_state(go_to_current_switch, LV_STATE_CHECKED);
+	}
+
+	// The bin among the selection's buttons, which deletes the chosen tracks
+	// from the card and from the library. Off by default: it is the one
+	// button on these lists that cannot be undone.
+	settingsrow_toggle(container, "musicsettings_allow_delete", &allow_delete_switch, allow_delete_cb);
+	option_note(container, "musicsettings_allow_delete_note");
+	if (medialist_allow_delete()) {
+		lv_obj_add_state(allow_delete_switch, LV_STATE_CHECKED);
+	}
+
+	switcher_attach_back_gesture(library_screen);
+}
+
+// ---------------------------------------------------------------------------
+// Now Playing
+//
+// The page of the track that is playing: how it is arranged, the colour it
+// wears, whose name it shows, and whether the player starts on it.
+// ---------------------------------------------------------------------------
+
+static void build_nowplaying_page(gui_config_t *cfg) {
+	nowplaying_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(nowplaying_screen, cfg, "musicsettings_now_playing");
+	settingsrow_title_corner_slots(settingsrow_page_title(nowplaying_screen), cfg, 0);
 
 	// How the now-playing page is arranged.
 	lv_obj_t *layout_pills = NULL;
@@ -1590,6 +1733,22 @@ static void build_display_page(gui_config_t *cfg) {
 	// this says. Studio asks for less and takes all of them.
 	option_note(container, "musicsettings_local_only_note");
 
+	// The sleeve's colour as the accent of the other two arrangements too.
+	settingsrow_toggle(container, "musicsettings_cover_accent", &cover_accent_switch, cover_accent_cb);
+	option_note(container, "musicsettings_cover_accent_note");
+	if (player_cover_accent()) {
+		lv_obj_add_state(cover_accent_switch, LV_STATE_CHECKED);
+	}
+
+	// Whose name goes under the title on the now-playing page, in the control
+	// centre and on the screensaver: the album's artist, as the record is
+	// filed, or the track's own. Off by default -- see metadata_shown_artist().
+	settingsrow_toggle(container, "musicsettings_track_artist", &track_artist_switch, track_artist_cb);
+	option_note(container, "musicsettings_track_artist_note");
+	if (metadata_track_artist()) {
+		lv_obj_add_state(track_artist_switch, LV_STATE_CHECKED);
+	}
+
 	// Whether a start with a remembered track lands on the now-playing page
 	// rather than on the home screen. Read once, at startup (main.c).
 	settingsrow_toggle(container, "musicsettings_nowplaying_at_boot", &nowplaying_at_boot_switch,
@@ -1599,7 +1758,7 @@ static void build_display_page(gui_config_t *cfg) {
 		lv_obj_add_state(nowplaying_at_boot_switch, LV_STATE_CHECKED);
 	}
 
-	switcher_attach_back_gesture(display_screen);
+	switcher_attach_back_gesture(nowplaying_screen);
 }
 
 static lv_obj_t *endless_shuffle_switch;
@@ -1656,8 +1815,10 @@ static void build_playback_page(gui_config_t *cfg) {
 	// No gaps between tracks. Underneath it is a PCM that stays open (see
 	// audio.h): it works only for music on the card, and only between tracks of
 	// the same format.
+	// The engine's state and not the file's: with nothing saved the engine
+	// starts with gapless off (see main.c), and the switch has to say so.
 	settingsrow_toggle(container, "musicsettings_gapless_playback", &gapless_switch, gapless_toggle_cb);
-	if (config_get_int("audio", "gapless", 1)) {
+	if (musicsettings_gapless_enabled()) {
 		lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
 	}
 
@@ -1696,6 +1857,9 @@ static void build_playback_page(gui_config_t *cfg) {
 	sleep_refresh();
 	theme_register_refresh(sleep_refresh);
 	lv_obj_add_event_cb(playback_screen, playback_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	// And again whenever the control centre switches something while the page
+	// is the one under it.
+	lv_obj_add_event_cb(playback_screen, playback_loaded_cb, LV_EVENT_REFRESH, NULL);
 
 	// One record into the next, instead of the queue simply running out.
 	settingsrow_toggle(container, "musicsettings_play_albums_back_to_back", &album_chain_switch, album_chain_cb);
@@ -1737,9 +1901,9 @@ void musicsettings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(musicsettings_screen, cfg, "music");
 
 	// The pages of behaviour first: how the index is built, what playback does
-	// around a track, how the lists look, and Last.fm, which only reports what
-	// was played. Then the sound, from the widest tool to the narrowest, and the
-	// DAC's own switches at the end.
+	// around a track, how the library's lists and the now-playing page look,
+	// and Last.fm, which only reports what was played. Then the sound, from the
+	// widest tool to the narrowest, and the DAC's own switches at the end.
 	artistexceptions_init(cfg, organize_touched);
 	build_scan_page(cfg);
 	settingsrow_add(container, "musicsettings_scan_options", NULL, switch_screen_cb, scan_screen);
@@ -1747,8 +1911,11 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_playback_page(cfg);
 	settingsrow_add(container, "musicsettings_playback_options", NULL, switch_screen_cb, playback_screen);
 
-	build_display_page(cfg);
-	settingsrow_add(container, "musicsettings_display_options", NULL, switch_screen_cb, display_screen);
+	build_library_page(cfg);
+	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
+
+	build_nowplaying_page(cfg);
+	settingsrow_add(container, "musicsettings_now_playing", NULL, switch_screen_cb, nowplaying_screen);
 
 	lastfmsettings_init(cfg);
 	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());
@@ -1777,6 +1944,9 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_balance_page(cfg);
 	balance_row = settingsrow_add(container, "musicsettings_channel_balance", NULL, switch_screen_cb, balance_screen);
 
+	build_volume_limit_page(cfg);
+	vlimit_row = settingsrow_add(container, "musicsettings_volume_limit", NULL, switch_screen_cb, vlimit_screen);
+
 	// The gain step: off = low gain (the stock default), on = +6 dB.
 	settingsrow_toggle(container, "musicsettings_high_gain", &gain_switch, gain_toggle_cb);
 	if (config_get_int("audio", "high_gain", 0)) {
@@ -1804,14 +1974,14 @@ void musicsettings_init(gui_config_t *cfg) {
 	settingsrow_add(container, "musicsettings_filters", NULL, switch_screen_cb, dacfilter_screen);
 
 	// Non-oversampling off and dynamic-range enhancement on by default, like the
-	// stock player. The R1's CS43131 driver has neither: no rows there, and
-	// alsa-controls.c keeps both off.
-	if (!alsa_board_is_cs43131()) {
-		settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
-		if (config_get_int("audio", "dac_nos", 0)) {
-			lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
-		}
+	// stock player. The R1's CS43131 has no DRE: no row there, and
+	// alsa-controls.c keeps it off.
+	settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
+	if (config_get_int("audio", "dac_nos", 0)) {
+		lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
+	}
 
+	if (!alsa_board_is_cs43131()) {
 		settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
 		if (config_get_int("audio", "dac_dre", 1)) {
 			lv_obj_add_state(dre_switch, LV_STATE_CHECKED);
@@ -1834,4 +2004,7 @@ void musicsettings_init(gui_config_t *cfg) {
 
 
 	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	// The parametric equaliser's chevron, which no setter on this page repaints,
+	// follows the control centre's button while the page is under it.
+	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_REFRESH, NULL);
 }

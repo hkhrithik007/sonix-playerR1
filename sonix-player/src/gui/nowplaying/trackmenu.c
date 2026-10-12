@@ -391,7 +391,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	details_add_row("trackmenu_title", tags->title[0] ? tags->title : (slash ? slash + 1 : file));
 	details_add_row("trackmenu_artist", tags->artist);
 	details_add_row("trackmenu_album_artist", tags->album_artist);
-	details_add_row("albums", tags->album);
+	details_add_row("trackmenu_album", tags->album);
 	details_add_row("genre", tags->genre);
 
 	if (tags->year > 0) {
@@ -494,7 +494,7 @@ static void details_rebuild(void) {
 		char codec[16] = "";
 		int kbps = 0;
 		bool lossy = false;
-		decoder_t *dec = format != DECODE_FORMAT_UNKNOWN ? decoder_open(details_path, format) : NULL;
+		decoder_t *dec = format != DECODE_FORMAT_UNKNOWN ? decoder_open_info(details_path, format) : NULL;
 		if (dec) {
 			bits = decoder_source_bits(dec);
 			channels = decoder_channels(dec);
@@ -723,7 +723,11 @@ static void open_album_cb(void *user) {
 
 	player_sheet_close(false);
 	medialist_open(album, LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ALBUM, album);
-	switcher_set_player_return(medialist_tracks_screen);
+	// Over a track list the album takes that list's place on the same page,
+	// and the page brings the list back with the player over it itself.
+	if (!medialist_step_back_to_player()) {
+		switcher_set_player_return(medialist_tracks_screen);
+	}
 }
 
 static void open_settings_cb(void *user) {

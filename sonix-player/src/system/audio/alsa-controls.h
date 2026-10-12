@@ -18,12 +18,10 @@ int detect_output(void); // the "Output Port Switch" value for what is plugged i
 // goes to the chip by another way. See alsa-controls.c.
 bool alsa_board_is_cs43131(void);
 
-// The route to pass through on the way to `route` when the driver has to be
-// made to reconfigure: a route on the OTHER physical socket. Routes 1 and 2
-// are the two faces of the 3.5 mm one and the driver runs nothing between
-// them, so a partner picked by "any different number" can traverse nothing at
-// all. Exposed because the resume path depends on getting this right and it is
-// worth a test.
+// The route on the OTHER physical socket, where the route is parked before a
+// suspend. Routes 1 and 2 are the two faces of the 3.5 mm one and the driver
+// runs nothing between them, so a partner picked by "any different number"
+// would mute nothing.
 int output_reinit_partner(int route);
 
 // The whole output configuration as one number: the route above plus the
@@ -33,8 +31,27 @@ int output_reinit_partner(int route);
 int alsa_output_key(void);
 void auto_set_output(void);
 // Realigns this file's cached route after the "Output Port Switch" mixer has
-// been written by hand (used by the forced re-init after suspend to memory).
+// been written by hand (the route parked before suspend to memory).
 void alsa_controls_note_output(int value);
+
+// After a suspend: the line-out flag and the route written once each, whatever
+// the cache holds. Wherever the suspend powered the HBC3000 off, the card's
+// suspend_pre ran first (the card module links against the HBC3000's, so it
+// registers later and suspends earlier) and the driver holds route 0: the
+// write is a real change and runs the whole sequence, the HBC3000 powered up
+// and loaded. After a refused suspend it holds the parked route instead.
+void alsa_controls_rewrite_output(void);
+
+// The card closed to everything but the route re-init after suspend to memory
+// (audio_start_output_reinit_after_resume()). Between begin and end every
+// other thread waits in alsa_set_control(), auto_set_output() and before a PCM
+// is opened. begin is idempotent. The thread doing the re-init calls
+// enter_thread before its first write and leave_thread after its last.
+void alsa_output_reinit_begin(void);
+void alsa_output_reinit_end(void);
+void alsa_output_reinit_enter_thread(void);
+void alsa_output_reinit_leave_thread(void);
+void alsa_wait_output_reinit(void);
 void set_volume(long volume);
 
 // The DAC's digital filter (0..3, see alsa-controls.c). Written only when
@@ -177,5 +194,21 @@ void volume_profile_persist(void);
 // Writes every level down whether or not one has moved.
 void volume_profile_persist_now(void);
 void change_volume_percent(int delta);
+
+// The volume limit: a ceiling for each of the two sockets and for USB-C, which
+// the level cannot be raised past while the limit is on, by any route -- the
+// keys, the slider, the app, a phone over DLNA. Lowering a ceiling under the
+// level an output was left at brings that level down to it, at once if it is
+// the output in use. Bluetooth is not limited: the headphones out there keep a
+// volume of their own. Line out is a fixed level switched on on purpose, and
+// is not either. Off, with every ceiling at 100, until it is set.
+//
+// The ceilings are written to the config as they move, without saving: the
+// page saves on release, so a drag is one write and not ninety.
+#define VOLUME_LIMIT_MIN 10
+bool volume_limit_enabled(void);
+void volume_limit_set_enabled(bool on);
+int volume_limit(volume_output_t out); // 100 for an output that has none
+void volume_limit_set(volume_output_t out, int percent);
 
 #endif

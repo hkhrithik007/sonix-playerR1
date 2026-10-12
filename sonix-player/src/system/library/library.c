@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -87,6 +88,11 @@ static const char *const SCHEMA[] = {
 	// and can point at files the index has never seen.
 	"CREATE TABLE IF NOT EXISTS FAVOURITES(path TEXT PRIMARY KEY, name TEXT, artist TEXT, added_at INT)",
 
+	// Also local: how many times each track has been played through, by the
+	// rule Last.fm counts a play by, and when last. Keyed by path and kept apart
+	// from MEDIA_TABLE like the favourites, so a rescan does not forget it.
+	"CREATE TABLE IF NOT EXISTS PLAY_COUNTS(path TEXT PRIMARY KEY, plays INT NOT NULL, last_played INT)",
+
 	// Also local: where playback was left (the "Ricorda traccia" option). One
 	// row only; id is always 0.
 	"CREATE TABLE IF NOT EXISTS PLAYBACK_STATE(id INT PRIMARY KEY, path TEXT, position REAL, updated_at INT)",
@@ -140,13 +146,16 @@ static const char *const SCHEMA[] = {
 	"CREATE TABLE IF NOT EXISTS FOLDER_TABLE(path TEXT COLLATE NOCASE PRIMARY KEY, mtime INT, files INT, names INT)",
 
 	// Local: what each CUE sheet was found to cut up, keyed by the sheet's
-	// modification time and size. A sheet that still matches is not parsed again.
-	"CREATE TABLE IF NOT EXISTS CUE_STATE(path TEXT COLLATE NOCASE PRIMARY KEY, mtime INT, size INT, audio TEXT)",
+	// modification time and size. A sheet that still matches is not parsed
+	// again. `version` is the CUE_STATE_VERSION the row was written under.
+	"CREATE TABLE IF NOT EXISTS CUE_STATE(path TEXT COLLATE NOCASE PRIMARY KEY, mtime INT, size INT, audio TEXT,"
+	" version INT)",
 
 	// Local: the names a multi-artist or multi-genre tag splits into (see
 	// split_names()), one row per track and name. A track whose tag does not
 	// split has no rows here and is found by MEDIA_TABLE's own column.
 	"CREATE TABLE IF NOT EXISTS ARTIST_LINK(path TEXT COLLATE NOCASE, artist TEXT COLLATE NOCASE)",
+	"CREATE TABLE IF NOT EXISTS ALBUM_ARTIST_LINK(path TEXT COLLATE NOCASE, album_artist TEXT COLLATE NOCASE)",
 	"CREATE TABLE IF NOT EXISTS GENRE_LINK(path TEXT COLLATE NOCASE, genre TEXT COLLATE NOCASE)",
 
 	// Local: the settings the index was last filed under (rules_signature()),
@@ -178,6 +187,7 @@ static const char *const SCHEMA_COLUMNS[] = {
 	"ALTER TABLE GENRE_TABLE ADD COLUMN sortkey TEXT",
 	"ALTER TABLE PLAYLIST_COUNTS ADD COLUMN mount INT",
 	"ALTER TABLE PLAYBACK_QUEUE ADD COLUMN slot INT",
+	"ALTER TABLE CUE_STATE ADD COLUMN version INT",
 };
 
 // After the columns exist, never before: an index on a column the table does
@@ -189,11 +199,23 @@ static const char *const SCHEMA_INDEXES[] = {
 	// is a full table scan. One such scan goes unnoticed; a playlist asking for
 	// a name per entry is one per row.
 	"CREATE INDEX IF NOT EXISTS media_path_idx ON MEDIA_TABLE(path)",
-	"CREATE INDEX IF NOT EXISTS media_album_idx ON MEDIA_TABLE(album)",
-	"CREATE INDEX IF NOT EXISTS media_artist_idx ON MEDIA_TABLE(artist)",
-	"CREATE INDEX IF NOT EXISTS media_album_artist_idx ON MEDIA_TABLE(album_artist)",
+	// One album's tracks, told apart by album_key: the subqueries behind every
+	// album row (its cover, its artist, its year, when it arrived) are a
+	// range of this index rather than every track that shares the name. Year
+	// and ctime ride along, so the album lists by year and by date read no
+	// table rows at all. It also serves every lookup by album name alone,
+	// which the single-column index it replaces did.
+	"CREATE INDEX IF NOT EXISTS media_album_key_idx ON MEDIA_TABLE(album, album_key, year, ctime)",
+	"DROP INDEX IF EXISTS media_album_idx",
+	// The same for the artist and album artist lists by date.
+	"CREATE INDEX IF NOT EXISTS media_artist_ctime_idx ON MEDIA_TABLE(artist, ctime)",
+	"DROP INDEX IF EXISTS media_artist_idx",
+	"CREATE INDEX IF NOT EXISTS media_album_artist_ctime_idx ON MEDIA_TABLE(album_artist, ctime)",
+	"DROP INDEX IF EXISTS media_album_artist_idx",
 	"CREATE INDEX IF NOT EXISTS artist_link_name_idx ON ARTIST_LINK(artist)",
 	"CREATE INDEX IF NOT EXISTS artist_link_path_idx ON ARTIST_LINK(path)",
+	"CREATE INDEX IF NOT EXISTS album_artist_link_name_idx ON ALBUM_ARTIST_LINK(album_artist)",
+	"CREATE INDEX IF NOT EXISTS album_artist_link_path_idx ON ALBUM_ARTIST_LINK(path)",
 	"CREATE INDEX IF NOT EXISTS genre_link_name_idx ON GENRE_LINK(genre)",
 	"CREATE INDEX IF NOT EXISTS genre_link_path_idx ON GENRE_LINK(path)",
 };
@@ -265,9 +287,9 @@ static const char *const SORT_INDEXES[] = {
 #define SCAN_MAX_DEPTH 12
 
 // How many subdirectories of one level are held aside while it is walked. Not a
-// limit on the library -- every file in that directory is still read -- but the
-// memory ceiling of the walk. A directory with more than four thousand
-// subdirectories is an accident, not a discography.
+// limit on the library: past this many the directory is read again for the
+// next batch, so a card with every album in one folder is walked whole while
+// the names held in memory stay bounded.
 #define SCAN_MAX_SUBDIRS 4096
 
 // How often the scan logs a line with the free memory. If it ever dies partway
@@ -299,6 +321,14 @@ static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
 	"COALESCE(NULLIF((SELECT m.artist FROM MEDIA_TABLE m WHERE m.path = FAVOURITES.path LIMIT 1), ''), artist)"
 // The title the same way: the library's, then the one written down at starring.
 #define FAV_NAME "COALESCE(NULLIF((SELECT m.name FROM MEDIA_TABLE m WHERE m.path = FAVOURITES.path LIMIT 1), ''), name)"
+
+// The most played tracks: the ones still in the index, most plays first and,
+// between equals, the one played last. The title and the artist are the
+// index's, which is the only place they are kept.
+#define PLAYS_IN_INDEX "EXISTS(SELECT 1 FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path)"
+#define PLAYS_ORDER "plays DESC, last_played DESC, rowid"
+#define PLAYS_NAME "(SELECT m.name FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path LIMIT 1)"
+#define PLAYS_ARTIST "(SELECT m.artist FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path LIMIT 1)"
 
 typedef enum {
 	GEN_MEDIA = 0, // MEDIA_TABLE and the four lookup tables the scan fills
@@ -344,6 +374,9 @@ static volatile bool scan_cancel;
 // transaction that will not commit. The walk stops on scan_cancel, and this
 // says the stop was a fault rather than the user pressing back.
 static volatile bool scan_db_failed;
+// The user asked the scan to stop, as opposed to the scan stopping itself on a
+// database fault.
+static volatile bool scan_stop_asked;
 static volatile int scan_found;
 static char scan_root[512];
 static char scan_folder[512];
@@ -376,15 +409,31 @@ static int scan_id_base;
 
 static library_update_listener_t update_listener;
 
-// Whether ARTIST_LINK and GENRE_LINK hold anything, and so whether a filter by
-// artist or genre has to look there as well as in MEDIA_TABLE's own column.
+// Whether ARTIST_LINK, ALBUM_ARTIST_LINK and GENRE_LINK hold anything, and so
+// whether a filter by artist, album artist or genre has to look there as well
+// as in MEDIA_TABLE's own column.
 static volatile bool artist_links;
+static volatile bool album_artist_links;
 static volatile bool genre_links;
 
 // The file the index was opened from, and which file that was, so that a
 // delete or a replacement under the open handle can be noticed.
 static char db_file[512];
 static file_identity_t db_identity;
+
+// The database file itself is damaged: SQLite answered SQLITE_CORRUPT or
+// SQLITE_NOTADB. A file left so by a power cut mid-write stays so through every
+// reboot and every factory reset, and every scan into it fails. The next full
+// scan puts it aside and starts a new one (replace_damaged()).
+static volatile bool db_damaged;
+
+static void note_damage(int rc) {
+	rc &= 0xff;
+	if ((rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB) && !db_damaged) {
+		db_damaged = true;
+		fprintf(stderr, "library: the database file is damaged; the next scan starts a new one\n");
+	}
+}
 
 // ---------------------------------------------------------------------------
 // collation
@@ -847,8 +896,7 @@ static void albumkey_sql(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 // A track row that belongs to the album value bound as ?1: its name, and its key
 // when the value has one. A value saved before albums had keys is a name alone
 // and still matches every album of that name. Constant in the row, so the
-// lookup still goes through media_album_idx; only the handful of rows with
-// that name pay for the key.
+// lookup still goes through media_album_key_idx.
 #define ALBUM_VALUE_MATCH                                                                                             \
 	"album = (CASE WHEN instr(?1, char(31)) > 0 THEN substr(?1, 1, instr(?1, char(31)) - 1) ELSE ?1 END)"             \
 	" AND (instr(?1, char(31)) = 0 OR album_key = substr(?1, instr(?1, char(31)) + 1))"
@@ -860,6 +908,19 @@ static void albumkey_sql(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 // album is, for the lists that run by date.
 #define ALBUM_GROUP_NEWEST                                                                                            \
 	"(SELECT MAX(m.ctime) FROM MEDIA_TABLE m WHERE m.album = g.album AND m.album_key = g.album_key)"
+
+// The year of the ALBUM_GROUP_TABLE row `g`: the latest its tracks carry, NULL
+// when none of them carries one. A reissue tagged track by track with the
+// original year and one bonus track with its own still files under the reissue.
+#define ALBUM_GROUP_YEAR                                                                                              \
+	"(SELECT MAX(CASE WHEN m.year > 0 THEN m.year END) FROM MEDIA_TABLE m"                                           \
+	" WHERE m.album = g.album AND m.album_key = g.album_key)"
+
+// A year as a sort key that sends the rows without one to the end, whichever
+// way the years run: past any real year going up, below any going down.
+#define YEAR_KEY_UP(expr) "IFNULL(" expr ", 1000000)"
+#define YEAR_KEY_DOWN(expr) "IFNULL(" expr ", -1) DESC"
+#define TRACK_YEAR "(CASE WHEN year > 0 THEN year END)"
 
 // The first track of the ALBUM_GROUP_TABLE row `g`, by disc and track number,
 // with the columns asked for: the one whose cover and artist the row shows.
@@ -986,7 +1047,9 @@ char library_index_letter(const char *name) {
 
 static bool exec(const char *sql) {
 	char *error = NULL;
-	if (sqlite3_exec(db, sql, NULL, NULL, &error) != SQLITE_OK) {
+	int rc = sqlite3_exec(db, sql, NULL, NULL, &error);
+	if (rc != SQLITE_OK) {
+		note_damage(rc);
 		fprintf(stderr, "library: %s\n", error ? error : "unknown error");
 		sqlite3_free(error);
 		return false;
@@ -1084,6 +1147,22 @@ static const struct {
 	{"ALBUM_GROUP_TABLE", "album"},
 };
 
+// Runs a list of index statements. A DROP INDEX follows the CREATE of the index
+// that replaces it, and runs only if that one exists: on a card too full to
+// build it, the old index is all the queries have.
+static void index_steps(const char *const *steps, size_t count, const char *what) {
+	bool made = true;
+	for (size_t i = 0; i < count; i++) {
+		if (strncmp(steps[i], "DROP INDEX", 10) == 0 && !made) {
+			continue;
+		}
+		made = exec(steps[i]);
+		if (!made) {
+			fprintf(stderr, "library: %s step %zu failed\n", what, i);
+		}
+	}
+}
+
 // Whether anything is still without a key. Cheap whatever the library's size:
 // nulls sort at the head of the sortkey index, so this is an index seek and not
 // a walk of the table.
@@ -1111,11 +1190,7 @@ static void build_sort_indexes(void) {
 		pthread_mutex_unlock(&db_lock);
 		return;
 	}
-	for (size_t i = 0; i < sizeof(SORT_INDEXES) / sizeof(SORT_INDEXES[0]); i++) {
-		if (!exec(SORT_INDEXES[i])) {
-			fprintf(stderr, "library: sort index step %zu failed\n", i);
-		}
-	}
+	index_steps(SORT_INDEXES, sizeof(SORT_INDEXES) / sizeof(SORT_INDEXES[0]), "sort index");
 	pthread_mutex_unlock(&db_lock);
 }
 
@@ -1212,7 +1287,8 @@ static void backfill_stop_and_wait(void) {
 static bool list_uses_sortkey(library_list_t kind) {
 	// Favourites run by when they were starred and a playlist by the order it
 	// was built, so neither has a sort key to read.
-	return sortkeys_ready && kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST;
+	return sortkeys_ready && kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST &&
+		   kind != LIBRARY_LIST_MOST_PLAYED;
 }
 
 static void next_mount_serial(void);
@@ -1246,14 +1322,9 @@ static void album_keys_fill(void) {
 	printf("library: album keys written down for %d tracks in %u ms\n", sqlite3_changes(db), now_ms() - started_ms);
 }
 
-bool library_open(const char *db_path) {
-	if (db) {
-		return true;
-	}
-	if (!db_path || !db_path[0]) {
-		return false;
-	}
-
+// Opens the file and brings its schema up to date: everything library_open()
+// does before the index is shared with other threads.
+static bool db_open_file(const char *db_path) {
 	// A ceiling SQLite will stay under by recycling instead of growing. The
 	// scan is the only thing here that touches a lot of rows and it has no
 	// business holding megabytes on a device with ten of them.
@@ -1311,14 +1382,20 @@ bool library_open(const char *db_path) {
 	for (size_t i = 0; i < sizeof(SCHEMA_COLUMNS) / sizeof(SCHEMA_COLUMNS[0]); i++) {
 		exec_quiet(SCHEMA_COLUMNS[i]);
 	}
-	for (size_t i = 0; i < sizeof(SCHEMA_INDEXES) / sizeof(SCHEMA_INDEXES[0]); i++) {
-		if (!exec(SCHEMA_INDEXES[i])) {
-			fprintf(stderr, "library: index step %zu failed\n", i);
-		}
-	}
+	index_steps(SCHEMA_INDEXES, sizeof(SCHEMA_INDEXES) / sizeof(SCHEMA_INDEXES[0]), "index");
 
 	album_groups_fill();
 	album_keys_fill();
+	return true;
+}
+
+bool library_open(const char *db_path) {
+	if (db) {
+		return true;
+	}
+	if (!db_path || !db_path[0] || !db_open_file(db_path)) {
+		return false;
+	}
 
 	pthread_mutex_lock(&db_lock);
 	links_check();
@@ -1360,10 +1437,132 @@ void library_close(void) {
 			fprintf(stderr, "library: sqlite3_close returned %d; the handle may be leaking\n", rc);
 		}
 		db = NULL;
-		artist_links = genre_links = false;
+		artist_links = album_artist_links = genre_links = false;
 		bump_all_generations(); // every open list is now looking at nothing
 	}
 	pthread_mutex_unlock(&db_lock);
+}
+
+#define PLAYLIST_TABLE_MAX 512
+static bool playlist_table(const char *name, char *out, size_t out_size);
+
+// The tables worth carrying out of a damaged file: everything the user made or
+// left where it was, which no scan can rebuild. The playlists, one table each,
+// are found by name.
+static const char *const KEPT_TABLES[] = {
+	"FAVOURITES",			"PLAYBACK_STATE",		"PLAYBACK_QUEUE", "PLAYBACK_QUEUE_STATE",
+	"PLAYBACK_QUEUE_QUERY", "PLAYBACK_QUEUE_ALBUM", "PLAYLIST_MIGRATION",   "PLAY_COUNTS",
+};
+
+// Copies one table from the attached damaged file. A table the damage reaches
+// fails on its own and is left behind; the transaction keeps a half-copied one
+// out. With db_lock held.
+static void rescue_table(const char *quoted, const char *create) {
+	if (create && !exec(create)) {
+		return;
+	}
+	char sql[2 * PLAYLIST_TABLE_MAX + 96];
+	snprintf(sql, sizeof(sql), "INSERT OR IGNORE INTO main.%s SELECT * FROM damaged.%s", quoted, quoted);
+	if (!exec("SAVEPOINT rescue")) {
+		return;
+	}
+	if (!exec(sql)) {
+		exec("ROLLBACK TO rescue");
+	}
+	exec("RELEASE rescue");
+}
+
+static void rescue_user_tables(const char *damaged) {
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(db, "ATTACH ?1 AS damaged", -1, &stmt, NULL) != SQLITE_OK) {
+		return;
+	}
+	sqlite3_bind_text(stmt, 1, damaged, -1, SQLITE_STATIC);
+	int rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE) {
+		return;
+	}
+
+	for (size_t i = 0; i < sizeof(KEPT_TABLES) / sizeof(KEPT_TABLES[0]); i++) {
+		rescue_table(KEPT_TABLES[i], NULL);
+	}
+
+	// The playlists: created here with the statement they were made with.
+	if (sqlite3_prepare_v2(db,
+						   "SELECT name, sql FROM damaged.sqlite_master WHERE type = 'table'"
+						   " AND substr(name, 1, length(?1)) = ?1",
+						   -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, LIBRARY_PLAYLIST_PREFIX, -1, SQLITE_STATIC);
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *name = (const char *)sqlite3_column_text(stmt, 0);
+			const char *create = (const char *)sqlite3_column_text(stmt, 1);
+			char quoted[PLAYLIST_TABLE_MAX];
+			if (!name || !create || !playlist_table(name + strlen(LIBRARY_PLAYLIST_PREFIX), quoted, sizeof(quoted))) {
+				continue;
+			}
+			rescue_table(quoted, create);
+		}
+		sqlite3_finalize(stmt);
+	}
+	exec("DETACH damaged");
+}
+
+// Puts the damaged file aside as "<name>.damaged", its journal with it, and
+// opens a new one in its place with what can be carried out of the old one.
+// Called with no scan writing: before a full scan starts, or from the scan
+// thread itself once its run has failed.
+static bool replace_damaged(void) {
+	char path[sizeof(db_file)];
+	char aside[sizeof(db_file) + 16];
+	char journal[sizeof(db_file) + 16];
+	char aside_journal[sizeof(db_file) + 32];
+	snprintf(path, sizeof(path), "%s", db_file);
+	if (!path[0]) {
+		return false;
+	}
+	snprintf(aside, sizeof(aside), "%s.damaged", path);
+	snprintf(journal, sizeof(journal), "%s-journal", path);
+	snprintf(aside_journal, sizeof(aside_journal), "%s-journal", aside);
+
+	backfill_stop_and_wait();
+	sortkeys_ready = false;
+
+	pthread_mutex_lock(&db_lock);
+	finalize_statements();
+	finalize_known();
+	if (db) {
+		sqlite3_close_v2(db); // statements still held elsewhere keep it alive until they go
+		db = NULL;
+	}
+	artist_links = album_artist_links = genre_links = false;
+
+	unlink(aside);
+	unlink(aside_journal);
+	bool moved = rename(path, aside) == 0;
+	if (moved) {
+		rename(journal, aside_journal); // a hot journal belongs to the old file
+	}
+	bool opened = db_open_file(path);
+	if (opened && moved) {
+		rescue_user_tables(aside);
+	}
+	if (opened) {
+		links_check();
+	}
+	bump_all_generations();
+	pthread_mutex_unlock(&db_lock);
+
+	if (!opened) {
+		fprintf(stderr, "library: cannot open %s again\n", path);
+		return false;
+	}
+	db_damaged = false;
+	file_identity_read(path, &db_identity);
+	next_mount_serial();
+	sortkeys_start_backfill();
+	printf("library: the damaged database is kept as %s; scanning into a new one\n", moved ? aside : "(not moved)");
+	return moved;
 }
 
 bool library_reopen_if_replaced(void) {
@@ -1394,7 +1593,9 @@ static int count_rows(const char *sql) {
 	}
 
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+	int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		note_damage(rc);
 		return 0;
 	}
 
@@ -1467,6 +1668,8 @@ static const char *filter_column(library_filter_t filter) {
 		return "album_artist";
 	case LIBRARY_FILTER_GENRE:
 		return "genre";
+	case LIBRARY_FILTER_YEAR:
+		return "year";
 	default:
 		return NULL;
 	}
@@ -1483,9 +1686,16 @@ static const char *filter_where(library_filter_t filter) {
 	case LIBRARY_FILTER_ARTIST:
 		return artist_links ? "(artist=?1 OR path IN (SELECT path FROM ARTIST_LINK WHERE artist=?1))" : "artist=?1";
 	case LIBRARY_FILTER_ALBUM_ARTIST:
-		return "album_artist=?1";
+		return album_artist_links
+				   ? "(album_artist=?1 OR path IN (SELECT path FROM ALBUM_ARTIST_LINK WHERE album_artist=?1))"
+				   : "album_artist=?1";
 	case LIBRARY_FILTER_GENRE:
 		return genre_links ? "(genre=?1 OR path IN (SELECT path FROM GENRE_LINK WHERE genre=?1))" : "genre=?1";
+	case LIBRARY_FILTER_YEAR:
+		// The tracks of the albums of that year, by the album's year and not
+		// the track's own, so the tracks are those of the records listed.
+		return "(album, album_key) IN (SELECT g.album, g.album_key FROM ALBUM_GROUP_TABLE g WHERE " ALBUM_GROUP_YEAR
+			   " = CAST(?1 AS INTEGER))";
 	default:
 		return NULL;
 	}
@@ -1512,6 +1722,47 @@ bool library_track_title(const char *path, char *out, size_t out_size) {
 		sqlite3_finalize(stmt);
 	}
 	pthread_mutex_unlock(&db_lock);
+	return found;
+}
+
+// The lock is let go between batches, so a scan writing rows or the interface
+// opening a list is never held behind a folder of eight hundred lookups.
+#define TRACK_PLACE_BATCH 64
+
+size_t library_track_places(const char *const *paths, size_t count, library_place_cb cb, void *user) {
+	if (!paths || !cb) {
+		return 0;
+	}
+
+	size_t found = 0;
+	for (size_t start = 0; start < count; start += TRACK_PLACE_BATCH) {
+		size_t end = start + TRACK_PLACE_BATCH < count ? start + TRACK_PLACE_BATCH : count;
+
+		pthread_mutex_lock(&db_lock);
+		sqlite3_stmt *stmt = NULL;
+		if (!db || sqlite3_prepare_v2(db,
+									  "SELECT album, COALESCE(disc,1), dis_id FROM MEDIA_TABLE WHERE path=? LIMIT 1",
+									  -1, &stmt, NULL) != SQLITE_OK) {
+			pthread_mutex_unlock(&db_lock);
+			break;
+		}
+		for (size_t i = start; i < end; i++) {
+			if (!paths[i] || !paths[i][0]) {
+				continue;
+			}
+			sqlite3_bind_text(stmt, 1, paths[i], -1, SQLITE_STATIC);
+			if (sqlite3_step(stmt) == SQLITE_ROW) {
+				const unsigned char *album = sqlite3_column_text(stmt, 0);
+				cb(i, album ? (const char *)album : "", sqlite3_column_int(stmt, 1), sqlite3_column_int(stmt, 2),
+				   user);
+				found++;
+			}
+			sqlite3_reset(stmt);
+			sqlite3_clear_bindings(stmt);
+		}
+		sqlite3_finalize(stmt);
+		pthread_mutex_unlock(&db_lock);
+	}
 	return found;
 }
 
@@ -1548,6 +1799,76 @@ bool library_album_artist(const char *album, char *out, size_t size) {
 	}
 	pthread_mutex_unlock(&db_lock);
 	return found;
+}
+
+bool library_album_info(const char *album, library_album_info_t *out) {
+	if (!out) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!album || !album[0]) {
+		return false;
+	}
+
+	// The artist and the genre of the first track, as library_album_artist()
+	// picks it; the year as ALBUM_GROUP_YEAR works it out for the Albums list.
+	pthread_mutex_lock(&db_lock);
+	bool found = false;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db,
+								 "SELECT COALESCE(NULLIF(album_artist,''), artist), genre,"
+								 " (SELECT MAX(CASE WHEN year > 0 THEN year END) FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH
+								 ") FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH " ORDER BY COALESCE(disc,1), dis_id LIMIT 1",
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, album, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const unsigned char *artist = sqlite3_column_text(stmt, 0);
+			const unsigned char *genre = sqlite3_column_text(stmt, 1);
+			snprintf(out->artist, sizeof(out->artist), "%s", artist ? (const char *)artist : "");
+			snprintf(out->genre, sizeof(out->genre), "%s", genre ? (const char *)genre : "");
+			out->year = sqlite3_column_type(stmt, 2) == SQLITE_NULL ? 0 : sqlite3_column_int(stmt, 2);
+			found = true;
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return found;
+}
+
+int library_album_places(const char *album, uint16_t *disc, uint16_t *track, int max) {
+	if (!album || !album[0]) {
+		return 0;
+	}
+
+	// The same rows and the same order as the album's track list (see
+	// list_sql and TRACK_ORDER_IN_ALBUM). Rows the list tells apart only by
+	// name share their disc and number, so which of them comes first does not
+	// change what is written at any position.
+	pthread_mutex_lock(&db_lock);
+	int count = 0;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db,
+								 "SELECT COALESCE(disc,1), dis_id FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH
+								 " ORDER BY " TRACK_ORDER_IN_ALBUM,
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, album, -1, SQLITE_TRANSIENT);
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			if (count < max) {
+				int d = sqlite3_column_int(stmt, 0);
+				int t = sqlite3_column_int(stmt, 1);
+				if (disc) {
+					disc[count] = (uint16_t)(d < 1 ? 1 : (d > UINT16_MAX ? UINT16_MAX : d));
+				}
+				if (track) {
+					track[count] = (uint16_t)(t < 0 ? 0 : (t > UINT16_MAX ? UINT16_MAX : t));
+				}
+			}
+			count++;
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return count;
 }
 
 bool library_track_names(const char *path, char *title_out, size_t title_size, char *artist_out, size_t artist_size) {
@@ -1845,6 +2166,38 @@ bool library_fav_toggle(const char *path, const char *name, const char *artist) 
 	return now_favourite;
 }
 
+void library_note_play(const char *path) {
+	if (!path || !path[0]) {
+		return;
+	}
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	// An upsert and not INSERT OR REPLACE: the row keeps its row id, so an open
+	// list of the most played -- and a queue built on one -- is not left
+	// holding ids that no longer exist. Neither is told: the list takes the
+	// new order the next time it is opened, and a queue playing it goes on in
+	// the order it started with.
+	//
+	// Only a track the index has: a station, a stream's cache file or a file
+	// played from the browser that was never scanned would only fill the table
+	// with rows the list never shows.
+	if (db && sqlite3_prepare_v2(db,
+								 "INSERT INTO PLAY_COUNTS(path, plays, last_played)"
+								 " SELECT ?1, 1, strftime('%s','now') WHERE EXISTS"
+								 " (SELECT 1 FROM MEDIA_TABLE m WHERE m.path = ?1)"
+								 " ON CONFLICT(path) DO UPDATE SET plays = plays + 1, last_played = excluded.last_played",
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) != SQLITE_DONE) {
+			fprintf(stderr, "library: play of '%s' not counted: %s\n", path, sqlite3_errmsg(db));
+		} else if (sqlite3_changes(db) > 0) {
+			printf("library: play of '%s' counted\n", path);
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+}
+
 int library_fav_add_many(const library_fav_row_t *rows, int count) {
 	if (!rows || count <= 0) {
 		return 0;
@@ -1950,10 +2303,37 @@ int library_for_each(library_list_t kind, library_filter_t filter, const char *v
 	return library_for_each_ordered(kind, filter, value, LIBRARY_ORDER_DEFAULT, cb, user);
 }
 
+// The ORDER BY of a track list. Inside one album the disc order is the natural
+// one; everywhere else the titles read best alphabetically. The orders asked
+// for are the other cases: an artist's tracks with each record kept together
+// and in its own running order, every track by when it arrived, and every
+// track by year -- each year's records kept together and in their running
+// order, so playing the list plays the records through.
+// The albums in name order, one record after another: the sort key worked out
+// once per row, then compared as bytes -- the same order as the collation,
+// which would instead be called for every comparison of the sort -- and the
+// album key, so two records of one name do not mix their tracks.
+#define ALBUM_ORDER_KEY "sortkey(album), album_key"
+
+static void track_order_sql(char *out, size_t size, library_order_t order, bool in_album, const char *by_name) {
+	if (order == LIBRARY_ORDER_ALBUM) {
+		snprintf(out, size, ALBUM_ORDER_KEY ", " TRACK_ORDER_IN_ALBUM ", %s", by_name);
+	} else if (order == LIBRARY_ORDER_ADDED) {
+		snprintf(out, size, TRACK_ORDER_ADDED ", %s", by_name);
+	} else if (order == LIBRARY_ORDER_YEAR || order == LIBRARY_ORDER_YEAR_DESC) {
+		snprintf(out, size, "%s, " ALBUM_ORDER_KEY ", " TRACK_ORDER_IN_ALBUM ", %s",
+				 order == LIBRARY_ORDER_YEAR ? YEAR_KEY_UP(TRACK_YEAR) : YEAR_KEY_DOWN(TRACK_YEAR), by_name);
+	} else if (in_album) {
+		snprintf(out, size, TRACK_ORDER_IN_ALBUM ", %s", by_name);
+	} else {
+		snprintf(out, size, "%s", by_name);
+	}
+}
+
 int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order,
 							 library_row_cb cb, void *user) {
-	if (!cb) {
-		return 0;
+	if (!cb || filter == LIBRARY_FILTER_SEARCH) {
+		return 0; // a search is read through a handle
 	}
 
 	char sql[512];
@@ -1964,24 +2344,12 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 
 	if (kind == LIBRARY_LIST_FAVOURITES) {
 		snprintf(sql, sizeof(sql), "SELECT name, path, %s FROM FAVOURITES ORDER BY added_at, rowid", FAV_ARTIST);
+	} else if (kind == LIBRARY_LIST_MOST_PLAYED) {
+		snprintf(sql, sizeof(sql), "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST " FROM PLAY_COUNTS WHERE " PLAYS_IN_INDEX
+								   " ORDER BY " PLAYS_ORDER);
 	} else if (kind == LIBRARY_LIST_TRACKS) {
-		// Inside one album the disc order is the natural one; everywhere else
-		// the titles read best alphabetically.
-		//
-		// LIBRARY_ORDER_ALBUM is the third case: an artist's tracks with each
-		// record kept together and in its own running order, which is how a
-		// person thinks about an artist's work and not how an alphabetical list
-		// of titles presents it.
-		char order_sql[128];
-		if (order == LIBRARY_ORDER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), "album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else if (order == LIBRARY_ORDER_ADDED) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_ADDED ", %s", by_name);
-		} else if (col && value && filter == LIBRARY_FILTER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else {
-			snprintf(order_sql, sizeof(order_sql), "%s", by_name);
-		}
+		char order_sql[256];
+		track_order_sql(order_sql, sizeof(order_sql), order, col && value && filter == LIBRARY_FILTER_ALBUM, by_name);
 		if (col && value) {
 			snprintf(sql, sizeof(sql), "SELECT name, path, artist FROM MEDIA_TABLE WHERE %s ORDER BY %s",
 					 filter_where(filter), order_sql);
@@ -2119,8 +2487,6 @@ static bool playlist_table(const char *name, char *out, size_t out_size) {
 	return true;
 }
 
-#define PLAYLIST_TABLE_MAX 512
-
 // Which of a playlist's entries are shown, for a query that names the
 // playlist's table `p`: the tracks the library has, and the entries it does not
 // have that were on the card when they went in (`present`). The scans keep
@@ -2136,12 +2502,69 @@ static bool playlist_table(const char *name, char *out, size_t out_size) {
 
 // The ordered query behind a list, as SQL. `select` is what to ask for, so the
 // same builder serves both the row-id pass and the streaming reader.
+// The LIKE pattern a query becomes: folded the way foldcase() folds the rows,
+// wrapped in wildcards, and with LIKE's own two wildcards escaped -- a query is
+// a piece of a name, so a user typing "_" means an underscore and not "any
+// character". False for a query that folds to nothing.
+static bool search_pattern(const char *query, char *out, size_t size) {
+	char folded[256];
+	if (!query || size < 3 || fold_text(query, folded, sizeof(folded)) == 0) {
+		return false;
+	}
+	size_t at = 0;
+	out[at++] = '%';
+	for (size_t i = 0; folded[i] && at + 3 < size; i++) {
+		if (folded[i] == '%' || folded[i] == '_' || folded[i] == '\\') {
+			out[at++] = '\\';
+		}
+		out[at++] = folded[i];
+	}
+	out[at++] = '%';
+	out[at] = '\0';
+	return true;
+}
+
 static void list_sql(char *sql, size_t size, const char *select, library_list_t kind, library_filter_t filter,
 					 const char *value, library_order_t order) {
 	const char *col = filter_column(filter);
 
+	// A search: the names that contain the query, in list order, with the
+	// pattern bound as ?1. Tracks, albums and artists only.
+	if (filter == LIBRARY_FILTER_SEARCH) {
+		static const struct {
+			library_list_t kind;
+			const char *table;
+			const char *column;
+		} SEARCHED[] = {
+			{LIBRARY_LIST_TRACKS, "MEDIA_TABLE", "name"},
+			{LIBRARY_LIST_ALBUMS, "ALBUM_GROUP_TABLE", "album"},
+			{LIBRARY_LIST_ARTISTS, "ARTIST_TABLE", "artist"},
+		};
+		sql[0] = '\0';
+		for (size_t i = 0; i < sizeof(SEARCHED) / sizeof(SEARCHED[0]); i++) {
+			if (SEARCHED[i].kind != kind) {
+				continue;
+			}
+			if (list_uses_sortkey(kind)) {
+				snprintf(sql, size, "SELECT %s FROM %s WHERE %s <> '' AND foldcase(%s) LIKE ?1 ESCAPE '\\' ORDER BY sortkey",
+						 select, SEARCHED[i].table, SEARCHED[i].column, SEARCHED[i].column);
+			} else {
+				snprintf(sql, size,
+						 "SELECT %s FROM %s WHERE %s <> '' AND foldcase(%s) LIKE ?1 ESCAPE '\\'"
+						 " ORDER BY %s COLLATE listorder",
+						 select, SEARCHED[i].table, SEARCHED[i].column, SEARCHED[i].column, SEARCHED[i].column);
+			}
+		}
+		return;
+	}
+
 	if (kind == LIBRARY_LIST_FAVOURITES) {
 		snprintf(sql, size, "SELECT %s FROM FAVOURITES ORDER BY added_at, rowid", select);
+		return;
+	}
+
+	if (kind == LIBRARY_LIST_MOST_PLAYED) {
+		snprintf(sql, size, "SELECT %s FROM PLAY_COUNTS WHERE " PLAYS_IN_INDEX " ORDER BY " PLAYS_ORDER, select);
 		return;
 	}
 
@@ -2169,20 +2592,8 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 	const char *by_name = list_uses_sortkey(kind) ? "sortkey" : "name COLLATE listorder";
 
 	if (kind == LIBRARY_LIST_TRACKS) {
-		// Inside one album the disc order is the natural one; everywhere else
-		// the titles read best alphabetically. LIBRARY_ORDER_ALBUM is the third
-		// case: an artist's tracks with each record kept together and in its
-		// own running order.
-		char order_sql[128];
-		if (order == LIBRARY_ORDER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), "album COLLATE listorder, " TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else if (order == LIBRARY_ORDER_ADDED) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_ADDED ", %s", by_name);
-		} else if (col && value && filter == LIBRARY_FILTER_ALBUM) {
-			snprintf(order_sql, sizeof(order_sql), TRACK_ORDER_IN_ALBUM ", %s", by_name);
-		} else {
-			snprintf(order_sql, sizeof(order_sql), "%s", by_name);
-		}
+		char order_sql[256];
+		track_order_sql(order_sql, sizeof(order_sql), order, col && value && filter == LIBRARY_FILTER_ALBUM, by_name);
 		if (col && value) {
 			snprintf(sql, size, "SELECT %s FROM MEDIA_TABLE WHERE %s ORDER BY %s", select, filter_where(filter),
 					 order_sql);
@@ -2192,11 +2603,34 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		return;
 	}
 
+	// The years, latest first: each year once, named by the row id of one of
+	// its albums, which is how row_by_id_sql() finds the year again. Counted
+	// as the distinct years, since there is no table of them to count.
+	if (kind == LIBRARY_LIST_YEARS) {
+		const char *years =
+			"SELECT g.rowid AS rid, " ALBUM_GROUP_YEAR " AS y FROM ALBUM_GROUP_TABLE g WHERE g.album <> ''";
+		if (strncmp(select, "COUNT(", 6) == 0) {
+			snprintf(sql, size, "SELECT COUNT(DISTINCT y) FROM (%s) WHERE y IS NOT NULL", years);
+		} else {
+			snprintf(sql, size, "SELECT MIN(rid), y FROM (%s) WHERE y IS NOT NULL GROUP BY y ORDER BY y DESC", years);
+		}
+		return;
+	}
+
+	// One year's records, by name.
+	if (kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_YEAR && value) {
+		snprintf(sql, size,
+				 "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' AND " ALBUM_GROUP_YEAR
+				 " = CAST(?1 AS INTEGER) ORDER BY %s",
+				 select, list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
+		return;
+	}
+
 	// One artist's or one genre's records, rather than their tracks: the album
 	// list narrowed to the albums with at least one track of theirs.
 	// ALBUM_GROUP_TABLE holds the albums and their sort keys, and which of them
-	// qualify is a question for MEDIA_TABLE -- answered off media_artist_idx,
-	// media_album_artist_idx or media_genre_sort_idx, once, so the subquery is
+	// qualify is a question for MEDIA_TABLE -- answered off media_artist_ctime_idx,
+	// media_album_artist_ctime_idx or media_genre_sort_idx, once, so the subquery is
 	// a lookup and not a scan.
 	if (kind == LIBRARY_LIST_ALBUMS && col && value &&
 		(filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)) {
@@ -2211,13 +2645,20 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 	// Every record, artist and album artist by when it arrived. Their tables
 	// have no date of their own, so each is as new as the newest of its files:
 	// a record topped up with a bonus track moves up with it, and so does an
-	// artist with a new album. One lookup per row on media_album_idx,
-	// media_artist_idx or media_album_artist_idx, the same price the cover
-	// subquery pays per row.
+	// artist with a new album. One range per row of media_album_key_idx,
+	// media_artist_ctime_idx or media_album_artist_ctime_idx, read from the
+	// index alone.
 	if (order == LIBRARY_ORDER_ADDED && kind == LIBRARY_LIST_ALBUMS) {
 		snprintf(sql, size, "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' ORDER BY " ALBUM_GROUP_NEWEST
 				 ", %s",
 				 select, list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
+		return;
+	}
+	// Every record by year, the albums of one year by name.
+	if ((order == LIBRARY_ORDER_YEAR || order == LIBRARY_ORDER_YEAR_DESC) && kind == LIBRARY_LIST_ALBUMS) {
+		snprintf(sql, size, "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' ORDER BY %s, %s", select,
+				 order == LIBRARY_ORDER_YEAR ? YEAR_KEY_UP(ALBUM_GROUP_YEAR) : YEAR_KEY_DOWN(ALBUM_GROUP_YEAR),
+				 list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
 		return;
 	}
 	if (order == LIBRARY_ORDER_ADDED && (kind == LIBRARY_LIST_ARTISTS || kind == LIBRARY_LIST_ALBUM_ARTISTS)) {
@@ -2228,9 +2669,13 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 				 list_uses_sortkey(kind) ? "" : " COLLATE listorder");
 		// An artist that is one of the names a tag split into is also as new as
 		// the newest of those tracks.
-		const char *linked = kind == LIBRARY_LIST_ARTISTS && artist_links
-								 ? " OR m.path IN (SELECT l.path FROM ARTIST_LINK l WHERE l.artist = ARTIST_TABLE.artist)"
-								 : "";
+		const char *linked =
+			kind == LIBRARY_LIST_ARTISTS && artist_links
+				? " OR m.path IN (SELECT l.path FROM ARTIST_LINK l WHERE l.artist = ARTIST_TABLE.artist)"
+			: kind == LIBRARY_LIST_ALBUM_ARTISTS && album_artist_links
+				? " OR m.path IN (SELECT l.path FROM ALBUM_ARTIST_LINK l"
+				  " WHERE l.album_artist = ALBUM_ARTIST_TABLE.album_artist)"
+				: "";
 		snprintf(sql, size,
 				 "SELECT %s FROM %s WHERE %s <> ''"
 				 " ORDER BY (SELECT MAX(m.ctime) FROM MEDIA_TABLE m WHERE m.%s = %s.%s%s), %s",
@@ -2299,8 +2744,13 @@ static const char *row_by_id_sql(library_list_t kind, const char *value, char *o
 		return "SELECT album_artist, NULL, NULL FROM ALBUM_ARTIST_TABLE WHERE rowid=?";
 	case LIBRARY_LIST_GENRES:
 		return "SELECT genre, NULL, NULL FROM GENRE_TABLE WHERE rowid=?";
+	case LIBRARY_LIST_YEARS:
+		// The row is one of the year's albums, and the name is its year.
+		return "SELECT " ALBUM_GROUP_YEAR ", NULL, NULL FROM ALBUM_GROUP_TABLE g WHERE rowid=?";
 	case LIBRARY_LIST_FAVOURITES:
 		return "SELECT " FAV_NAME ", path, " FAV_ARTIST " FROM FAVOURITES WHERE rowid=?";
+	case LIBRARY_LIST_MOST_PLAYED:
+		return "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST " FROM PLAY_COUNTS WHERE rowid=?";
 	default:
 		return NULL;
 	}
@@ -2319,6 +2769,10 @@ static const char *name_column(library_list_t kind) {
 		return "album_artist";
 	case LIBRARY_LIST_GENRES:
 		return "genre";
+	case LIBRARY_LIST_MOST_PLAYED:
+		// No name of its own: the table holds the path, and the list is not
+		// filed by letter anyway.
+		return "path";
 	default:
 		return "name";
 	}
@@ -2341,8 +2795,19 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 	// album/artist/genre, and an album list narrowed to one artist or genre.
 	bool bound = col && value &&
 				 (kind == LIBRARY_LIST_TRACKS ||
-				  (kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
-												   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)));
+				  (kind == LIBRARY_LIST_ALBUMS &&
+				   (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST ||
+					filter == LIBRARY_FILTER_GENRE || filter == LIBRARY_FILTER_YEAR)));
+	// A search binds the pattern the value becomes, not the value.
+	char pattern[2 * 256 + 3];
+	if (filter == LIBRARY_FILTER_SEARCH) {
+		if (!search_pattern(value, pattern, sizeof(pattern))) {
+			free(ix);
+			return NULL;
+		}
+		bound = true;
+		value = pattern;
+	}
 
 	char count_sql[PLAYLIST_TABLE_MAX + 256];
 	char rows_sql[PLAYLIST_TABLE_MAX + 256];
@@ -2447,8 +2912,10 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 		// ordered by that letter. Favourites run by when they were starred, an
 		// album by disc position, an artist's records by album -- three lists
 		// whose order has nothing to do with the alphabet.
-		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST &&
-					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED &&
+		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST && kind != LIBRARY_LIST_YEARS &&
+					   kind != LIBRARY_LIST_MOST_PLAYED &&
+					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED && order != LIBRARY_ORDER_YEAR &&
+					   order != LIBRARY_ORDER_YEAR_DESC &&
 					   !(kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_ALBUM);
 		ix->buckets_valid = by_name && ix->count > 0;
 	}
@@ -2636,7 +3103,9 @@ int library_index_find_path(const library_index_t *ix, const char *path) {
 			return -1;
 		}
 	} else {
-		const char *table = ix->kind == LIBRARY_LIST_FAVOURITES ? "FAVOURITES" : "MEDIA_TABLE";
+		const char *table = ix->kind == LIBRARY_LIST_FAVOURITES	 ? "FAVOURITES"
+							: ix->kind == LIBRARY_LIST_MOST_PLAYED ? "PLAY_COUNTS"
+																   : "MEDIA_TABLE";
 		snprintf(sql, sizeof(sql), "SELECT rowid FROM %s WHERE path = ?", table);
 	}
 
@@ -2751,14 +3220,16 @@ static void namelist_init(namelist_t *l) {
 	l->capacity = 0;
 }
 
-static bool namelist_add(namelist_t *l, const char *name) {
-	if (l->count >= SCAN_MAX_SUBDIRS) {
+// Adds a copy of `name`, unless the list already holds `limit` names or memory
+// runs out.
+static bool namelist_push(namelist_t *l, const char *name, int limit) {
+	if (l->count >= limit) {
 		return false;
 	}
 	if (l->count == l->capacity) {
 		int grown = l->capacity ? l->capacity * 2 : 16;
-		if (grown > SCAN_MAX_SUBDIRS) {
-			grown = SCAN_MAX_SUBDIRS;
+		if (grown > limit) {
+			grown = limit;
 		}
 		char **bigger = realloc(l->names, (size_t)grown * sizeof(*bigger));
 		if (!bigger) {
@@ -2775,6 +3246,8 @@ static bool namelist_add(namelist_t *l, const char *name) {
 	l->names[l->count++] = copy;
 	return true;
 }
+
+static bool namelist_add(namelist_t *l, const char *name) { return namelist_push(l, name, SCAN_MAX_SUBDIRS); }
 
 static void namelist_free(namelist_t *l) {
 	for (int i = 0; i < l->count; i++) {
@@ -3157,6 +3630,13 @@ void library_set_genre_separators(unsigned separators) {
 	config_save();
 }
 
+bool library_split_album_artists(void) { return config_get_bool("library", "split_album_artists", false); }
+
+void library_set_split_album_artists(bool on) {
+	config_set_bool("library", "split_album_artists", on);
+	config_save();
+}
+
 char **library_artist_exceptions(int *count) {
 	char **names = NULL;
 	if (!lines_read(ARTIST_EXCEPTIONS_FILE, &names, count)) {
@@ -3187,8 +3667,9 @@ void library_set_detect_retagged(bool on) {
 }
 
 typedef struct {
-	unsigned artist_separators; // 0: artists are not split
-	unsigned genre_separators;	// 0: genres are not split
+	unsigned artist_separators;		  // 0: artists are not split
+	unsigned album_artist_separators; // 0: album artists are not split
+	unsigned genre_separators;		  // 0: genres are not split
 	char **exceptions;
 	int exception_count;
 	bool join_albums;
@@ -3207,6 +3688,7 @@ static void rules_load(scan_rules_t *r) {
 	r->exceptions = NULL;
 	r->exception_count = 0;
 	r->artist_separators = library_split_artists() ? library_artist_separators() : 0;
+	r->album_artist_separators = r->artist_separators && library_split_album_artists() ? r->artist_separators : 0;
 	r->genre_separators = library_split_genres() ? library_genre_separators() : 0;
 	if (r->artist_separators) {
 		r->exceptions = library_artist_exceptions(&r->exception_count);
@@ -3224,8 +3706,14 @@ static void rules_signature(const scan_rules_t *r, char *out, size_t size) {
 		}
 		hash = (hash ^ '\n') * 16777619u;
 	}
-	snprintf(out, size, "a%u/g%u/j%d/x%08x", r->artist_separators, r->genre_separators, r->join_albums ? 1 : 0,
-			 r->artist_separators ? (unsigned)hash : 0u);
+	// The album artist part only when it is on, so an index filed before it
+	// existed still reads as filed under the same settings.
+	char album_artists[16] = "";
+	if (r->album_artist_separators) {
+		snprintf(album_artists, sizeof(album_artists), "/b%u", r->album_artist_separators);
+	}
+	snprintf(out, size, "a%u/g%u/j%d/x%08x%s", r->artist_separators, r->genre_separators, r->join_albums ? 1 : 0,
+			 r->artist_separators ? (unsigned)hash : 0u, album_artists);
 }
 
 // With db_lock held.
@@ -3268,6 +3756,7 @@ static bool organized_as_set(void) {
 // With db_lock held.
 static void links_check(void) {
 	artist_links = count_rows("SELECT 1 FROM ARTIST_LINK LIMIT 1") > 0;
+	album_artist_links = count_rows("SELECT 1 FROM ALBUM_ARTIST_LINK LIMIT 1") > 0;
 	genre_links = count_rows("SELECT 1 FROM GENRE_LINK LIMIT 1") > 0;
 }
 
@@ -3281,31 +3770,39 @@ typedef struct {
 } split_part_t;
 
 // A word separator ("feat", "vs") at `p`: preceded by a space or an opening
-// bracket, followed by a space or a full stop. Returns its length with the stop,
-// or 0.
-static int split_word_at(const char *text, const char *p, unsigned separators) {
+// bracket, followed by a space or, for an abbreviation, a full stop. Returns
+// its length with the stop, or 0. "x" counts in lower case only, so that
+// "Malcolm X" stays one name. "x", "with" and "and" are ordinary words inside
+// brackets -- "A (Live and Acoustic)" -- and split only outside them.
+static int split_word_at(const char *text, const char *p, unsigned separators, bool in_brackets) {
 	static const struct {
 		unsigned bit;
 		const char *word;
+		bool stop;	   // may end in a full stop: "feat.", "vs."
+		bool exact;	   // the case as written
+		bool outside; // outside brackets only
 	} WORDS[] = {
-		{LIBRARY_SPLIT_FEAT, "featuring"},
-		{LIBRARY_SPLIT_FEAT, "feat"},
-		{LIBRARY_SPLIT_FEAT, "ft"},
-		{LIBRARY_SPLIT_VS, "versus"},
-		{LIBRARY_SPLIT_VS, "vs"},
+		{LIBRARY_SPLIT_FEAT, "featuring", true, false, false},
+		{LIBRARY_SPLIT_FEAT, "feat", true, false, false},
+		{LIBRARY_SPLIT_FEAT, "ft", true, false, false},
+		{LIBRARY_SPLIT_VS, "versus", true, false, false},
+		{LIBRARY_SPLIT_VS, "vs", true, false, false},
+		{LIBRARY_SPLIT_X, "x", false, true, true},
+		{LIBRARY_SPLIT_WITH, "with", false, false, true},
+		{LIBRARY_SPLIT_AND, "and", false, false, true},
 	};
 	if (p == text || (p[-1] != ' ' && p[-1] != '(' && p[-1] != '[')) {
 		return 0;
 	}
 	for (size_t i = 0; i < sizeof(WORDS) / sizeof(WORDS[0]); i++) {
-		if (!(separators & WORDS[i].bit)) {
+		if (!(separators & WORDS[i].bit) || (WORDS[i].outside && in_brackets)) {
 			continue;
 		}
 		size_t n = strlen(WORDS[i].word);
-		if (strncasecmp(p, WORDS[i].word, n) != 0) {
+		if ((WORDS[i].exact ? strncmp(p, WORDS[i].word, n) : strncasecmp(p, WORDS[i].word, n)) != 0) {
 			continue;
 		}
-		if (p[n] == '.') {
+		if (WORDS[i].stop && p[n] == '.') {
 			return (int)n + 1;
 		}
 		if (p[n] == ' ') {
@@ -3315,9 +3812,33 @@ static int split_word_at(const char *text, const char *p, unsigned separators) {
 	return 0;
 }
 
-static bool split_symbol(char c, unsigned separators) {
-	return (c == ';' && (separators & LIBRARY_SPLIT_SEMICOLON)) || (c == '/' && (separators & LIBRARY_SPLIT_SLASH)) ||
-		   (c == '&' && (separators & LIBRARY_SPLIT_AMPERSAND)) || (c == ',' && (separators & LIBRARY_SPLIT_COMMA));
+// A symbol separator at `p`, ASCII or one of its full-width forms (see
+// library.h). Returns its length in bytes, or 0.
+static int split_symbol_at(const char *p, unsigned separators) {
+	static const struct {
+		unsigned bit;
+		const char *symbol;
+	} SYMBOLS[] = {
+		{LIBRARY_SPLIT_SEMICOLON, ";"},
+		{LIBRARY_SPLIT_SEMICOLON, "\xef\xbc\x9b"}, // U+FF1B
+		{LIBRARY_SPLIT_SLASH, "/"},
+		{LIBRARY_SPLIT_SLASH, "\xef\xbc\x8f"}, // U+FF0F
+		{LIBRARY_SPLIT_AMPERSAND, "&"},
+		{LIBRARY_SPLIT_AMPERSAND, "\xef\xbc\x86"}, // U+FF06
+		{LIBRARY_SPLIT_COMMA, ","},
+		{LIBRARY_SPLIT_COMMA, "\xef\xbc\x8c"}, // U+FF0C
+		{LIBRARY_SPLIT_COMMA, "\xe3\x80\x81"}, // U+3001, the ideographic comma
+		{LIBRARY_SPLIT_PLUS, "+"},
+		{LIBRARY_SPLIT_PLUS, "\xef\xbc\x8b"}, // U+FF0B
+		{LIBRARY_SPLIT_X, "\xc3\x97"},		   // U+00D7, the multiplication sign
+	};
+	for (size_t i = 0; i < sizeof(SYMBOLS) / sizeof(SYMBOLS[0]); i++) {
+		size_t n = strlen(SYMBOLS[i].symbol);
+		if ((separators & SYMBOLS[i].bit) && strncmp(p, SYMBOLS[i].symbol, n) == 0) {
+			return (int)n;
+		}
+	}
+	return 0;
 }
 
 // Spaces off both ends; a bracket left open at the end of a name ("A (" from
@@ -3381,10 +3902,11 @@ static int split_names(const char *text, unsigned separators, char *const *excep
 		}
 		int cut = 0;
 		if (!keep) {
-			if (split_symbol(*p, separators)) {
-				cut = depth == 0 || word_in_brackets ? 1 : 0;
+			int symbol = split_symbol_at(p, separators);
+			if (symbol > 0) {
+				cut = depth == 0 || word_in_brackets ? symbol : 0;
 			} else {
-				cut = split_word_at(text, p, separators);
+				cut = split_word_at(text, p, separators, depth > 0);
 				word_in_brackets |= cut > 0 && depth > 0;
 			}
 		}
@@ -3441,6 +3963,7 @@ static sqlite3_stmt *stmt_genre;
 static sqlite3_stmt *stmt_album_artist;
 static sqlite3_stmt *stmt_album_group;
 static sqlite3_stmt *stmt_artist_link;
+static sqlite3_stmt *stmt_album_artist_link;
 static sqlite3_stmt *stmt_genre_link;
 
 static void finalize_statements(void) {
@@ -3451,9 +3974,10 @@ static void finalize_statements(void) {
 	sqlite3_finalize(stmt_album_artist);
 	sqlite3_finalize(stmt_album_group);
 	sqlite3_finalize(stmt_artist_link);
+	sqlite3_finalize(stmt_album_artist_link);
 	sqlite3_finalize(stmt_genre_link);
 	stmt_track = stmt_album = stmt_artist = stmt_genre = stmt_album_artist = stmt_album_group = NULL;
-	stmt_artist_link = stmt_genre_link = NULL;
+	stmt_artist_link = stmt_album_artist_link = stmt_genre_link = NULL;
 }
 
 static bool prepare_statements(void) {
@@ -3488,6 +4012,8 @@ static bool prepare_statements(void) {
 
 	if (sqlite3_prepare_v2(db, "INSERT INTO ARTIST_LINK(path,artist) VALUES(?,?)", -1, &stmt_artist_link, NULL) !=
 			SQLITE_OK ||
+		sqlite3_prepare_v2(db, "INSERT INTO ALBUM_ARTIST_LINK(path,album_artist) VALUES(?,?)", -1,
+						   &stmt_album_artist_link, NULL) != SQLITE_OK ||
 		sqlite3_prepare_v2(db, "INSERT INTO GENRE_LINK(path,genre) VALUES(?,?)", -1, &stmt_genre_link, NULL) !=
 			SQLITE_OK) {
 		return false;
@@ -3625,7 +4151,9 @@ static void insert_track(const char *path, const char *filename, const song_meta
 	album_key(album_artist, path, track_album_key, sizeof(track_album_key));
 	sqlite3_bind_text(stmt_track, column++, track_album_key, -1, SQLITE_TRANSIENT); // album_key
 
-	if (sqlite3_step(stmt_track) != SQLITE_DONE) {
+	int step_rc = sqlite3_step(stmt_track);
+	if (step_rc != SQLITE_DONE) {
+		note_damage(step_rc);
 		fprintf(stderr, "library: insert failed: %s\n", sqlite3_errmsg(db));
 	}
 	sqlite3_reset(stmt_track);
@@ -3634,7 +4162,8 @@ static void insert_track(const char *path, const char *filename, const song_meta
 	lookup_names(stmt_artist, stmt_artist_link, path, tags->artist, rules.artist_separators, rules.exceptions,
 				 rules.exception_count);
 	lookup_names(stmt_genre, stmt_genre_link, path, tags->genre, rules.genre_separators, NULL, 0);
-	run_lookup(stmt_album_artist, album_artist);
+	lookup_names(stmt_album_artist, stmt_album_artist_link, path, album_artist, rules.album_artist_separators,
+				 rules.exceptions, rules.exception_count);
 
 	// And the album as this player lists it: its name and whose it is.
 	if (stmt_album_group && tags->album[0]) {
@@ -3955,6 +4484,10 @@ static void scan_indexed(const char *path, const char *name, const song_metadata
 static char cue_claimed[CUE_CLAIMED_MAX][512];
 static int cue_claimed_count;
 
+// Rows a sheet took out after they were indexed: their album, artist and genre
+// names went in with them, and are pruned once the walk is over.
+static bool cue_claimed_rows;
+
 static void cue_claim(const char *audio_path) {
 	if (cue_claimed_count >= CUE_CLAIMED_MAX) {
 		return;
@@ -3972,7 +4505,9 @@ static void cue_claim(const char *audio_path) {
 			sqlite3_step(stmt);
 			sqlite3_finalize(stmt);
 			// The counter on the progress page must lose the row too.
-			scan_found -= sqlite3_changes(db);
+			int gone = sqlite3_changes(db);
+			scan_found -= gone;
+			cue_claimed_rows |= gone > 0;
 			bump_generation(GEN_MEDIA);
 		}
 	}
@@ -3988,6 +4523,11 @@ static bool cue_claims(const char *path) {
 	return false;
 }
 
+// Raised whenever what a sheet is taken to cut up changes: a row written under
+// another version is not believed, and its sheet is parsed again. Version 1: a
+// sheet over files split one per track claims none of them.
+#define CUE_STATE_VERSION 1
+
 // What CUE_STATE remembers of a sheet: the audio file it cuts up, valid for as
 // long as the sheet keeps the modification time and size it had. Only sheets
 // that parsed are remembered: whether one does also depends on its audio being
@@ -3995,11 +4535,14 @@ static bool cue_claims(const char *path) {
 static bool cue_state_get(const char *path, const struct stat *st, char *audio, size_t size) {
 	sqlite3_stmt *stmt = NULL;
 	bool found = false;
-	if (db && sqlite3_prepare_v2(db, "SELECT audio FROM CUE_STATE WHERE path = ?1 AND mtime = ?2 AND size = ?3", -1,
-								 &stmt, NULL) == SQLITE_OK) {
+	if (db && sqlite3_prepare_v2(db,
+								 "SELECT audio FROM CUE_STATE WHERE path = ?1 AND mtime = ?2 AND size = ?3"
+								 " AND version = ?4",
+								 -1, &stmt, NULL) == SQLITE_OK) {
 		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
 		sqlite3_bind_int64(stmt, 2, (sqlite3_int64)st->st_mtime);
 		sqlite3_bind_int64(stmt, 3, (sqlite3_int64)st->st_size);
+		sqlite3_bind_int(stmt, 4, CUE_STATE_VERSION);
 		if (sqlite3_step(stmt) == SQLITE_ROW) {
 			const char *text = (const char *)sqlite3_column_text(stmt, 0);
 			snprintf(audio, size, "%s", text ? text : "");
@@ -4013,12 +4556,15 @@ static bool cue_state_get(const char *path, const struct stat *st, char *audio, 
 // With db_lock held.
 static void cue_state_put(const char *path, const struct stat *st, const char *audio) {
 	sqlite3_stmt *stmt = NULL;
-	if (db && sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO CUE_STATE(path, mtime, size, audio) VALUES(?1, ?2, ?3, ?4)",
+	if (db && sqlite3_prepare_v2(db,
+								 "INSERT OR REPLACE INTO CUE_STATE(path, mtime, size, audio, version)"
+								 " VALUES(?1, ?2, ?3, ?4, ?5)",
 								 -1, &stmt, NULL) == SQLITE_OK) {
 		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
 		sqlite3_bind_int64(stmt, 2, (sqlite3_int64)st->st_mtime);
 		sqlite3_bind_int64(stmt, 3, (sqlite3_int64)st->st_size);
 		sqlite3_bind_text(stmt, 4, audio, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int(stmt, 5, CUE_STATE_VERSION);
 		sqlite3_step(stmt);
 		sqlite3_finalize(stmt);
 	}
@@ -4095,7 +4641,9 @@ static bool scan_cue_sheet(const char *path, const struct stat *st) {
 	if (!cue) {
 		return false;
 	}
-	if (!cue_parse(path, cue)) {
+	// A sheet over files already split one per track leaves them to be
+	// indexed as the files they are.
+	if (!cue_parse(path, cue) || cue->split) {
 		free(cue);
 		return false;
 	}
@@ -4239,6 +4787,56 @@ static bool scan_folder_chosen(const char *name) {
 	return false;
 }
 
+// Whether a directory entry is a subfolder the walk goes into, by the same
+// rules as in scan_directory() -- or, with `by_type`, as in update_folder(),
+// which believes the entry's d_type and asks the card only when it has none.
+static bool walked_subdir(const char *path, const struct dirent *de, int depth, bool by_type) {
+	const char *name = de->d_name;
+	if (name[0] == '.' || playlist_is_junk_name(name)) {
+		return false;
+	}
+	char child[512];
+	if (snprintf(child, sizeof(child), "%s/%s", path, name) >= (int)sizeof(child)) {
+		return false;
+	}
+	bool is_dir = by_type && de->d_type == DT_DIR;
+	if (!is_dir && !(by_type && de->d_type == DT_REG)) {
+		struct stat st;
+		is_dir = lstat(child, &st) == 0 && S_ISDIR(st.st_mode);
+	}
+	if (!is_dir) {
+		return false;
+	}
+	if (depth == 0 && (strcasecmp(name, AUDIOBOOKDB_FOLDER) == 0 || strcasecmp(name, PODCASTDL_FOLDER) == 0)) {
+		return false;
+	}
+	return !(depth == 0 && scan_folder_count > 0 && !scan_folder_chosen(name));
+}
+
+// The next batch of a directory's subfolders: the first `skip` of them in
+// readdir order are passed over. True when there are more after the batch.
+static bool collect_subdirs(const char *path, int depth, int skip, bool by_type, namelist_t *out) {
+	namelist_init(out);
+	DIR *dir = opendir(path);
+	if (!dir) {
+		return false;
+	}
+	bool more = false;
+	int seen = 0;
+	struct dirent *de;
+	while (!scan_cancel && (de = readdir(dir)) != NULL) {
+		if (!walked_subdir(path, de, depth, by_type) || seen++ < skip) {
+			continue;
+		}
+		if (!namelist_add(out, de->d_name)) {
+			more = true;
+			break;
+		}
+	}
+	closedir(dir);
+	return more;
+}
+
 static void scan_directory(const char *path, int depth) {
 	if (scan_cancel || depth > SCAN_MAX_DEPTH) {
 		return;
@@ -4259,6 +4857,7 @@ static void scan_directory(const char *path, int depth) {
 
 	namelist_t subdirs;
 	namelist_init(&subdirs);
+	bool more_subdirs = false;
 
 	// WAVs are held back to a second pass. A WAV can carry its own track list
 	// in its markers, and a .cue in the same folder overrules it -- but
@@ -4308,9 +4907,10 @@ static void scan_directory(const char *path, int depth) {
 			if (depth == 0 && scan_folder_count > 0 && !scan_folder_chosen(de->d_name)) {
 				continue;
 			}
-			if (!namelist_add(&subdirs, de->d_name) && subdirs.count == SCAN_MAX_SUBDIRS) {
-				fprintf(stderr, "library: %s has more than %d subfolders; the rest are skipped\n", path,
-						SCAN_MAX_SUBDIRS);
+			// Once one is left out, so are the rest: the next batch starts
+			// after the ones held here, counted in readdir order.
+			if (!more_subdirs && !namelist_add(&subdirs, de->d_name)) {
+				more_subdirs = true;
 			}
 			continue;
 		}
@@ -4362,17 +4962,32 @@ static void scan_directory(const char *path, int depth) {
 		pthread_mutex_unlock(&db_lock);
 	}
 
-	for (int i = 0; i < subdirs.count && !scan_cancel; i++) {
-		char child[512];
-		if (snprintf(child, sizeof(child), "%s/%s", path, subdirs.names[i]) >= (int)sizeof(child)) {
-			continue;
+	// The subfolders, SCAN_MAX_SUBDIRS at a time: past the first batch the
+	// directory is read again for the next one.
+	int walked = 0;
+	for (;;) {
+		for (int i = 0; i < subdirs.count && !scan_cancel; i++) {
+			char child[512];
+			if (snprintf(child, sizeof(child), "%s/%s", path, subdirs.names[i]) >= (int)sizeof(child)) {
+				continue;
+			}
+			scan_directory(child, depth + 1);
+			set_scan_folder(path); // back to this level for the progress display
 		}
-		scan_directory(child, depth + 1);
-		set_scan_folder(path); // back to this level for the progress display
+		walked += subdirs.count;
+		namelist_free(&subdirs);
+		if (!more_subdirs || scan_cancel) {
+			break;
+		}
+		more_subdirs = collect_subdirs(path, depth, walked, false, &subdirs);
+		if (subdirs.count == 0) {
+			break;
+		}
 	}
-
-	namelist_free(&subdirs);
 }
+
+static void prune_links(void);
+static void prune_names(void);
 
 // A scan: the tables emptied, the card walked, every file read.
 static void full_scan_run(void) {
@@ -4390,6 +5005,7 @@ static void full_scan_run(void) {
 	exec("DELETE FROM ALBUM_ARTIST_TABLE");
 	exec("DELETE FROM GENRE_TABLE");
 	exec("DELETE FROM ARTIST_LINK");
+	exec("DELETE FROM ALBUM_ARTIST_LINK");
 	exec("DELETE FROM GENRE_LINK");
 	exec("DELETE FROM FOLDER_TABLE");
 	exec("DELETE FROM CUE_STATE");
@@ -4416,6 +5032,12 @@ static void full_scan_run(void) {
 		exec("COMMIT");
 	}
 	finalize_statements();
+
+	if (cue_claimed_rows && !scan_db_failed) {
+		prune_links();
+		prune_names();
+	}
+	cue_claimed_rows = false;
 
 	// One row so the count is readable without walking the table.
 	exec("DELETE FROM COUNT_TABLE");
@@ -4597,6 +5219,15 @@ static bool namelist_has(const namelist_t *l, const char *name) {
 	return false;
 }
 
+static int name_cmp(const void *a, const void *b) {
+	return strcasecmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+// Whether `name` is in `names`, sorted by name_cmp.
+static bool sorted_has(char *const *names, int count, const char *name) {
+	return count > 0 && bsearch(&name, names, (size_t)count, sizeof(*names), name_cmp) != NULL;
+}
+
 // A row directly in the folder being compared: the file it comes from, which
 // for a sheet's track is the sheet ("x.cue?track=3" comes from "x.cue").
 typedef struct {
@@ -4628,9 +5259,14 @@ static int folder_row_find(folder_row_t *rows, int count, const char *file) {
 }
 
 // The audio a sheet cuts up, from CUE_STATE when the sheet is the one it
-// remembers and from the sheet itself otherwise. Empty when it is unusable.
-static void sheet_audio(const char *sheet, char *audio, size_t size) {
+// remembers and from the sheet itself otherwise. Empty when it is unusable;
+// `split`, when not NULL, says whether that is because the sheet is over files
+// split one per track.
+static void sheet_audio(const char *sheet, char *audio, size_t size, bool *split) {
 	audio[0] = '\0';
+	if (split) {
+		*split = false;
+	}
 	struct stat st;
 	if (stat(sheet, &st) != 0) {
 		return;
@@ -4643,7 +5279,11 @@ static void sheet_audio(const char *sheet, char *audio, size_t size) {
 	}
 	audio[0] = '\0';
 	cue_sheet_t *cue = malloc(sizeof(*cue));
-	if (cue && cue_parse(sheet, cue) && cue->track_count > 0) {
+	bool parsed = cue && cue_parse(sheet, cue);
+	if (parsed && cue->split && split) {
+		*split = true;
+	}
+	if (parsed && cue->track_count > 0 && !cue->split) {
 		snprintf(audio, size, "%s", cue->audio_path);
 		pthread_mutex_lock(&db_lock);
 		cue_state_put(sheet, &st, audio);
@@ -4653,7 +5293,9 @@ static void sheet_audio(const char *sheet, char *audio, size_t size) {
 }
 
 // One folder that no longer matches its FOLDER_TABLE row: `files` are its
-// playable names as the walk reads them, `dirs` every subfolder it has. Without
+// playable names as the walk reads them, `dirs` its subfolders -- every one,
+// or with `dirs_listed` false only the first SCAN_MAX_SUBDIRS, in which case a
+// subfolder the index knows and the list does not is asked of the card. Without
 // `own_files` -- the root of a card read only for its chosen folders -- the
 // files directly in it are none of the walk's business.
 //
@@ -4666,15 +5308,30 @@ static void sheet_audio(const char *sheet, char *audio, size_t size) {
 // subfolder name too long to hold, leaves part of it unjudged -- nothing is
 // taken out there, and the folder is looked into again next time.
 static bool update_compare(const char *path, bool own_files, const namelist_t *files, const namelist_t *dirs,
-						   walk_t *w) {
+						   bool dirs_listed, walk_t *w) {
 	size_t plen = strlen(path);
 	folder_row_t *rows = NULL;
 	int row_count = 0, row_cap = 0;
-	namelist_t indexed_dirs; // the subfolders the index has tracks in
-	namelist_init(&indexed_dirs);
+	// The subfolders the index has tracks or a FOLDER_TABLE row in and the
+	// list does not: gone, or with the list cut short, to be asked of the card.
+	namelist_t missing_dirs;
+	namelist_init(&missing_dirs);
 	char last_dir[512] = "";
 	bool rows_complete = true; // every row directly in the folder, and every claim
 	bool dirs_complete = true; // every subfolder the index has tracks in
+
+	// Sorted, so that each subfolder the index names is a binary search and
+	// not a walk of the list -- this runs with db_lock held.
+	char **sorted_dirs = NULL;
+	if (dirs->count > 0) {
+		sorted_dirs = malloc((size_t)dirs->count * sizeof(*sorted_dirs));
+		if (sorted_dirs) {
+			memcpy(sorted_dirs, dirs->names, (size_t)dirs->count * sizeof(*sorted_dirs));
+			qsort(sorted_dirs, (size_t)dirs->count, sizeof(*sorted_dirs), name_cmp);
+		} else {
+			dirs_complete = false;
+		}
+	}
 
 	pthread_mutex_lock(&db_lock);
 	if (db && stmt_under_media) {
@@ -4693,7 +5350,8 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 				} else if (strncasecmp(last_dir, rest, n) != 0 || last_dir[n] != '\0') {
 					memcpy(last_dir, rest, n);
 					last_dir[n] = '\0';
-					if (!namelist_has(&indexed_dirs, last_dir) && !namelist_add(&indexed_dirs, last_dir)) {
+					if (dirs_complete && !sorted_has(sorted_dirs, dirs->count, last_dir) &&
+						!namelist_push(&missing_dirs, last_dir, INT_MAX)) {
 						dirs_complete = false;
 					}
 				}
@@ -4733,17 +5391,24 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 		qsort(rows, (size_t)row_count, sizeof(rows[0]), folder_row_cmp);
 	}
 
-	// What the sheets here claim, by full path.
-	namelist_t claimed;
+	// What the sheets here claim, by full path; and the sheets over files
+	// split one per track, whose rows, if the index has any, are taken out:
+	// the files stand for themselves.
+	namelist_t claimed, split_sheets;
 	namelist_init(&claimed);
+	namelist_init(&split_sheets);
 	for (int i = 0; i < files->count && !scan_cancel; i++) {
 		if (!cue_is_sheet(files->names[i])) {
 			continue;
 		}
 		char sheet[600], audio[600];
 		snprintf(sheet, sizeof(sheet), "%s/%s", path, files->names[i]);
-		sheet_audio(sheet, audio, sizeof(audio));
+		bool split = false;
+		sheet_audio(sheet, audio, sizeof(audio), &split);
 		if (audio[0] && !namelist_add(&claimed, audio)) {
+			rows_complete = false;
+		}
+		if (split && !namelist_add(&split_sheets, files->names[i])) {
 			rows_complete = false;
 		}
 	}
@@ -4752,7 +5417,8 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 		const char *name = files->names[i];
 		int hit = folder_row_find(rows, row_count, name);
 		if (hit >= 0) {
-			for (int j = hit; j < row_count && strcasecmp(rows[j].file, name) == 0; j++) {
+			bool keep = !namelist_has(&split_sheets, name);
+			for (int j = hit; keep && j < row_count && strcasecmp(rows[j].file, name) == 0; j++) {
 				rows[j].seen = true;
 			}
 			continue;
@@ -4763,7 +5429,7 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 		}
 		if (cue_is_sheet(name)) {
 			char audio[600];
-			sheet_audio(child, audio, sizeof(audio));
+			sheet_audio(child, audio, sizeof(audio), NULL);
 			if (!audio[0]) {
 				continue;
 			}
@@ -4775,6 +5441,7 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 		}
 	}
 	namelist_free(&claimed);
+	namelist_free(&split_sheets);
 
 	// A full list leaves the rest of this folder's names unread, and an unread
 	// name is not a missing file.
@@ -4785,37 +5452,51 @@ static bool update_compare(const char *path, bool own_files, const namelist_t *f
 		}
 	}
 	if (judged && dirs_complete) {
-		// Subfolders the index has tracks or a FOLDER_TABLE row in, and the
-		// card no longer has.
-		for (int i = 0; i < indexed_dirs.count; i++) {
-			if (!namelist_has(dirs, indexed_dirs.names[i])) {
-				char gone[600];
-				snprintf(gone, sizeof(gone), "%s/%s", path, indexed_dirs.names[i]);
-				if (!namelist_add(&w->gone_folders, gone)) {
-					w->lists_failed = true;
-				}
-			}
-		}
 		pthread_mutex_lock(&db_lock);
 		if (db && stmt_under_folders) {
 			bind_under(stmt_under_folders, path);
 			while (sqlite3_step(stmt_under_folders) == SQLITE_ROW) {
 				const char *folder = (const char *)sqlite3_column_text(stmt_under_folders, 0);
 				const char *rest = folder && strlen(folder) > plen + 1 ? folder + plen + 1 : NULL;
-				if (rest && !strchr(rest, '/') && !namelist_has(dirs, rest) && !namelist_has(&w->gone_folders, folder)) {
-					namelist_add(&w->gone_folders, folder);
+				if (rest && !strchr(rest, '/') && !sorted_has(sorted_dirs, dirs->count, rest) &&
+					!namelist_push(&missing_dirs, rest, INT_MAX)) {
+					dirs_complete = false;
 				}
 			}
 			sqlite3_reset(stmt_under_folders);
 		}
 		pthread_mutex_unlock(&db_lock);
 	}
+	if (judged && dirs_complete) {
+		// Subfolders the index has tracks or a FOLDER_TABLE row in, and the
+		// card no longer has. Only a name the card says is not there is gone:
+		// one it cannot answer for is left for the next run. A folder with
+		// both tracks and a FOLDER_TABLE row is in the list twice.
+		if (missing_dirs.count > 1) {
+			qsort(missing_dirs.names, (size_t)missing_dirs.count, sizeof(*missing_dirs.names), name_cmp);
+		}
+		for (int i = 0; i < missing_dirs.count; i++) {
+			if (i > 0 && strcasecmp(missing_dirs.names[i], missing_dirs.names[i - 1]) == 0) {
+				continue;
+			}
+			char gone[600];
+			snprintf(gone, sizeof(gone), "%s/%s", path, missing_dirs.names[i]);
+			struct stat st;
+			if (!dirs_listed && (lstat(gone, &st) == 0 || errno != ENOENT)) {
+				continue;
+			}
+			if (!namelist_add(&w->gone_folders, gone)) {
+				w->lists_failed = true;
+			}
+		}
+	}
 
 	for (int i = 0; i < row_count; i++) {
 		free(rows[i].file);
 	}
 	free(rows);
-	namelist_free(&indexed_dirs);
+	free(sorted_dirs);
+	namelist_free(&missing_dirs);
 	return rows_complete && dirs_complete;
 }
 
@@ -4844,7 +5525,9 @@ static void update_folder(const char *path, int depth, walk_t *w) {
 	namelist_init(&dirs);
 	namelist_init(&files);
 	folder_sig_t sig = {0, 0};
-	bool overflow = false;
+	bool overflow = false;		// more files than a list holds
+	bool dirs_listed = true;	// every subfolder in `dirs`
+	bool more_subdirs = false; // subfolders past the batch in `subdirs`
 
 	for (;;) {
 		errno = 0;
@@ -4881,7 +5564,9 @@ static void update_folder(const char *path, int depth, walk_t *w) {
 
 		if (is_dir) {
 			folder_sig_add(&sig, de->d_name, true);
-			overflow |= !namelist_add(&dirs, de->d_name);
+			if (dirs_listed && !namelist_add(&dirs, de->d_name)) {
+				dirs_listed = false;
+			}
 			if (depth == 0 && (strcasecmp(de->d_name, AUDIOBOOKDB_FOLDER) == 0 ||
 							   strcasecmp(de->d_name, PODCASTDL_FOLDER) == 0)) {
 				continue;
@@ -4889,7 +5574,10 @@ static void update_folder(const char *path, int depth, walk_t *w) {
 			if (depth == 0 && scan_folder_count > 0 && !scan_folder_chosen(de->d_name)) {
 				continue;
 			}
-			namelist_add(&subdirs, de->d_name);
+			// As in scan_directory(): the rest come in later batches.
+			if (!more_subdirs && !namelist_add(&subdirs, de->d_name)) {
+				more_subdirs = true;
+			}
 			continue;
 		}
 
@@ -4908,10 +5596,10 @@ static void update_folder(const char *path, int depth, walk_t *w) {
 	closedir(dir);
 
 	if (overflow) {
-		printf("library: %s holds more than %d names; Detect changes leaves it to a scan\n", path, SCAN_MAX_SUBDIRS);
+		printf("library: %s holds more than %d tracks; Detect changes leaves it to a scan\n", path, SCAN_MAX_SUBDIRS);
 	}
 	if (readable && !scan_cancel && !folder_unchanged(path, &sig)) {
-		bool complete = update_compare(path, !(depth == 0 && scan_folder_count > 0), &files, &dirs, w);
+		bool complete = update_compare(path, !(depth == 0 && scan_folder_count > 0), &files, &dirs, dirs_listed, w);
 		if (complete && !w->full) {
 			walk_note(w, path, dir_st.st_mtime, &sig);
 		}
@@ -4919,15 +5607,26 @@ static void update_folder(const char *path, int depth, walk_t *w) {
 	namelist_free(&files);
 	namelist_free(&dirs);
 
-	for (int i = 0; i < subdirs.count && !scan_cancel && !w->full; i++) {
-		char child[512];
-		if (snprintf(child, sizeof(child), "%s/%s", path, subdirs.names[i]) >= (int)sizeof(child)) {
-			continue;
+	int walked = 0;
+	for (;;) {
+		for (int i = 0; i < subdirs.count && !scan_cancel && !w->full; i++) {
+			char child[512];
+			if (snprintf(child, sizeof(child), "%s/%s", path, subdirs.names[i]) >= (int)sizeof(child)) {
+				continue;
+			}
+			update_folder(child, depth + 1, w);
+			set_scan_folder(path);
 		}
-		update_folder(child, depth + 1, w);
-		set_scan_folder(path);
+		walked += subdirs.count;
+		namelist_free(&subdirs);
+		if (!more_subdirs || scan_cancel || w->full) {
+			break;
+		}
+		more_subdirs = collect_subdirs(path, depth, walked, true, &subdirs);
+		if (subdirs.count == 0) {
+			break;
+		}
 	}
-	namelist_free(&subdirs);
 }
 
 // Whether a track's path lies in what the walk covered: the whole card, or the
@@ -5137,6 +5836,8 @@ static int walk_gone_rows(const walk_t *w) {
 // Link rows whose track is gone. With db_lock held.
 static void prune_links(void) {
 	exec("DELETE FROM ARTIST_LINK WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.path = ARTIST_LINK.path)");
+	exec("DELETE FROM ALBUM_ARTIST_LINK WHERE NOT EXISTS"
+		 " (SELECT 1 FROM MEDIA_TABLE m WHERE m.path = ALBUM_ARTIST_LINK.path)");
 	exec("DELETE FROM GENRE_LINK WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.path = GENRE_LINK.path)");
 }
 
@@ -5146,12 +5847,136 @@ static void prune_names(void) {
 	exec("DELETE FROM ARTIST_TABLE WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.artist = ARTIST_TABLE.artist)"
 		 " AND NOT EXISTS (SELECT 1 FROM ARTIST_LINK l WHERE l.artist = ARTIST_TABLE.artist)");
 	exec("DELETE FROM ALBUM_ARTIST_TABLE WHERE NOT EXISTS"
-		 " (SELECT 1 FROM MEDIA_TABLE m WHERE m.album_artist = ALBUM_ARTIST_TABLE.album_artist)");
+		 " (SELECT 1 FROM MEDIA_TABLE m WHERE m.album_artist = ALBUM_ARTIST_TABLE.album_artist)"
+		 " AND NOT EXISTS (SELECT 1 FROM ALBUM_ARTIST_LINK l WHERE l.album_artist = ALBUM_ARTIST_TABLE.album_artist)");
 	exec("DELETE FROM GENRE_TABLE WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.genre = GENRE_TABLE.genre)"
 		 " AND NOT EXISTS (SELECT 1 FROM GENRE_LINK l WHERE l.genre = GENRE_TABLE.genre)");
 	exec("DELETE FROM ALBUM_TABLE WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.album = ALBUM_TABLE.album)");
 	exec("DELETE FROM ALBUM_GROUP_TABLE WHERE NOT EXISTS (SELECT 1 FROM MEDIA_TABLE m WHERE m.album = "
 		 "ALBUM_GROUP_TABLE.album AND m.album_key = ALBUM_GROUP_TABLE.album_key)");
+}
+
+// The file a row stands for: its own path, or for a track of a sheet the
+// sheet's, which is everything before "?track=".
+static void row_file(const char *path, char *out, size_t size) {
+	const char *mark = strstr(path, "?track=");
+	size_t len = mark ? (size_t)(mark - path) : strlen(path);
+	snprintf(out, size, "%.*s", (int)(len < size ? len : size - 1), path);
+}
+
+int library_forget_deleted(const char *const *paths, int count) {
+	if (!paths || count <= 0) {
+		return 0;
+	}
+	pthread_mutex_lock(&db_lock);
+	if (!db) {
+		pthread_mutex_unlock(&db_lock);
+		return 0;
+	}
+
+	// The rows the paths stand for -- a file's own, a sheet's tracks, and
+	// everything under a folder -- and of those, the ones whose file is gone.
+	// Asked of the card and not assumed: a delete that stopped halfway leaves
+	// some of a folder behind, and those stay.
+	static const char *const SELECT_SQL =
+		"SELECT rowid, path FROM MEDIA_TABLE WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')"
+		" OR (path >= ?1 || '/' AND path < ?1 || '0')";
+	int removed = 0, unfavoured = 0;
+	bool in_transaction = exec("BEGIN");
+	sqlite3_stmt *select = NULL, *del = NULL, *fav = NULL, *plays = NULL;
+	sqlite3_prepare_v2(db, SELECT_SQL, -1, &select, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM MEDIA_TABLE WHERE rowid = ?1", -1, &del, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM FAVOURITES WHERE path = ?1", -1, &fav, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM PLAY_COUNTS WHERE path = ?1", -1, &plays, NULL);
+	for (int i = 0; select && del && i < count; i++) {
+		if (!paths[i] || !paths[i][0]) {
+			continue;
+		}
+		sqlite3_reset(select);
+		sqlite3_bind_text(select, 1, paths[i], -1, SQLITE_TRANSIENT);
+		while (sqlite3_step(select) == SQLITE_ROW) {
+			sqlite3_int64 rowid = sqlite3_column_int64(select, 0);
+			const char *path = (const char *)sqlite3_column_text(select, 1);
+			char file[600];
+			struct stat st;
+			row_file(path ? path : "", file, sizeof(file));
+			if (!file[0] || stat(file, &st) == 0) {
+				continue;
+			}
+			sqlite3_reset(del);
+			sqlite3_bind_int64(del, 1, rowid);
+			sqlite3_step(del);
+			removed += sqlite3_changes(db);
+			// A favourite or a count of plays of a file deleted on purpose has
+			// nothing left to point at.
+			sqlite3_stmt *const owned[] = {fav, plays};
+			for (size_t k = 0; k < sizeof(owned) / sizeof(owned[0]); k++) {
+				if (!owned[k]) {
+					continue;
+				}
+				sqlite3_reset(owned[k]);
+				sqlite3_bind_text(owned[k], 1, path, -1, SQLITE_TRANSIENT);
+				sqlite3_step(owned[k]);
+				if (owned[k] == fav) {
+					unfavoured += sqlite3_changes(db);
+				}
+			}
+		}
+	}
+	sqlite3_finalize(select);
+	sqlite3_finalize(del);
+	sqlite3_finalize(fav);
+	sqlite3_finalize(plays);
+
+	// A folder that is gone takes what the walk wrote down about it too, so the
+	// next look for changes does not go looking for it.
+	static const char *const UNDER[] = {
+		"DELETE FROM FOLDER_TABLE WHERE path = ?3 OR (path >= ?1 AND path < ?2)",
+		"DELETE FROM CUE_STATE WHERE path = ?3 OR (path >= ?1 AND path < ?2)",
+	};
+	for (int i = 0; i < count; i++) {
+		struct stat st;
+		if (!paths[i] || !paths[i][0] || stat(paths[i], &st) == 0) {
+			continue;
+		}
+		for (size_t q = 0; q < sizeof(UNDER) / sizeof(UNDER[0]); q++) {
+			sqlite3_stmt *stmt = NULL;
+			if (sqlite3_prepare_v2(db, UNDER[q], -1, &stmt, NULL) == SQLITE_OK) {
+				bind_under(stmt, paths[i]);
+				sqlite3_bind_text(stmt, 3, paths[i], -1, SQLITE_TRANSIENT);
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			}
+		}
+	}
+
+	if (removed > 0) {
+		prune_links();
+		prune_names();
+		exec("DELETE FROM COUNT_TABLE");
+		char sql[128];
+		snprintf(sql, sizeof(sql), "INSERT INTO COUNT_TABLE(cn) VALUES(%d)",
+				 count_rows("SELECT COUNT(*) FROM MEDIA_TABLE"));
+		exec(sql);
+	}
+	if (in_transaction && !exec("COMMIT")) {
+		exec("ROLLBACK");
+		removed = 0;
+		unfavoured = 0;
+	}
+	if (removed > 0) {
+		// The open lists hold row ids, some of which are gone now.
+		bump_generation(GEN_MEDIA);
+	}
+	if (unfavoured > 0) {
+		bump_generation(GEN_FAVOURITES);
+	}
+	pthread_mutex_unlock(&db_lock);
+
+	if (removed > 0) {
+		printf("library: %d deleted track(s) taken out of the index\n", removed);
+	}
+	return removed;
 }
 
 // Takes out what the walk found gone. Returns how many tracks went, or -1
@@ -5235,6 +6060,7 @@ static int forget_file(const char *file) {
 	static const char *const SQL[] = {
 		"DELETE FROM MEDIA_TABLE WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')",
 		"DELETE FROM ARTIST_LINK WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')",
+		"DELETE FROM ALBUM_ARTIST_LINK WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')",
 		"DELETE FROM GENRE_LINK WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')",
 	};
 	int tracks = 0;
@@ -5454,6 +6280,9 @@ static void update_run(void) {
 	finalize_known();
 	scan_id_base = 0;
 	if (changed) {
+		if (cue_claimed_rows) {
+			prune_links();
+		}
 		prune_names();
 		links_check();
 		exec("DELETE FROM COUNT_TABLE");
@@ -5465,6 +6294,7 @@ static void update_run(void) {
 		// are not among them, and the removed ones still are.
 		bump_generation(GEN_MEDIA);
 	}
+	cue_claimed_rows = false;
 	exec("PRAGMA cache_size=-256");
 	if (db) {
 		sqlite3_db_release_memory(db);
@@ -5550,8 +6380,10 @@ static bool reorganize_run(void) {
 	bool ready = db && prepare_statements() && exec("BEGIN");
 	if (ready) {
 		exec("DELETE FROM ARTIST_LINK");
+		exec("DELETE FROM ALBUM_ARTIST_LINK");
 		exec("DELETE FROM GENRE_LINK");
 		exec("DELETE FROM ARTIST_TABLE");
+		exec("DELETE FROM ALBUM_ARTIST_TABLE");
 		exec("DELETE FROM GENRE_TABLE");
 		ready = exec("COMMIT");
 		if (!ready) {
@@ -5562,6 +6394,8 @@ static bool reorganize_run(void) {
 
 	if (ready) {
 		relink("artist", "ARTIST_LINK", &stmt_artist, rules.artist_separators, rules.exceptions, rules.exception_count);
+		relink("album_artist", "ALBUM_ARTIST_LINK", &stmt_album_artist, rules.album_artist_separators, rules.exceptions,
+			   rules.exception_count);
 		relink("genre", "GENRE_LINK", &stmt_genre, rules.genre_separators, NULL, 0);
 
 		int count = 0;
@@ -5603,6 +6437,14 @@ static void *scan_thread_func(void *arg) {
 	switch (scan_mode) {
 	case SCAN_FULL:
 		full_scan_run();
+		// A run that failed on a damaged file goes again into a new one.
+		if (scan_db_failed && db_damaged && !scan_stop_asked && replace_damaged()) {
+			scan_db_failed = false;
+			scan_cancel = false;
+			scan_found = 0;
+			scan_id_base = 0;
+			full_scan_run();
+		}
 		if (!scan_cancel && !scan_db_failed) {
 			playlists_follow_library();
 			if (update_listener) {
@@ -5675,6 +6517,7 @@ static bool scan_launch(const char *root, scan_mode_t mode) {
 	scan_id_base = 0;
 	scan_found = 0;
 	scan_cancel = false;
+	scan_stop_asked = false;
 	scan_db_failed = false;
 	scan_running = true;
 	set_scan_folder(mode == SCAN_REORGANIZE ? "" : root);
@@ -5702,6 +6545,9 @@ static bool scan_launch(const char *root, scan_mode_t mode) {
 bool library_scan_start(const char *root) {
 	if (scan_running && scan_mode != SCAN_FULL) {
 		library_scan_stop_and_wait();
+	}
+	if (db_damaged && !scan_running) {
+		replace_damaged();
 	}
 	return scan_launch(root, SCAN_FULL);
 }
@@ -5837,6 +6683,7 @@ void library_scan_stop(void) {
 	if (!scan_running) {
 		return;
 	}
+	scan_stop_asked = true;
 	scan_cancel = true;
 }
 
@@ -5848,6 +6695,7 @@ static void library_scan_stop_and_wait(void) {
 	if (!scan_running) {
 		return;
 	}
+	scan_stop_asked = true;
 	scan_cancel = true;
 
 	for (int i = 0; i < 400 && scan_running; i++) {
@@ -7034,25 +7882,10 @@ int library_search(const char *query, int per_category, library_search_cb_t cb, 
 		return 0;
 	}
 
-	// The pattern, folded the way foldcase() folds the rows, and with LIKE's own
-	// two wildcards escaped: a query is a piece of a name, so a user typing "_"
-	// means an underscore and not "any character".
-	char folded[256];
-	if (fold_text(query, folded, sizeof(folded)) == 0) {
+	char like[2 * 256 + 3];
+	if (!search_pattern(query, like, sizeof(like))) {
 		return 0;
 	}
-
-	char like[2 * sizeof(folded) + 3];
-	size_t at = 0;
-	like[at++] = '%';
-	for (size_t i = 0; folded[i]; i++) {
-		if (folded[i] == '%' || folded[i] == '_' || folded[i] == '\\') {
-			like[at++] = '\\';
-		}
-		like[at++] = folded[i];
-	}
-	like[at++] = '%';
-	like[at] = '\0';
 
 	int total = 0;
 

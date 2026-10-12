@@ -104,6 +104,20 @@ void storage_recheck_card(void);
 // Call it last, after anything that still writes to the card.
 void storage_release_for_shutdown(void);
 
+// "Lock keys while the screen is off": with it on, volume down + power pressed
+// with the screen off locks the buttons on the case, and pressed again unlocks
+// them. Locked, they are ignored while the screen is off; the power key and the
+// headphone remote keep working. Turning the option off drops the lock. Off
+// until set.
+void input_set_key_lock(bool on);
+
+// How far one press of a volume key moves the volume, in percent: on the case,
+// on the headphone cable and from Bluetooth headphones alike. Clamped to
+// VOLUME_STEP_MIN..VOLUME_STEP_MAX; VOLUME_STEP_MIN until set.
+#define VOLUME_STEP_MIN 1
+#define VOLUME_STEP_MAX 5
+void input_set_volume_step(int percent);
+
 #ifdef HOST_BUILD
 // Feeds one key press or release to the button thread, as if it had come off
 // an evdev node. `code` is a KEY_* from linux/input.h.

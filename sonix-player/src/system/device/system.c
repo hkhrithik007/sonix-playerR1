@@ -574,7 +574,8 @@ static int mount_ntfs_rw(const char *device, const char *mount_point) {
 		if (pid == 0) {
 			// big_writes and the default uid/gid: the player is the only user of
 			// this card, and the helper otherwise leaves everything owned by
-			// whoever mounted it.
+			// whoever mounted it. The helper stays running as the filesystem.
+			logging_child_stdio();
 			execl(helpers[i], helpers[i], device, mount_point, "-o", "big_writes,noatime", (char *)NULL);
 			_exit(127);
 		}
@@ -916,8 +917,75 @@ void storage_recheck_card(void) {
 	pthread_mutex_unlock(&card_lock);
 }
 
-// Every descriptor of this process that points into the card, for the log
-// when the card cannot be released.
+static bool path_on_card(const char *path, const char *root, size_t root_len) {
+	return strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0');
+}
+
+// One process's hold on the card: its working directory, its descriptors and
+// its mapped files. The player's own log, reopened to report this, is left out.
+static void log_process_on_card(int pid, const char *root, size_t root_len, const char *log_file) {
+	bool self = pid == (int)getpid();
+	char path[64], target[PATH_MAX], name[32] = "?";
+
+	snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+	FILE *comm = fopen(path, "re");
+	if (comm) {
+		if (fgets(name, sizeof(name), comm)) {
+			name[strcspn(name, "\n")] = '\0';
+		}
+		fclose(comm);
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
+	ssize_t n = readlink(path, target, sizeof(target) - 1);
+	if (n > 0) {
+		target[n] = '\0';
+		if (path_on_card(target, root, root_len)) {
+			fprintf(stderr, "storage:   on the card: %s (%s, pid %d, working directory)\n", target, name, pid);
+		}
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/fd", pid);
+	DIR *dir = opendir(path);
+	if (dir) {
+		struct dirent *de;
+		while ((de = readdir(dir)) != NULL) {
+			char link[64];
+			snprintf(link, sizeof(link), "/proc/%d/fd/%.16s", pid, de->d_name);
+			n = readlink(link, target, sizeof(target) - 1);
+			if (n <= 0) {
+				continue;
+			}
+			target[n] = '\0';
+			if (!path_on_card(target, root, root_len) || (self && strcmp(target, log_file) == 0)) {
+				continue;
+			}
+			fprintf(stderr, "storage:   on the card: %s (%s, pid %d, fd %s)\n", target, name, pid, de->d_name);
+		}
+		closedir(dir);
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	FILE *maps = fopen(path, "re");
+	if (maps) {
+		char line[PATH_MAX + 128], last[PATH_MAX] = "";
+		while (fgets(line, sizeof(line), maps)) {
+			char *file = strchr(line, '/');
+			if (!file) {
+				continue;
+			}
+			file[strcspn(file, "\n")] = '\0';
+			if (path_on_card(file, root, root_len) && strcmp(file, last) != 0) {
+				snprintf(last, sizeof(last), "%s", file);
+				fprintf(stderr, "storage:   on the card: %s (%s, pid %d, mapped)\n", file, name, pid);
+			}
+		}
+		fclose(maps);
+	}
+}
+
+// Every process holding something on the card, for the log when the card
+// cannot be released.
 static void log_open_on_card(void) {
 	char root[PATH_MAX];
 	if (!realpath(sd_root, root)) {
@@ -925,24 +993,23 @@ static void log_open_on_card(void) {
 	}
 	size_t root_len = strlen(root);
 
-	DIR *dir = opendir("/proc/self/fd");
-	if (!dir) {
+	char log_file[PATH_MAX];
+	if (!realpath(logging_path(), log_file)) {
+		log_file[0] = '\0';
+	}
+
+	DIR *proc = opendir("/proc");
+	if (!proc) {
 		return;
 	}
-	struct dirent *de;
-	while ((de = readdir(dir)) != NULL) {
-		char link[16 + sizeof(de->d_name)], target[PATH_MAX];
-		snprintf(link, sizeof(link), "/proc/self/fd/%s", de->d_name);
-		ssize_t n = readlink(link, target, sizeof(target) - 1);
-		if (n <= 0) {
-			continue;
-		}
-		target[n] = '\0';
-		if (strncmp(target, root, root_len) == 0 && (target[root_len] == '/' || target[root_len] == '\0')) {
-			fprintf(stderr, "storage:   still open on the card: %s (fd %s)\n", target, de->d_name);
+	struct dirent *pe;
+	while ((pe = readdir(proc)) != NULL) {
+		int pid = atoi(pe->d_name);
+		if (pid > 0) {
+			log_process_on_card(pid, root, root_len, log_file);
 		}
 	}
-	closedir(dir);
+	closedir(proc);
 }
 
 void storage_release_for_shutdown(void) {
@@ -1137,11 +1204,10 @@ static void log_key_event(const char *node, const struct input_event *ev) {
 // ---------------------------------------------------------------------------
 
 // How long a volume key waits before it starts repeating, and how fast it goes
-// once it does. One step is small enough that a quick tap is a fine adjustment
-// and a hold sweeps the whole range in a few seconds.
+// once it does. One step of the smallest size is small enough that a quick tap
+// is a fine adjustment and a hold sweeps the whole range in a few seconds.
 #define VOLUME_REPEAT_DELAY_MS 400
 #define VOLUME_REPEAT_PERIOD_MS 70
-#define VOLUME_STEP_PERCENT 1
 
 // Hold the power key this long and the shutdown menu comes up instead of the
 // screen simply toggling.
@@ -1153,30 +1219,83 @@ static uint32_t now_ms(void) {
 	return (uint32_t)(ts.tv_sec * 1000) + (uint32_t)(ts.tv_nsec / 1000000);
 }
 
+// How far one press of a volume key moves the volume, in percent (Settings >
+// More > Volume steps). Read by the key threads, written by the interface.
+static volatile int volume_step_percent = VOLUME_STEP_MIN;
+
+void input_set_volume_step(int percent) {
+	if (percent < VOLUME_STEP_MIN) {
+		percent = VOLUME_STEP_MIN;
+	}
+	if (percent > VOLUME_STEP_MAX) {
+		percent = VOLUME_STEP_MAX;
+	}
+	volume_step_percent = percent;
+}
+
+// One step up or down, as a signed change of the volume.
+static int volume_step_delta(int code) {
+	int step = volume_step_percent;
+	return code == KEY_VOLUMEUP ? step : -step;
+}
+
 // The keys always move the volume, over Bluetooth as over the jack: the step
 // reaches the stream itself, so synchronised, bluealsa passes it on to the
 // headphones, and separate, bluealsa attenuates on this side.
 static void apply_volume_step(int code) {
-	device_state_change_volume_percent(code == KEY_VOLUMEUP ? VOLUME_STEP_PERCENT : -VOLUME_STEP_PERCENT);
+	device_state_change_volume_percent(volume_step_delta(code));
 	gui_notify_volume(device_state_get_volume_percent());
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot: volume up + power
+// Key lock: volume down + power, with the screen off
 //
-// The state lives out here under a lock because the two keys can arrive on
+// The option in Power settings does not lock anything by itself: it arms the
+// gesture. With the screen off, volume down + power locks the buttons on the
+// case, and the same gesture unlocks them. Locked, they do nothing while the
+// screen is off; the power key and the headphone remote are never locked, and
+// with the screen on everything works as usual.
+//
+// The lock stays engaged across screen-on and screen-off until the gesture
+// releases it, and is dropped with the option. It is not saved: a restart
+// starts unlocked.
+// ---------------------------------------------------------------------------
+
+static volatile bool key_lock_when_off; // the option: the gesture is armed
+static volatile bool key_lock_engaged;	// the gesture's state
+
+void input_set_key_lock(bool on) {
+	key_lock_when_off = on;
+	if (!on) {
+		key_lock_engaged = false;
+	}
+}
+
+// Whether volume down + power, pressed now, is the lock gesture.
+static bool key_lock_gesture_armed(void) { return key_lock_when_off && !power_screen_is_on(); }
+
+static bool keys_locked(void) { return key_lock_when_off && key_lock_engaged && !power_screen_is_on(); }
+
+// ---------------------------------------------------------------------------
+// Key combinations: volume up + power (screenshot), volume down + power (key
+// lock, see above)
+//
+// The state lives out here under a lock because the keys can arrive on
 // different input nodes, and each node has its own thread: the one seeing the
 // volume key would never see the other's power key.
 //
-// When the combination fires both keys must be consumed: the volume must not go
-// up and power must not blank the screen on release. It rearms only once both
-// are back up -- otherwise holding them down would fire a burst of screenshots.
+// When a combination fires its keys must be consumed: the volume must not move
+// and power must not toggle the screen on release. It rearms only once all of
+// them are back up -- otherwise holding them down would fire a burst.
 // ---------------------------------------------------------------------------
 
 static pthread_mutex_t combo_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool combo_vol_down;
-static bool combo_power_down;
+static bool combo_up_held;
+static bool combo_down_held;
+static bool combo_power_held;
 static bool combo_fired;
+
+static bool combo_key(int code) { return code == KEY_VOLUMEUP || code == KEY_VOLUMEDOWN || code == KEY_POWER; }
 
 static bool combo_active(void) {
 	pthread_mutex_lock(&combo_lock);
@@ -1188,51 +1307,66 @@ static bool combo_active(void) {
 // True when this key is part of a fired combination and so must not do what it
 // would do on its own.
 static bool combo_press(int code) {
-	if (code != KEY_VOLUMEUP && code != KEY_POWER) {
+	if (!combo_key(code)) {
 		return false;
 	}
 
-	// Read outside the lock: it reads the configuration, and the option does not
-	// change a thousand times a second.
-	bool enabled = screenshot_enabled();
+	// Read outside the lock: they read the configuration and the screen state,
+	// and neither changes a thousand times a second.
+	bool screenshot = screenshot_enabled();
+	bool lock = key_lock_gesture_armed();
 
-	bool fire = false;
+	bool fire_screenshot = false;
+	bool fire_lock = false;
 	pthread_mutex_lock(&combo_lock);
 	if (code == KEY_VOLUMEUP) {
-		combo_vol_down = true;
+		combo_up_held = true;
+	} else if (code == KEY_VOLUMEDOWN) {
+		combo_down_held = true;
 	} else {
-		combo_power_down = true;
+		combo_power_held = true;
 	}
-	if (combo_vol_down && combo_power_down && !combo_fired && enabled) {
-		combo_fired = true;
-		fire = true;
+	if (combo_power_held && !combo_fired) {
+		if (combo_up_held && screenshot) {
+			combo_fired = true;
+			fire_screenshot = true;
+		} else if (combo_down_held && lock) {
+			combo_fired = true;
+			fire_lock = true;
+		}
 	}
 	bool active = combo_fired;
 	pthread_mutex_unlock(&combo_lock);
 
-	if (fire) {
+	if (fire_screenshot) {
 		printf("input: volume up + power -> screenshot\n");
 		screenshot_request();
+	}
+	if (fire_lock) {
+		key_lock_engaged = !key_lock_engaged;
+		printf("input: volume down + power -> keys %s\n", key_lock_engaged ? "locked" : "unlocked");
 	}
 	return active;
 }
 
 // True when the release must be ignored.
 static bool combo_release(int code) {
-	if (code != KEY_VOLUMEUP && code != KEY_POWER) {
+	if (!combo_key(code)) {
 		return false;
 	}
 
 	pthread_mutex_lock(&combo_lock);
 	if (code == KEY_VOLUMEUP) {
-		combo_vol_down = false;
+		combo_up_held = false;
+	} else if (code == KEY_VOLUMEDOWN) {
+		combo_down_held = false;
 	} else {
-		combo_power_down = false;
+		combo_power_held = false;
 	}
 	bool consumed = combo_fired;
-	// Rearm only with both back up: releasing one and pressing it again must not
-	// fire the combination by itself.
-	if (!combo_vol_down && !combo_power_down) {
+	// Rearm only with all of them back up: releasing one and pressing it again
+	// must not fire the combination by itself.
+	if (!combo_up_held && !combo_down_held && !combo_power_held) {
 		combo_fired = false;
 	}
 	pthread_mutex_unlock(&combo_lock);
@@ -1600,11 +1734,11 @@ static void *input_thread_func(void *arg) {
 				run_mapped_action(keymap_button_for_code(code));
 			}
 
-			// While the screenshot combination is active these two keys are no
-			// longer themselves: the volume does not rise and the power menu
-			// does not open. The check is here and not only on press because the
-			// combination can complete LATER, on the other node's thread, while
-			// this one is already repeating.
+			// While a combination is active its keys are no longer themselves:
+			// the volume does not move and the power menu does not open. The
+			// check is here and not only on press because the combination can
+			// complete LATER, on the other node's thread, while this one is
+			// already repeating.
 			bool suppressed = combo_active();
 
 			// The wait may have ended for another deadline than the held key's.
@@ -1656,14 +1790,30 @@ static void *input_thread_func(void *arg) {
 			continue;
 		}
 
+		// Keys locked by the gesture: the buttons on the case do nothing while
+		// the panel is dark. The power key is not one of them. A release still
+		// closes a press that went down before the lock. Volume down is still
+		// counted towards the combination, or the lock could not be undone.
+		if (!info->headset && keymap_button_for_code(ev.code) != KEYMAP_BTN_COUNT && keys_locked() &&
+			(ev.value != 0 || ev.code != held)) {
+			if (ev.code == KEY_VOLUMEDOWN) {
+				if (ev.value == 1) {
+					combo_press(ev.code);
+				} else if (ev.value == 0) {
+					combo_release(ev.code);
+				}
+			}
+			continue;
+		}
+
 		if (ev.value == 1) {
 			power_notify_activity(); // any physical button counts as use
 
-			// Volume up + power: if the combination has fired -- now, or because
-			// the other key was already down -- this key belongs to it. The
-			// volume key on the case only: the remote's is not under the thumb
-			// that presses power, and one stuck down would turn every later
-			// press of power into a screenshot.
+			// Volume + power: if a combination has fired -- now, or because the
+			// other key was already down -- this key belongs to it. The volume
+			// keys on the case only: the remote's are not under the thumb that
+			// presses power, and one stuck down would turn every later press of
+			// power into a screenshot or a lock.
 			bool combo = !info->headset && combo_press(ev.code);
 
 			// A scrub still open from a button whose release never arrived --
@@ -1716,6 +1866,11 @@ static void *input_thread_func(void *arg) {
 				deferred = true;
 			} else if (seeks) {
 				deferred = true;
+			} else if (!info->headset && ev.code == KEY_VOLUMEDOWN && key_lock_gesture_armed()) {
+				// Possibly the first half of the lock gesture, with power to
+				// follow: what it does on its own waits for the release, or
+				// for the hold to start repeating it.
+				deferred = true;
 			} else if (info->headset && ev.code == KEY_PLAYPAUSE) {
 				// Counted, not acted on: see hookclicks.h.
 				hook_clicks_press(&hook, held_since);
@@ -1749,9 +1904,10 @@ static void *input_thread_func(void *arg) {
 						dbl_code = ev.code;
 						dbl_until = now_ms() + DOUBLE_CLICK_MS;
 					}
-				} else if (deferred && !seeked && !combo) {
+				} else if (deferred && !seeked && !held_repeated && !combo) {
 					// A skip button let go before it became a seek: now it
-					// skips.
+					// skips. Likewise a deferred volume down let go before it
+					// started repeating.
 					run_mapped_action(keymap_button_for_code(ev.code));
 				}
 				// And one that did become a seek: this is where the music moves
@@ -2149,7 +2305,7 @@ static void handle_bt_remote_key(const char *node, int code, bool usb) {
 	// here the headphones themselves are asking, so it is carried out.
 	case KEY_VOLUMEUP:
 	case KEY_VOLUMEDOWN:
-		device_state_change_volume_percent(code == KEY_VOLUMEUP ? VOLUME_STEP_PERCENT : -VOLUME_STEP_PERCENT);
+		device_state_change_volume_percent(volume_step_delta(code));
 		gui_notify_volume(device_state_get_volume_percent());
 		break;
 

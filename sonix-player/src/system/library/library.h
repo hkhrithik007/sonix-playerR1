@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // The music index.
 //
@@ -99,13 +100,26 @@ typedef enum {
 	LIBRARY_SPLIT_COMMA = 1 << 3,	  // ,
 	LIBRARY_SPLIT_FEAT = 1 << 4,	  // feat., ft., featuring, as a word
 	LIBRARY_SPLIT_VS = 1 << 5,		  // vs., versus, as a word
+	LIBRARY_SPLIT_X = 1 << 6,		  // x as a word, lower case, and the sign
+	LIBRARY_SPLIT_PLUS = 1 << 7,	  // +
+	LIBRARY_SPLIT_WITH = 1 << 8,	  // with, as a word
+	LIBRARY_SPLIT_AND = 1 << 9,		  // and, as a word
 } library_split_t;
+
+// The full-width forms CJK tags are written with count as the separator they
+// stand for: ／ as /, ＆ as &, ；as ;, ， and 、 as a comma, ＋ as +.
 
 // [library] split_artists (off) and artist_separators (; / & feat.).
 bool library_split_artists(void);
 void library_set_split_artists(bool on);
 unsigned library_artist_separators(void);
 void library_set_artist_separators(unsigned separators);
+
+// [library] split_album_artists (off): the album artist split as well, at the
+// artist separators and with the same exceptions, so a record by "A & B" is
+// listed under A and under B in Album artists. Only with split_artists on.
+bool library_split_album_artists(void);
+void library_set_split_album_artists(bool on);
 
 // [library] split_genres (off) and genre_separators (; / ,).
 bool library_split_genres(void);
@@ -223,6 +237,13 @@ typedef enum {
 	LIBRARY_LIST_GENRES,
 	LIBRARY_LIST_FAVOURITES, // in order of addition, oldest first
 	LIBRARY_LIST_PLAYLIST,	 // one playlist's own table, in the order it was built
+	// The years the records came out in, latest first: one row per year that
+	// at least one album has (an album's year is its tracks' latest, as
+	// LIBRARY_ORDER_YEAR reads it). A row's name is the year. Handles only.
+	LIBRARY_LIST_YEARS,
+	// The tracks played most, most plays first: those still in the index that
+	// library_note_play() has counted. Handles only.
+	LIBRARY_LIST_MOST_PLAYED,
 } library_list_t;
 
 // Fills `out` with up to `max` names, in the collation's order (see above).
@@ -237,6 +258,13 @@ typedef enum {
 	LIBRARY_FILTER_ARTIST,
 	LIBRARY_FILTER_ALBUM_ARTIST,
 	LIBRARY_FILTER_GENRE,
+	// The tracks, albums or artists whose name contains the value, matched the
+	// way library_search() matches. For the handles below only.
+	LIBRARY_FILTER_SEARCH,
+	// The albums of one year, the value being the year, and the tracks of
+	// those albums: an album whose tracks carry different years is filed under
+	// the latest of them, here as in LIBRARY_ORDER_YEAR. For the handles only.
+	LIBRARY_FILTER_YEAR,
 } library_filter_t;
 
 // Streams the whole result set, sorted by the collation, one row per call:
@@ -258,6 +286,13 @@ typedef enum {
 	LIBRARY_ORDER_ADDED,	   // by when the file landed on the card, oldest
 							   // first; all tracks, albums, artists and album
 							   // artists only (a row is as new as its newest file)
+	LIBRARY_ORDER_YEAR,		   // by release year, earliest first; all tracks and
+							   // all albums only (an album's year is its tracks'
+							   // latest). Rows with no year come last.
+	LIBRARY_ORDER_YEAR_DESC,   // the same, latest first, and still with the rows
+							   // that have no year last -- which is why it is an
+							   // order of its own and not the one above read
+							   // backwards
 } library_order_t;
 int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order,
 							 library_row_cb cb, void *user);
@@ -265,6 +300,15 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 // Looks a track's display title up by its file path (the scan stored it).
 // False when the file is not in the index; `out` untouched then.
 bool library_track_title(const char *path, char *out, size_t out_size);
+
+// Where each of `count` paths sits on its record, as the scan stored it: the
+// album, the disc (1 when the file has no disc tag) and the track number (0
+// when it has none). `cb` is called once for every path the index holds, with
+// its position in `paths`, and never for one it does not. Called with the
+// index locked: `cb` must not call back into the library. Returns how many
+// were found.
+typedef void (*library_place_cb)(size_t index, const char *album, int disc, int track, void *user);
+size_t library_track_places(const char *const *paths, size_t count, library_place_cb cb, void *user);
 
 // An album is its name AND whose it is: two records called "Greatest Hits" by
 // two different artists are two albums. Whose is the album artist, the artist
@@ -317,6 +361,25 @@ bool library_track_names(const char *path, char *title_out, size_t title_size, c
 // when the album has no tracks. `album` is an album value (see above).
 bool library_album_artist(const char *album, char *out, size_t size);
 
+// What the head of an album's page says about it: the artist it is credited
+// to (as library_album_artist() names it), the genre of its first track, and
+// its year -- the latest any of its tracks carries, the same year the Albums
+// list sorts it by. Empty strings and a year of 0 for what the tags do not
+// say. False when the album has no tracks. `album` is an album value.
+typedef struct {
+	char artist[256];
+	char genre[128];
+	int year;
+} library_album_info_t;
+bool library_album_info(const char *album, library_album_info_t *out);
+
+// The disc and the track number of every track of one album, in the order its
+// track list runs (by disc, then by track number), into disc[] and track[].
+// A track with no disc tag is on disc 1 and one with no number is track 0.
+// Either array may be NULL. Returns how many tracks there are, which can be
+// more than `max`: only the first `max` are written.
+int library_album_places(const char *album, uint16_t *disc, uint16_t *track, int max);
+
 // --- Audio quality ---
 //
 // Which of four badges a track earns, from what the scan wrote down: the
@@ -345,6 +408,10 @@ library_quality_t library_track_quality(const char *path, int *rate_out, int *bi
 // Stars/unstars a track. Returns the new state (true = it is now a favourite).
 bool library_fav_toggle(const char *path, const char *name, const char *artist);
 
+// One more play of `path`, counted for the Most played list. Called once a
+// play has gone on long enough to count (playcount.h).
+void library_note_play(const char *path);
+
 bool library_fav_contains(const char *path);
 
 // Stars every track in `rows` that is not starred yet, in one transaction and
@@ -360,6 +427,13 @@ int library_fav_add_many(const library_fav_row_t *rows, int count);
 // Unstars every track in `paths`, in one transaction. Returns how many were
 // favourites and are not any more.
 int library_fav_remove_many(const char *const *paths, int count);
+
+// Takes out of the index the tracks of files that have been deleted: each path
+// a file, a cue sheet or a folder, and of the tracks it stands for only those
+// whose file is no longer on the card -- so a delete that stopped halfway
+// leaves in what it left behind. Their favourites and play counts go with
+// them. Returns how many tracks went.
+int library_forget_deleted(const char *const *paths, int count);
 
 // Removes from the favourites (and from the saved playback state) everything
 // under `prefix`. It is what clears rows pointing into the stream cache, whose
