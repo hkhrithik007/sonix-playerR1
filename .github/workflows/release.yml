@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - spotui
       - beta-releases
 
   workflow_dispatch:
@@ -26,7 +27,7 @@ env:
   SPOTUI_RELEASE_TAG: spotui
 
   # Canonical working SpotUI source.
-  SPOTUI_REPOSITORY: https://github.com/hkhrithik007/spotui-hiby-r1.git
+  SPOTUI_REPOSITORY: https://github.com/noisetta/spotui-hiby-r3proii.git
   SPOTUI_REF: main
   R1_UI_PATCH_VERSION: v5-robust-no-wlan0-startup
   R1_PLAYBACK_PATCH_VERSION: symphonia-codec-vorbis-0.5.5-integer-root-v1
