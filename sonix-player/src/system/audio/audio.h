@@ -115,6 +115,10 @@ unsigned audio_loop_turns(void);
 void audio_set_gapless(bool enabled);
 bool audio_get_gapless(void);
 
+// Bypass software processing for bit-perfect wired playback.
+void audio_set_bit_perfect(bool on);
+bool audio_get_bit_perfect(void);
+
 // Fade: ramp the last seconds of a track down to silence and the first seconds
 // of the next up from it. One decoder means the two cannot truly overlap, so
 // this is the ramp-out/ramp-in version of the effect. `seconds` is clamped to

@@ -74,6 +74,8 @@ void sx_mini_hide_on_screen(lv_obj_t *screen);
 // Looks again at whether it should be up: called when the page changes and
 // when a keyboard comes or goes.
 void sx_mini_update_visibility(void);
+// Set by the frame when the active page scroller reaches its end.
+void sx_mini_set_page_bottom(bool at_bottom);
 
 // A temporary full-panel input on this screen owns the mini-player slot.
 void sx_mini_input_overlay(lv_obj_t *screen, bool active);

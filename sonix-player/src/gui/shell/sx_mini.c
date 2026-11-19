@@ -57,6 +57,7 @@ static bool live;
 static bool playing;
 static bool player_open;
 static bool shown;
+static bool page_bottom;
 
 #define HIDDEN_SCREENS_MAX 16
 static lv_obj_t *hidden_screens[HIDDEN_SCREENS_MAX];
@@ -125,7 +126,7 @@ void sx_mini_update_visibility(void) {
 		return;
 	}
 	lv_obj_t *screen = lv_screen_active();
-	bool want = has_track && !player_open && !screen_hides_mini(screen) && !keyboard_shown_on(screen) && screen != input_overlay_screen;
+	bool want = has_track && !player_open && !page_bottom && !screen_hides_mini(screen) && !keyboard_shown_on(screen) && screen != input_overlay_screen;
 	bool changed = layout_compact != compact_mode();
 	if (want == shown && !changed) {
 		return;
@@ -139,6 +140,12 @@ void sx_mini_update_visibility(void) {
 	lv_obj_set_hidden(slot, !want);
 	player_mini_mode_changed();
 	sx_frame_slot_changed();
+}
+
+void sx_mini_set_page_bottom(bool at_bottom) {
+	if (page_bottom == at_bottom) return;
+	page_bottom = at_bottom;
+	sx_mini_update_visibility();
 }
 
 void sx_mini_player_shown(bool open) {

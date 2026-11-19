@@ -18,6 +18,7 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/sx_palette.h"
 #include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_toast.h"
 #include "src/gui/shell/sx_styles.h"
 #include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
@@ -30,6 +31,7 @@
 #include "src/gui/wireless/wifisettings.h"
 #include "src/gui/wireless/wifitransfer.h"
 #include "src/system/audio/alsa-controls.h"
+#include "src/system/audio/audio.h"
 #include "src/system/audio/eq.h"
 #include "src/system/audio/usbdac.h"
 #include "src/system/bluetooth/bluetooth.h"
@@ -1175,6 +1177,14 @@ static void refresh_audio_buttons(void) {
 	circle_button_set_on(sonixlink_btn, sonixlink_get_enabled());
 	circle_button_set_on(dlna_btn, dlna_get_enabled());
 	circle_button_set_on(peq_btn, peq_get_enabled());
+	bool pure = audio_get_bit_perfect();
+	lv_obj_t *effects[] = {eq_btn, mseb_btn, peq_btn, fade_btn};
+	for (size_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++) {
+		if (effects[i]) {
+			lv_obj_set_state(effects[i], LV_STATE_DISABLED, pure);
+			lv_obj_set_style_opa(effects[i], pure ? LV_OPA_40 : LV_OPA_COVER, 0);
+		}
+	}
 	circle_button_set_on(sleep_music_btn, sleep_timer_armed(SLEEPTIMER_MUSIC));
 	if (sleep_music_btn) {
 		char caption[96];
@@ -1357,6 +1367,10 @@ static void mseb_clicked_cb(lv_event_t *e) {
 		long_press_consumed = false;
 		return; // the long press that opened the page must not also toggle
 	}
+	if (audio_get_bit_perfect()) {
+		sx_toast(tr("bit_perfect_holds_off"));
+		return;
+	}
 	musicsettings_set_mseb_enabled(!mseb_get_enabled());
 	toggled();
 }
@@ -1367,6 +1381,10 @@ static void eq_clicked_cb(lv_event_t *e) {
 		long_press_consumed = false;
 		return;
 	}
+	if (audio_get_bit_perfect()) {
+		sx_toast(tr("bit_perfect_holds_off"));
+		return;
+	}
 	musicsettings_set_eq_enabled(!eq_get_enabled());
 	toggled();
 }
@@ -1375,6 +1393,10 @@ static void fade_clicked_cb(lv_event_t *e) {
 	(void)e;
 	if (long_press_consumed) {
 		long_press_consumed = false;
+		return;
+	}
+	if (audio_get_bit_perfect()) {
+		sx_toast(tr("bit_perfect_holds_off"));
 		return;
 	}
 	musicsettings_set_fade_enabled(!musicsettings_fade_enabled());
@@ -1491,6 +1513,10 @@ static void peq_clicked_cb(lv_event_t *e) {
 	(void)e;
 	if (long_press_consumed) {
 		long_press_consumed = false;
+		return;
+	}
+	if (audio_get_bit_perfect()) {
+		sx_toast(tr("bit_perfect_holds_off"));
 		return;
 	}
 	peq_set_enabled(!peq_get_enabled());

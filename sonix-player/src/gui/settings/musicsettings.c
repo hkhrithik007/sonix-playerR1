@@ -2022,9 +2022,76 @@ static void build_playback_page(gui_config_t *cfg) {
 	switcher_attach_back_gesture(playback_screen);
 }
 
+static lv_obj_t *bit_perfect_switch;
+#define BP_SECTION "bit_perfect_hold"
+
+static bool bp_saved(const char *key) { return config_get_int(BP_SECTION, key, 0) != 0; }
+static void bp_note(const char *key, long value) { config_set_int(BP_SECTION, key, value); }
+
+static void bit_perfect_paint(void) {
+	bool on = audio_get_bit_perfect();
+	lv_obj_t *rows[] = {eq_row, peq_row, mseb_row, soundfield_row, crossfeed_row, balance_row, fade_card, rg_card};
+	for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		if (rows[i]) {
+			lv_obj_set_state(rows[i], LV_STATE_DISABLED, on);
+			lv_obj_set_style_opa(rows[i], on ? LV_OPA_40 : LV_OPA_COVER, 0);
+		}
+	}
+	lv_obj_t *controls[] = {fade_switch, fade_slider, rg_switch, mono_switch};
+	for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+		if (controls[i]) lv_obj_set_state(controls[i], LV_STATE_DISABLED, on);
+	}
+}
+
+static void bit_perfect_hold(bool on) {
+	if (on == bp_saved("held")) return;
+	if (on) {
+		bp_note("replaygain", replaygain_mode());
+		bp_note("eq", eq_get_enabled());
+		bp_note("peq", peq_get_enabled());
+		bp_note("mseb", mseb_get_enabled());
+		bp_note("soundfield", soundfield_get_enabled());
+		bp_note("crossfeed", crossfeed_get_enabled());
+		bp_note("balance", balance_get_enabled());
+		bp_note("mono", mono_get_enabled());
+		bp_note("fade", musicsettings_fade_enabled());
+		bp_note("held", 1);
+		config_save();
+	}
+	replaygain_set_mode(on ? REPLAYGAIN_OFF : (replaygain_mode_t)config_get_int(BP_SECTION, "replaygain", REPLAYGAIN_OFF));
+	rg_apply_to_loaded_track();
+	rg_refresh();
+	musicsettings_set_eq_enabled(!on && bp_saved("eq"));
+	peq_set_enabled(!on && bp_saved("peq"));
+	musicsettings_set_mseb_enabled(!on && bp_saved("mseb"));
+	soundfield_set_enabled(!on && bp_saved("soundfield"));
+	if (soundfield_switch) soundfield_refresh();
+	crossfeed_set_enabled(!on && bp_saved("crossfeed"));
+	if (crossfeed_switch) crossfeed_refresh();
+	balance_set_enabled(!on && bp_saved("balance"));
+	if (balance_switch) balance_refresh();
+	mono_set_enabled(!on && bp_saved("mono"));
+	if (mono_switch) lv_obj_set_state(mono_switch, LV_STATE_CHECKED, mono_get_enabled());
+	musicsettings_set_fade_enabled(!on && bp_saved("fade"));
+	bp_note("held", on ? 1 : 0);
+	config_save();
+	refresh_active_chevrons();
+}
+
+static void bit_perfect_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(bit_perfect_switch, LV_STATE_CHECKED);
+	config_set_int("audio", "bit_perfect", on ? 1 : 0);
+	config_save();
+	audio_set_bit_perfect(on);
+	bit_perfect_hold(on);
+	bit_perfect_paint();
+}
+
 static void musicsettings_loaded_cb(lv_event_t *e) {
 	(void)e;
 	rg_refresh();
+	bit_perfect_paint();
 }
 
 void musicsettings_init(gui_config_t *cfg) {
@@ -2050,6 +2117,12 @@ void musicsettings_init(gui_config_t *cfg) {
 
 	listenbrainzsettings_init(cfg);
 	settingsrow_add(container, "listenbrainz", NULL, switch_screen_cb, listenbrainzsettings_screen());
+
+	bool bit_perfect_on = config_get_int("audio", "bit_perfect", 0) != 0;
+	settingsrow_toggle(container, "musicsettings_bit_perfect", &bit_perfect_switch, bit_perfect_toggle_cb);
+	option_note(container, "bit_perfect_holds_off");
+	if (bit_perfect_on) lv_obj_add_state(bit_perfect_switch, LV_STATE_CHECKED);
+	audio_set_bit_perfect(bit_perfect_on);
 
 	build_eq_page(cfg);
 	eq_row = settingsrow_add(container, "equaliser", NULL, switch_screen_cb, eq_screen);
@@ -2138,4 +2211,6 @@ void musicsettings_init(gui_config_t *cfg) {
 	// The parametric equaliser's chevron, which no setter on this page repaints,
 	// follows the control centre's button while the page is under it.
 	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_REFRESH, NULL);
+	bit_perfect_hold(bit_perfect_on);
+	bit_perfect_paint();
 }

@@ -78,6 +78,18 @@ static follower_t *find_follower(lv_obj_t *obj) {
 	return NULL;
 }
 
+static void scroller_scroll_cb(lv_event_t *e) {
+	lv_obj_t *obj = lv_event_get_target(e);
+	int32_t bottom = lv_obj_get_scroll_bottom(obj);
+	if (bottom <= 2) {
+		sx_mini_set_page_bottom(true);
+	} else if (bottom > SX_MINI_SLOT_H / 2) {
+		// Hysteresis keeps the bar hidden while its own slot padding is being
+		// removed, then restores it once the user has scrolled away from the end.
+		sx_mini_set_page_bottom(false);
+	}
+}
+
 static void follow(lv_obj_t *obj, follow_kind_t kind) {
 	if (!obj || find_follower(obj)) {
 		return;
@@ -99,7 +111,11 @@ static void follow(lv_obj_t *obj, follow_kind_t kind) {
 	apply_follower(f);
 }
 
-void sx_frame_reserve_bottom(lv_obj_t *scroller) { follow(scroller, FOLLOW_RESERVE); }
+void sx_frame_reserve_bottom(lv_obj_t *scroller) {
+	bool fresh = scroller && !find_follower(scroller);
+	follow(scroller, FOLLOW_RESERVE);
+	if (fresh && find_follower(scroller)) lv_obj_add_event_cb(scroller, scroller_scroll_cb, LV_EVENT_SCROLL, NULL);
+}
 
 void sx_frame_lift(lv_obj_t *obj) { follow(obj, FOLLOW_LIFT); }
 
@@ -218,6 +234,7 @@ void sx_frame_page_shown(lv_obj_t *screen) {
 	if (!screen || !frame_cfg) {
 		return;
 	}
+	sx_mini_set_page_bottom(false);
 	treat(screen, (int32_t)frame_cfg->screen_height, 0);
 	place_idle_cards(screen);
 }
