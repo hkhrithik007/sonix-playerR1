@@ -366,7 +366,7 @@ static void wheel_event(lv_event_t *e) {
 		case WHEEL_MENU: back_btn_cb(NULL); return;
 		case WHEEL_PREV: player_screen_prev(); break;
 		case WHEEL_NEXT: player_screen_next(); break;
-		case WHEEL_PLAY_PAUSE: player_screen_play_pause(); break;
+		case WHEEL_PLAY_PAUSE: player_key_play_pause(); break;
 		default: return;
 		}
 		volume_shown = false;
@@ -556,7 +556,6 @@ static void build_wheel(void) {
 static void loaded(lv_event_t *e) {
 	(void)e;
 	topbar_set_hidden(true);
-	corners_set_suppressed(true);
 	update_display(NULL);
 	lv_timer_resume(display_timer);
 }
@@ -567,7 +566,6 @@ static void unloaded(lv_event_t *e) {
 	volume_shown = false;
 	lv_timer_pause(display_timer);
 	ipod_mode_release_artwork();
-	corners_set_suppressed(false);
 	back_btn_hide_on_screen(screen, false);
 }
 

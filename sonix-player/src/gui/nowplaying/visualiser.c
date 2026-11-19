@@ -655,7 +655,7 @@ static void frame_cb(lv_timer_t *t) {
 
 static void screen_loaded(lv_event_t *e) {
 	(void)e;
-	power_hold_screen_for_visualiser(true);
+	power_hold_screen_for_view(true);
 	topbar_set_hidden(true);
 	reveal_controls();
 	visualiser_audio_frame_t old;
@@ -670,7 +670,7 @@ static void screen_loaded(lv_event_t *e) {
 static void screen_unloaded(lv_event_t *e) {
 	(void)e;
 	hide_settings();
-	power_hold_screen_for_visualiser(false);
+	power_hold_screen_for_view(false);
 	visualiser_audio_set_active(false);
 	lv_timer_pause(timer);
 	lv_image_set_src(image, NULL);
