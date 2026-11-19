@@ -144,6 +144,7 @@ static bool back_goes_to_player(void) {
 // ---------------------------------------------------------------------------
 
 #define BACK_DRAG_COMMIT_PX 10	// sideways movement that starts the drag
+#define BACK_DRAG_EDGE_PX 32	// reserve the edge for the back gesture; rows can own the rest
 #define BACK_COMMIT_FRACTION 3	// release beyond width/3 goes back
 #define BACK_ANIM_MS 140
 
@@ -338,6 +339,7 @@ static void back_drag_cb(lv_event_t *e) {
 	}
 
 	if (code == LV_EVENT_PRESSED) {
+		back_dragging = false;
 		if (back_anim_running || player_sheet_is_open()) {
 			return; // the sheet has its own horizontal gestures
 		}
@@ -346,6 +348,9 @@ static void back_drag_cb(lv_event_t *e) {
 			return; // nowhere to go back to / scans exit through their buttons
 		}
 		lv_indev_get_point(indev, &back_drag_start);
+		if (back_drag_start.x > BACK_DRAG_EDGE_PX) {
+			return;
+		}
 		back_dragging = true;
 		back_drag_engaged = false;
 		return;

@@ -195,6 +195,10 @@ typedef struct {
 	lv_obj_t *check;	// the tick on a chosen row in selection mode
 	lv_obj_t *playmark; // the accent bar shown on the playing row
 	int index;
+	lv_point_t swipe_start;
+	bool swipe_tracking;
+	bool swipe_consumed;
+	int swipe_direction;
 
 	bool has_thumb;
 	bool thumb_requested;
@@ -2574,6 +2578,11 @@ static void row_clicked_cb(lv_event_t *e) {
 	}
 
 	panel_t *p = lv_event_get_user_data(e);
+	row_t *tapped_row = row_of_button(p, lv_event_get_current_target(e));
+	if (tapped_row && tapped_row->swipe_consumed) {
+		tapped_row->swipe_consumed = false;
+		return;
+	}
 	if (p->reordering) {
 		// The list is being arranged, not listened to. A tap that started a
 		// track here would replace what is playing with the entry the user was
@@ -3512,6 +3521,83 @@ static void menu_queue_action(void *user) {
 	}
 }
 
+static void row_swipe_cb(lv_event_t *e) {
+	panel_t *p = lv_event_get_user_data(e);
+	lv_obj_t *button = lv_event_get_current_target(e);
+	row_t *row = row_of_button(p, button);
+	if (!row) {
+		return;
+	}
+	lv_event_code_t code = lv_event_get_code(e);
+	if (code == LV_EVENT_PRESSED) {
+		row->swipe_tracking = p->is_tracks && !p->selecting && !p->reordering;
+		row->swipe_consumed = false;
+		row->swipe_direction = 0;
+		lv_indev_t *indev = lv_indev_active();
+		if (row->swipe_tracking && indev) {
+			lv_indev_get_point(indev, &row->swipe_start);
+			if (row->swipe_start.x <= 32) {
+				row->swipe_tracking = false; // reserve the edge for back navigation
+			}
+		}
+		return;
+	}
+	if (!row->swipe_tracking || p->selecting || p->reordering || player_sheet_drag_active() || switcher_back_drag_active()) {
+		if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+			row->swipe_tracking = false;
+		}
+		return;
+	}
+
+	lv_indev_t *indev = lv_indev_active();
+	if (!indev) {
+		row->swipe_tracking = false;
+		return;
+	}
+	lv_point_t point;
+	lv_indev_get_point(indev, &point);
+	int dx = point.x - row->swipe_start.x;
+	int dy = point.y - row->swipe_start.y;
+	if (code == LV_EVENT_PRESSING && lv_indev_get_scroll_obj(indev)) {
+		row->swipe_tracking = false;
+		return;
+	}
+	if (code == LV_EVENT_PRESSING && !row->swipe_consumed && LV_ABS(dx) >= 46 && LV_ABS(dx) > LV_ABS(dy) * 3 / 2) {
+		row->swipe_consumed = true;
+		row->swipe_direction = dx > 0 ? 1 : -1;
+		lv_event_stop_bubbling(e);
+		return;
+	}
+	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+		row->swipe_tracking = false;
+		if (code != LV_EVENT_RELEASED || !row->swipe_consumed) {
+			row->swipe_consumed = false;
+			return;
+		}
+		lv_event_stop_bubbling(e);
+		int index = row->index;
+		const char *name = NULL;
+		const char *path = NULL;
+		if (index < 0 || index >= p->count || !row_at(p, index, &name, &path) || !path || !path[0]) {
+			return;
+		}
+		snprintf(menu_path, sizeof(menu_path), "%s", path);
+		snprintf(menu_name, sizeof(menu_name), "%s", name ? name : "");
+		menu_panel = p;
+		menu_index = index;
+		if (row->swipe_direction > 0) {
+			if (playlist_insert_next(menu_path)) {
+				device_state_queue_changed();
+				toast_success("added_to_the_queue");
+			}
+		} else {
+			bool was_favourite = library_fav_contains(menu_path);
+			menu_fav_action(NULL);
+			toast_success(was_favourite ? "favourites_removed" : "added_to_favourites");
+		}
+	}
+}
+
 static void menu_details_action(void *user) {
 	(void)user;
 	if (menu_path[0]) {
@@ -3830,9 +3916,13 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_add_style(row->button, &style_row, 0);
 		lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
 		lv_obj_set_hidden(row->button, true);
-		lv_obj_set_event_bubble(row->button, true); // so the player sheet can be dragged in
+		lv_obj_set_event_bubble(row->button, true); // page gestures share the row surface
 		lv_obj_add_event_cb(row->button, row_clicked_cb, LV_EVENT_CLICKED, p);
 		lv_obj_add_event_cb(row->button, row_long_pressed_cb, LV_EVENT_LONG_PRESSED, p);
+		lv_obj_add_event_cb(row->button, row_swipe_cb, LV_EVENT_PRESSED, p);
+		lv_obj_add_event_cb(row->button, row_swipe_cb, LV_EVENT_PRESSING, p);
+		lv_obj_add_event_cb(row->button, row_swipe_cb, LV_EVENT_RELEASED, p);
+		lv_obj_add_event_cb(row->button, row_swipe_cb, LV_EVENT_PRESS_LOST, p);
 
 		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -3983,7 +4073,9 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 
 	// The player sheet can be pulled in from the list, like everywhere else,
 	// and the swipe-back drag can start on it too.
-	player_sheet_attach_drag(p->list, true); // a page surface: swiping left pulls the player in
+	if (!p->is_tracks) {
+		player_sheet_attach_drag(p->list, true); // track rows reserve horizontal swipes for queue and favourite actions
+	}
 	switcher_attach_back_gesture(p->list);
 
 	// Last, so both sit above the rows they cover.

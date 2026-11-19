@@ -64,6 +64,27 @@ There are two builds from one tree:
 
 ---
 
+## Rage OS interface
+
+The `Rage-os` branch uses a Spotify-inspired dark palette, green playback
+controls, a shortcut-based home screen, and a compact player with album art.
+The accent remains adjustable in Appearance settings.
+
+| Gesture | Action |
+|---|---|
+| Swipe right from the left edge | Go back |
+| Swipe right on a track row | Add it to play next |
+| Swipe left on a track row | Add or remove it from favourites |
+| Tap the mini-player | Open Now Playing |
+| Swipe up on the mini-player | Open Now Playing |
+| Swipe left or right on the mini-player | Next or previous track |
+| Hold and drag horizontally on the mini-player | Preview and seek within the track |
+| Pull down from the top bar | Open quick settings |
+
+The other playback controls and existing queue reordering remain available.
+
+---
+
 ## Building for the host
 
 The simulator draws the real interface in an SDL window, using the same source

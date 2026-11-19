@@ -730,16 +730,17 @@ void gui_init(gui_config_t *cfg) {
 	trackmenu_init(cfg);
 
 	// The leftward swipe that pulls the player in works on the browsing pages
-	// -- menu, library lists, file browser -- but NOT on the settings pages
+	// -- menu, library lists, file browser -- but NOT on track rows, settings pages
 	// nor on the queue: there a stray horizontal drag would yank the player
-	// over what is being adjusted or read.
+	// over what is being adjusted or read. Track rows use horizontal swipes for
+	// queue and favourite actions; the home mini-player opens Now Playing.
 	lv_obj_t *const player_swipe_screens[] = {
 		main_menu_screen,		 music_screen,		browser_screen,		medialist_screen,
 		// details_screen is deliberately absent: its page is reached FROM the
 		// player, so dragging it sideways to go back into the player would be
 		// one gesture doing two contradictory things. The back swipe is the
 		// only way out of it.
-		medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, wireless_screen,
+		medialist_albums_screen, audiobooks_screen, wireless_screen,
 		streaming_screen,		 radiopage_screen,	radiolist_screen,	radiosearch_screen,
 		morepage_screen,
 	};
