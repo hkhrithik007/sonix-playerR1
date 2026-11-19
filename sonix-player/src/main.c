@@ -55,6 +55,7 @@
 #include "src/system/streaming/tidalcache.h"
 #include "src/system/streaming/streamkeys.h"
 #include "src/system/lastfm/lastfm.h"
+#include "src/system/listenbrainz/listenbrainz.h"
 #include "src/system/library/library.h"
 #include "src/system/core/logging.h"
 #include "src/system/playback/playlist.h"
@@ -2204,6 +2205,7 @@ int main(int argc, char **argv) {
 	// and returns at once; if a switch was on, the bring-up happens on that
 	// worker while the interface carries on drawing.
 	wifi_init();
+	listenbrainz_init();
 	// Before the radio, so a bring-up that fails is in the Bluetooth log from
 	// its first line.
 	btlog_init();

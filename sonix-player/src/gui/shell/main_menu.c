@@ -409,7 +409,11 @@ static void build_mini_player(gui_config_t *cfg) {
 
 	lv_obj_t *labels = lv_obj_create(mini_player);
 	lv_obj_remove_style_all(labels);
-	lv_obj_set_height(labels, LV_SIZE_CONTENT);
+	// Let the flex row assign the space between the cover and play button.
+	// A content-sized width can otherwise grow to the full song title and push
+	// the play control off the card on long track names.
+	lv_obj_set_width(labels, 0);
+	lv_obj_set_height(labels, LV_PCT(100));
 	lv_obj_set_flex_grow(labels, 1);
 	lv_obj_set_flex_flow(labels, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(labels, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -419,12 +423,16 @@ static void build_mini_player(gui_config_t *cfg) {
 	lv_obj_set_event_bubble(labels, true);
 	mini_title = lv_label_create(labels);
 	lv_obj_set_width(mini_title, LV_PCT(100));
+	// LV_LABEL_LONG_DOT wraps before truncating. Pin both labels to one line so
+	// a long title cannot shove the artist out of the mini-player.
+	lv_obj_set_height(mini_title, lv_font_get_line_height(&font_ui_20_bold));
 	lv_obj_set_event_bubble(mini_title, true);
 	lv_label_set_long_mode(mini_title, LV_LABEL_LONG_DOT);
 	lv_obj_add_style(mini_title, &theme_style_text, 0);
 	lv_obj_set_style_text_font(mini_title, &font_ui_20_bold, 0);
 	mini_artist = lv_label_create(labels);
 	lv_obj_set_width(mini_artist, LV_PCT(100));
+	lv_obj_set_height(mini_artist, lv_font_get_line_height(&font_ui_14));
 	lv_obj_set_event_bubble(mini_artist, true);
 	lv_label_set_long_mode(mini_artist, LV_LABEL_LONG_DOT);
 	lv_obj_add_style(mini_artist, &theme_style_text_dim, 0);

@@ -14,6 +14,7 @@
 #include "src/system/audio/audio.h"
 #include "src/system/core/lang.h"
 #include "src/system/lastfm/lastfm.h"
+#include "src/system/listenbrainz/listenbrainz.h"
 #include "src/system/library/playcount.h"
 #include "src/system/net/wifi.h"
 #include "src/system/playback/audiobook.h"
@@ -322,6 +323,12 @@ static void tick_cb(lv_timer_t *t) {
 	playcount_playback_t counted = {
 		.playing = playing, .file = file, .position = position, .duration = duration, .skip = skip};
 	playcount_note_playback(&counted);
+	const char *tags_file = NULL;
+	const song_metadata_t *metadata = device_state_loaded_metadata(&tags_file);
+	bool tags = file[0] && tags_file && strcmp(tags_file, file) == 0;
+	const char *artist = tags ? (metadata->artist[0] ? metadata->artist : metadata->album_artist) : "";
+	const char *title = tags ? metadata->title : "";
+	const char *album = tags ? metadata->album : "";
 
 	if (lastfm_active()) {
 		lastfm_playback_t now = {0};
@@ -330,17 +337,25 @@ static void tick_cb(lv_timer_t *t) {
 		now.position = position;
 		now.duration = duration;
 
-		// Tags only once device_state has read them for this very file.
-		const char *tags_file = NULL;
-		const song_metadata_t *m = device_state_loaded_metadata(&tags_file);
-		bool tags = file[0] && tags_file && strcmp(tags_file, file) == 0;
-		now.artist = tags ? (m->artist[0] ? m->artist : m->album_artist) : "";
-		now.title = tags ? m->title : "";
-		now.album = tags ? m->album : "";
+		// Tags are used only once the current file's metadata has loaded.
+		now.artist = artist;
+		now.title = title;
+		now.album = album;
 
 		now.skip = skip;
 		lastfm_note_playback(&now);
 	}
+
+	listenbrainz_playback_t lb = {0};
+	lb.file = file;
+	lb.playing = playing;
+	lb.position = position;
+	lb.duration = duration;
+	lb.skip = skip;
+	lb.artist = artist;
+	lb.title = title;
+	lb.album = album;
+	listenbrainz_note_playback(&lb);
 
 	lastfm_status_t st;
 	lastfm_get_status(&st);

@@ -6,7 +6,7 @@
 #include "lvgl/lvgl.h"
 
 // The Last.fm page, reached from Music settings, and its sign-in screen. Also
-// starts the once-a-second timer that tells src/system/lastfm what is playing.
+// starts the once-a-second playback observer used by Last.fm and ListenBrainz.
 void lastfmsettings_init(gui_config_t *cfg);
 
 lv_obj_t *lastfmsettings_screen(void);
