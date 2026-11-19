@@ -15,6 +15,7 @@
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_mini.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/sx_tokens.h"
 #include "src/system/image/stb_image_decl.h"
@@ -663,6 +664,10 @@ void remap_init(gui_config_t *cfg) {
 	remap_screen = lv_obj_create(NULL);
 	lv_obj_add_style(remap_screen, &theme_style_screen, 0);
 	lv_obj_set_scrollable(remap_screen, false);
+	// This page is laid out against the physical screen edges rather than in a
+	// scroller. Keep the persistent mini-player out of the way of the bottom
+	// button mapping row (and the double-click action on the R1).
+	sx_mini_hide_on_screen(remap_screen);
 
 	const sysinfo_model_t *model = sysinfo_model();
 	if (!model) {
