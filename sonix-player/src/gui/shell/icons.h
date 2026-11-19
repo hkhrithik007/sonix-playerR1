@@ -84,6 +84,8 @@ extern const lv_image_dsc_t icon_list_queue;
 extern const lv_image_dsc_t icon_list_x;
 extern const lv_image_dsc_t icon_star_x;
 extern const lv_image_dsc_t icon_search;
+extern const lv_image_dsc_t icon_nav_home;
+extern const lv_image_dsc_t icon_nav_library;
 extern const lv_image_dsc_t icon_wifi;
 extern const lv_image_dsc_t icon_bluetooth;
 extern const lv_image_dsc_t icon_wifi_zero;

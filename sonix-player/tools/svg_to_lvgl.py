@@ -155,6 +155,9 @@ ICONS = [
     ("list-x.svg", "list_x", 34),
     ("star-x.svg", "star_x", 34),
     ("search.svg", "search", 34),
+    # Spotify-inspired bottom navigation glyphs, sized to match search.
+    ("home.svg", "nav_home", 34),
+    ("library.svg", "nav_library", 34),
     ("wifi.svg", "wifi", 46),
     ("bluetooth.svg", "bluetooth", 46),
     # Status bar radios. The wifi glyph is the same arc with none, one, two or

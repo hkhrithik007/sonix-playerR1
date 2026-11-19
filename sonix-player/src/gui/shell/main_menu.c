@@ -379,9 +379,9 @@ static void build_mini_player(gui_config_t *cfg) {
 	lv_obj_set_flex_flow(mini_nav, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(mini_nav, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_scrollable(mini_nav, false);
-	add_nav_item(mini_nav, "home", &icon_menu_music, main_menu_screen);
+	add_nav_item(mini_nav, "home", &icon_nav_home, main_menu_screen);
 	add_nav_item(mini_nav, "search_tab", &icon_search, NULL);
-	add_nav_item(mini_nav, "library_tab", &icon_menu_favourites, music_screen);
+	add_nav_item(mini_nav, "library_tab", &icon_nav_library, music_screen);
 
 	theme_register_refresh(home_theme_refresh);
 	home_theme_refresh();
