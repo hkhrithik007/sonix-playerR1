@@ -1073,7 +1073,16 @@ static void row_update_detail(panel_t *p, row_t *row, int index, const char *pat
 	char badge[24];
 	char length[16];
 	listacts_track_badge(path, badge, sizeof(badge), length, sizeof(length));
-	sx_row_set_subtitle(row->row, artist ? artist : "", badge, length);
+	char detail[160];
+	if (artist && p->kind == LIBRARY_LIST_MOST_PLAYED) {
+		long long plays = library_track_plays(path);
+		snprintf(detail, sizeof(detail), "%s · %lld plays", artist, plays);
+	} else if (p->kind == LIBRARY_LIST_MOST_PLAYED) {
+		snprintf(detail, sizeof(detail), "%lld plays", library_track_plays(path));
+	} else {
+		snprintf(detail, sizeof(detail), "%s", artist ? artist : "");
+	}
+	sx_row_set_subtitle(row->row, detail, badge, length);
 }
 
 // ---------------------------------------------------------------------------

@@ -2927,6 +2927,20 @@ void library_note_play(const char *path) {
 	pthread_mutex_unlock(&db_lock);
 }
 
+long long library_track_plays(const char *path) {
+	if (!path || !path[0]) return 0;
+	pthread_mutex_lock(&db_lock);
+	long long plays = 0;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, "SELECT plays FROM PLAY_COUNTS WHERE path = ?1", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) plays = sqlite3_column_int64(stmt, 0);
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return plays;
+}
+
 void library_history_add(const char *path, const char *name, const char *artist, long long played_at) { (void)library_history_record_at(library_database_epoch(), path, name, artist, played_at); }
 
 long long library_history_record_at(unsigned epoch, const char *path, const char *name, const char *artist, long long played_at) {

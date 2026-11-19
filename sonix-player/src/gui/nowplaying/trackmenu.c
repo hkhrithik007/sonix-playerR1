@@ -18,6 +18,8 @@
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/nowplaying/npicons.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/ipodmode.h"
+#include "src/gui/nowplaying/visualiser.h"
 #include "src/gui/nowplaying/queueundo.h"
 #include "src/gui/settings/musicsettings.h"
 #include "src/gui/shell/confirm.h"
@@ -51,6 +53,10 @@
 #include "src/system/playback/audiobook.h"
 #include "src/system/playback/device_state.h"
 #include "src/system/playback/playlist.h"
+
+static gui_config_t *trackmenu_cfg;
+static void open_visualiser_cb(void *user) { (void)user; if (trackmenu_cfg) visualiser_open(trackmenu_cfg); }
+static void open_ipod_cb(void *user) { (void)user; if (trackmenu_cfg) ipod_mode_open(trackmenu_cfg); }
 #include "src/system/remote/dlna.h"
 #include "src/system/streaming/podcastcache.h"
 #include "src/system/streaming/provider.h"
@@ -1826,7 +1832,7 @@ void trackmenu_open(lv_obj_t *anchor) {
 	snprintf(title, sizeof(title), "%.255s", ext && outside[0] ? outside : state.metadata.title[0] ? state.metadata.title : (slash ? slash + 1 : state.current_file));
 	snprintf(sub, sizeof(sub), "%s", state.live ? state.metadata.artist : metadata_shown_artist(&state.metadata));
 
-	sx_sheet_item_t items[14];
+	sx_sheet_item_t items[16];
 	int n = 0;
 	const stream_provider_t *service = !state.live && !ext ? stream_provider_for_track(state.current_file) : NULL;
 	if (!ext && loaded && playback_source_available(&state))
@@ -1842,6 +1848,10 @@ void trackmenu_open(lv_obj_t *anchor) {
 	}
 	items[n++] = (sx_sheet_item_t){player_sleep_label(), &npicon_sleep, false, false, sleep_cb, NULL};
 	items[n++] = (sx_sheet_item_t){tr("np_audio_chain"), &npicon_details, false, false, chain_cb, NULL};
+	if (loaded && !state.live) {
+		items[n++] = (sx_sheet_item_t){"iTunes Visualiser", &icon_audio_waveform, false, false, open_visualiser_cb, NULL};
+		items[n++] = (sx_sheet_item_t){"iPod mode", &npicon_album, false, false, open_ipod_cb, NULL};
+	}
 	if (!ext && loaded) {
 		items[n++] = (sx_sheet_item_t){tr("add_to_playlist"), &npicon_add_playlist, false, false, add_to_playlist_cb, NULL};
 		items[n++] = (sx_sheet_item_t){tr(podcast ? "trackmenu_show_podcast" : "show_album"), &npicon_album, false, false, open_album_cb, NULL};
@@ -1867,7 +1877,7 @@ void trackmenu_open(lv_obj_t *anchor) {
 // players never open the queue in a session. Everything here that reaches
 // into the queue page asks first whether it is the page on show.
 void trackmenu_init(gui_config_t *cfg) {
-	(void)cfg;
+	trackmenu_cfg = cfg;
 	gui_page_defer(queue_screen, build_queue_page);
 	gui_page_defer(details_screen, build_details_page);
 }

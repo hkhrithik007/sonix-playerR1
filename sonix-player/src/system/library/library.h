@@ -490,6 +490,7 @@ bool library_fav_toggle(const char *path, const char *name, const char *artist);
 // One more play of `path`, counted for the Most played list. Called once a
 // play has gone on long enough to count (playcount.h).
 void library_note_play(const char *path);
+long long library_track_plays(const char *path);
 
 // Confirmed listening events (playhistory.h), oldest first. Only the latest
 // LIBRARY_HISTORY_MAX are kept.
