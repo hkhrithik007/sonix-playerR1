@@ -2119,8 +2119,7 @@ void musicsettings_init(gui_config_t *cfg) {
 	settingsrow_add(container, "listenbrainz", NULL, switch_screen_cb, listenbrainzsettings_screen());
 
 	bool bit_perfect_on = config_get_int("audio", "bit_perfect", 0) != 0;
-	settingsrow_switch_card(container, "musicsettings_bit_perfect", "bit_perfect_holds_off",
-							&bit_perfect_switch, bit_perfect_toggle_cb);
+	settingsrow_toggle(container, "musicsettings_bit_perfect", &bit_perfect_switch, bit_perfect_toggle_cb);
 	if (bit_perfect_on) lv_obj_add_state(bit_perfect_switch, LV_STATE_CHECKED);
 	audio_set_bit_perfect(bit_perfect_on);
 

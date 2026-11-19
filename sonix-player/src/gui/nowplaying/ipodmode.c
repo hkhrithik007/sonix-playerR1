@@ -10,6 +10,7 @@
 #include "src/gui/shell/corners.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_mini.h"
 #include "src/gui/shell/topbar.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/power.h"
@@ -517,7 +518,8 @@ static void build_lower_shell(gui_config_t *cfg) {
 static void build_wheel(void) {
 	wheel = panel(screen, 0x242424);
 	lv_obj_set_size(wheel, scale(WHEEL_SIZE), scale(WHEEL_SIZE));
-	lv_obj_align(wheel, LV_ALIGN_BOTTOM_MID, 0, -scale(84));
+	// Keep the click wheel entirely below the LCD area on every supported size.
+	lv_obj_align(wheel, LV_ALIGN_TOP_MID, 0, scale(LCD_H + 24));
 	lv_obj_set_style_radius(wheel, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_clickable(wheel, true);
 	lv_obj_set_press_lock(wheel, true);
@@ -576,6 +578,7 @@ void ipod_mode_open(gui_config_t *cfg) {
 		lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
 		lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 		lv_obj_set_scrollable(screen, false);
+		sx_mini_hide_on_screen(screen);
 		build_lcd();
 		build_lower_shell(cfg);
 		build_wheel();
