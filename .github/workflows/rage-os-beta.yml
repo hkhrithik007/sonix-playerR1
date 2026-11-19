@@ -643,6 +643,75 @@ jobs:
             exit 1
           fi
 
+          python3 - "$OTA_DIR" <<'PYOTA'
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+          ota = Path(sys.argv[1])
+          update_text = (ota / "ota_update.in").read_text(encoding="ascii")
+          rootfs_block = next(
+              (block for block in re.split(r"\n\s*\n", update_text)
+               if re.search(r"(?m)^img_name=rootfs\.squashfs$", block)),
+              None,
+          )
+          if rootfs_block is None:
+              raise SystemExit("ERROR: rootfs entry is missing from ota_update.in.")
+
+          def field(name):
+              match = re.search(rf"(?m)^img_{name}=([0-9a-fA-F]+)$", rootfs_block)
+              if not match:
+                  raise SystemExit(f"ERROR: rootfs img_{name} is missing or malformed.")
+              return match.group(1)
+
+          expected_size = int(field("size"), 10)
+          overall_md5 = field("md5").lower()
+          if len(overall_md5) != 32:
+              raise SystemExit("ERROR: rootfs img_md5 is not a 32-character MD5.")
+
+          manifest = ota / f"ota_md5_rootfs.squashfs.{overall_md5}"
+          if not manifest.is_file():
+              raise SystemExit(f"ERROR: rootfs MD5 manifest is missing: {manifest.name}")
+          manifest_hashes = [line.strip().lower() for line in manifest.read_text(encoding="ascii").splitlines() if line.strip()]
+          chunks = sorted(ota.glob("rootfs.squashfs.*"))
+          if not chunks or len(chunks) != len(manifest_hashes):
+              raise SystemExit(
+                  f"ERROR: rootfs chunk/manifest count differs ({len(chunks)} chunks, "
+                  f"{len(manifest_hashes)} hashes)."
+              )
+
+          whole = hashlib.md5()
+          previous_md5 = overall_md5
+          total_size = 0
+          for index, chunk in enumerate(chunks):
+              match = re.fullmatch(r"rootfs\.squashfs\.(\d{4})\.([0-9a-fA-F]{32})", chunk.name)
+              if not match or int(match.group(1)) != index:
+                  raise SystemExit(f"ERROR: malformed or missing rootfs chunk sequence at {chunk.name}.")
+              if match.group(2).lower() != previous_md5:
+                  raise SystemExit(f"ERROR: MD5 chain filename is incorrect for {chunk.name}.")
+
+              chunk_md5 = hashlib.md5()
+              with chunk.open("rb") as source:
+                  while data := source.read(1024 * 1024):
+                      chunk_md5.update(data)
+                      whole.update(data)
+                      total_size += len(data)
+              actual_md5 = chunk_md5.hexdigest()
+              if actual_md5 != manifest_hashes[index]:
+                  raise SystemExit(f"ERROR: MD5 manifest entry does not match {chunk.name}.")
+              previous_md5 = actual_md5
+
+          if total_size != expected_size:
+              raise SystemExit(
+                  f"ERROR: rootfs chunks total {total_size} bytes; ota_update.in expects {expected_size}."
+              )
+          if whole.hexdigest() != overall_md5:
+              raise SystemExit("ERROR: reassembled rootfs MD5 does not match ota_update.in.")
+
+          print(f"Rootfs MD5 chain verified ({len(chunks)} chunks, {total_size} bytes).")
+          PYOTA
+
           ROOTFS_IMAGE="$RUNNER_TEMP/r1-verify/rootfs.squashfs"
 
           (
