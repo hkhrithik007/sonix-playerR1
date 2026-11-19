@@ -67,9 +67,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo apt-get update
+          retry_apt() {
+            local attempt=1
+            local delay=15
+            local max_attempts=4
 
-          sudo apt-get install -y --no-install-recommends \
+            until sudo apt-get \
+              -o Acquire::Retries=5 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "apt-get $1 failed after ${attempt} attempts."
+                return 1
+              fi
+
+              echo "apt-get $1 failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s."
+              sleep "$delay"
+              delay=$((delay * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          retry_apt update
+
+          retry_apt install -y --no-install-recommends \
             autoconf \
             automake \
             autopoint \
