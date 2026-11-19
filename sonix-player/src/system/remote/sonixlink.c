@@ -82,6 +82,8 @@
 // ---------------------------------------------------------------------------
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// Signalled when the switch is turned on: the worker sleeps on it while off.
+static pthread_cond_t enabled_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t worker;
 static bool worker_running;
 static bool enabled;
@@ -175,20 +177,6 @@ static void push_command_paths(sonixlink_command_kind_t kind, int arg, char *pat
 	}
 	pthread_mutex_unlock(&lock);
 	free(paths);
-}
-
-// A command filled in by the caller, for the queue page's ones with numbers of
-// their own. `paths`, when set, is owned from here on.
-static void push_command_whole(sonixlink_command_t *cmd) {
-	pthread_mutex_lock(&lock);
-	if (queue_count < CMD_QUEUE_LEN) {
-		queue[(queue_head + queue_count) % CMD_QUEUE_LEN] = *cmd;
-		cmd->paths = NULL;
-		queue_count++;
-	}
-	pthread_mutex_unlock(&lock);
-	free(cmd->paths);
-	cmd->paths = NULL;
 }
 
 void sonixlink_command_free(sonixlink_command_t *cmd) {
@@ -365,6 +353,7 @@ bool sonixlink_get_enabled(void) {
 void sonixlink_set_enabled(bool on) {
 	pthread_mutex_lock(&lock);
 	enabled = on;
+	pthread_cond_signal(&enabled_cond);
 	pthread_mutex_unlock(&lock);
 	config_set_int("wireless", "sonixlink", on ? 1 : 0);
 	config_save();
@@ -956,7 +945,6 @@ static void route_state(client_t *c) {
 	buf_fmt(&j, "\"display_position\":%d,\"display_count\":%d,", s.display_position, s.display_count);
 	buf_fmt(&j, "\"favourites_revision\":%u,\"playlists_revision\":%u,", s.favourites_revision,
 			s.playlists_revision);
-	buf_fmt(&j, "\"history_revision\":%lld,", s.history_revision);
 	buf_fmt(&j, "\"scanning\":%s,\"scan_count\":%u,\"tracks\":%u}", s.scanning ? "true" : "false", s.scan_count,
 			s.track_count);
 	reply_json(c, &j);
@@ -1240,49 +1228,6 @@ static void route_command(client_t *c, const char *query) {
 										: strcmp(what, "playlist_add") == 0	  ? SONIXLINK_CMD_PLAYLIST_ADD
 																				  : SONIXLINK_CMD_PLAYLIST_REMOVE;
 		push_command_paths(kind, 0, paths, count, value);
-	} else if (strcmp(what, "queue_remove") == 0 || strcmp(what, "queue_move") == 0 || strcmp(what, "history_play") == 0 || strcmp(what, "history_insert") == 0) {
-		sonixlink_command_t cmd;
-		memset(&cmd, 0, sizeof(cmd));
-		char number_text[32] = "";
-		if (query_value(query, "rev", number_text, sizeof(number_text)) && number_text[0]) {
-			cmd.revision = (unsigned)strtoul(number_text, NULL, 10);
-			cmd.has_revision = true;
-		}
-		if (strcmp(what, "queue_remove") == 0) {
-			cmd.kind = SONIXLINK_CMD_QUEUE_REMOVE;
-			cmd.path_count = body_paths(c, &cmd.paths);
-			if (cmd.path_count == 0) {
-				reply_status(c, "400 Bad Request", "no entries");
-				return;
-			}
-		} else if (strcmp(what, "queue_move") == 0) {
-			char from[16] = "", to[16] = "";
-			if (!query_value(query, "from", from, sizeof(from)) || !query_value(query, "to", to, sizeof(to)) || !from[0] || !to[0]) {
-				reply_status(c, "400 Bad Request", "from and to");
-				return;
-			}
-			cmd.kind = SONIXLINK_CMD_QUEUE_MOVE;
-			cmd.arg = atoi(from);
-			cmd.arg2 = atoi(to);
-		} else {
-			char id[32] = "";
-			if (!query_value(query, "id", id, sizeof(id)) || !id[0]) {
-				reply_status(c, "400 Bad Request", "which entry?");
-				return;
-			}
-			cmd.id = strtoll(id, NULL, 10);
-			cmd.kind = SONIXLINK_CMD_HISTORY_PLAY;
-			if (strcmp(what, "history_insert") == 0) {
-				char at[16] = "";
-				if (!query_value(query, "at", at, sizeof(at)) || !at[0]) {
-					reply_status(c, "400 Bad Request", "where?");
-					return;
-				}
-				cmd.kind = SONIXLINK_CMD_HISTORY_INSERT;
-				cmd.arg = atoi(at);
-			}
-		}
-		push_command_whole(&cmd);
 	} else if (strcmp(what, "scan") == 0) {
 		push_command(SONIXLINK_CMD_SCAN, 0);
 	} else {
@@ -1439,66 +1384,6 @@ static bool index_path(char *out, size_t out_size) {
 	snprintf(out, out_size, "%s", db_path);
 	pthread_mutex_unlock(&lock);
 	return out[0] != '\0';
-}
-
-// The latest entries of the history, oldest first, as the player's queue page
-// lists them above Now playing: read live, like the favourites, with the title
-// and artist written down when the entry was, so an entry outlives a rescan.
-#define HISTORY_DEFAULT_LIMIT 200
-#define HISTORY_MAX_LIMIT 1000
-
-static void route_history(client_t *c, const char *query) {
-	char limit_text[16] = "";
-	int limit = HISTORY_DEFAULT_LIMIT;
-	if (query_value(query, "limit", limit_text, sizeof(limit_text)) && limit_text[0]) {
-		limit = atoi(limit_text);
-	}
-	if (limit < 1) {
-		limit = 1;
-	} else if (limit > HISTORY_MAX_LIMIT) {
-		limit = HISTORY_MAX_LIMIT;
-	}
-
-	char path[sizeof(db_path)];
-	sonixlink_state_t s;
-	state_copy(&s);
-
-	buf_t j;
-	memset(&j, 0, sizeof(j));
-	buf_fmt(&j, "{\"revision\":%lld,\"items\":[", s.history_revision);
-
-	sqlite3 *db = NULL;
-	if (index_path(path, sizeof(path)) && sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-		sqlite3_busy_timeout(db, 1000);
-		sqlite3_stmt *st = NULL;
-		if (sqlite3_prepare_v2(db,
-							   "SELECT id, path, name, artist, played_at FROM"
-							   " (SELECT * FROM PLAY_HISTORY ORDER BY id DESC LIMIT ?1) ORDER BY id",
-							   -1, &st, NULL) == SQLITE_OK) {
-			sqlite3_bind_int(st, 1, limit);
-			bool first = true;
-			while (sqlite3_step(st) == SQLITE_ROW) {
-				const char *p = (const char *)sqlite3_column_text(st, 1);
-				const char *name = (const char *)sqlite3_column_text(st, 2);
-				const char *artist = (const char *)sqlite3_column_text(st, 3);
-				if (!p || !p[0]) {
-					continue;
-				}
-				buf_str(&j, first ? "{" : ",{");
-				first = false;
-				buf_fmt(&j, "\"id\":%lld,", (long long)sqlite3_column_int64(st, 0));
-				buf_json_field(&j, "path", p, true);
-				buf_json_field(&j, "title", name ? name : "", true);
-				buf_json_field(&j, "artist", artist ? artist : "", true);
-				buf_fmt(&j, "\"played_at\":%lld}", (long long)sqlite3_column_int64(st, 4));
-			}
-		}
-		sqlite3_finalize(st);
-	}
-	sqlite3_close(db);
-
-	buf_str(&j, "]}");
-	reply_json(c, &j);
 }
 
 // The playlists, read live like the favourites: the copy of the index on the
@@ -2445,8 +2330,6 @@ static void serve_request(client_t *c) {
 		route_thumbkeys(c);
 	} else if (strcmp(target, "/api/queue") == 0) {
 		route_queue(c, query);
-	} else if (strcmp(target, "/api/history") == 0) {
-		route_history(c, query);
 	} else if (strcmp(target, "/api/browse") == 0) {
 		route_browse(c, query);
 	} else if (strcmp(target, "/api/ping") == 0) {
@@ -2989,7 +2872,24 @@ static void *sonixlink_worker(void *unused) {
 				pthread_mutex_unlock(&lock);
 				printf("sonixlink: off\n");
 			}
-			usleep(300 * 1000);
+			// A Bluetooth link handed over just before the switch went off,
+			// with no listener up yet, has nobody to serve it either.
+			for (int i = 0; i < MAX_CLIENTS; i++) {
+				if (clients[i].fd >= 0) {
+					client_close(&clients[i]);
+				}
+			}
+			// Asleep until the switch is turned on again: nothing else can
+			// need this thread meanwhile -- no socket is open, and a link
+			// handed over from Bluetooth is refused while off
+			// (sonixlink_adopt_link) -- so it does not wake at all, where it
+			// used to look at the switch three times a second for as long as
+			// the player ran.
+			pthread_mutex_lock(&lock);
+			while (!enabled) {
+				pthread_cond_wait(&enabled_cond, &lock);
+			}
+			pthread_mutex_unlock(&lock);
 			continue;
 		}
 

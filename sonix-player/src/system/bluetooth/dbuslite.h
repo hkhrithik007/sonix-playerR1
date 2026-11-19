@@ -50,7 +50,7 @@ typedef struct {
 	char signature[64];
 	const uint8_t *body; // into the connection's read buffer, valid for the call
 	size_t body_len;
-	bool big_endian; // how the body is encoded, for the readers below
+	bool big_endian;   // how the body is encoded, for the readers below
 	uint32_t unix_fds; // descriptors that came with it; see dbus_take_fd()
 } dbus_msg_t;
 
@@ -65,6 +65,9 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 typedef struct dbus_writer dbus_writer_t;
+
+// Refuse the pending send when a typed value cannot be represented safely.
+void dbus_w_reject(dbus_writer_t *writer);
 
 void dbus_w_byte(dbus_writer_t *w, uint8_t v);
 void dbus_w_bool(dbus_writer_t *w, bool v);
@@ -102,6 +105,7 @@ void dbus_w_dict_variant_begin(dbus_writer_t *w, const char *key, const char *va
 void dbus_w_variant_string(dbus_writer_t *w, const char *value);
 void dbus_w_variant_bool(dbus_writer_t *w, bool value);
 void dbus_w_variant_u16(dbus_writer_t *w, uint16_t value);
+void dbus_w_variant_bytes(dbus_writer_t *w, const uint8_t *values, size_t count);
 void dbus_w_variant_u32(dbus_writer_t *w, uint32_t value);
 
 // ---------------------------------------------------------------------------
@@ -193,8 +197,7 @@ bool dbus_alive(const dbus_conn_t *c);
 // Begins a method call and hands back the writer for its body. `signature` is
 // the body's signature ("" for no arguments). Every begin must be followed by a
 // send.
-dbus_writer_t *dbus_call_begin(dbus_conn_t *c, const char *destination, const char *path, const char *interface,
-							   const char *member, const char *signature);
+dbus_writer_t *dbus_call_begin(dbus_conn_t *c, const char *destination, const char *path, const char *interface, const char *member, const char *signature);
 
 // Sends it and waits up to `timeout_ms` for the reply. True when the reply was
 // a method return; false on an error reply, a timeout, or a dead connection.
@@ -217,8 +220,7 @@ bool dbus_error(dbus_conn_t *c, const dbus_msg_t *call, const char *name, const 
 
 // --- emitting a signal ---
 
-dbus_writer_t *dbus_signal_begin(dbus_conn_t *c, const char *path, const char *interface, const char *member,
-								 const char *signature);
+dbus_writer_t *dbus_signal_begin(dbus_conn_t *c, const char *path, const char *interface, const char *member, const char *signature);
 bool dbus_signal_send(dbus_conn_t *c);
 
 #endif /* DBUSLITE_H */

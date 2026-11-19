@@ -1,4 +1,6 @@
 #include "metronomepage.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -54,7 +56,7 @@ static lv_obj_t *play_btn;
 static lv_obj_t *play_glyph;
 static lv_timer_t *frame_timer;
 
-static float angle;	   // of the arm as drawn, in degrees; positive leans right
+static float angle;		  // of the arm as drawn, in degrees; positive leans right
 static int lit_beat = -1; // the dot shown as the beat being heard, -1 for none
 static bool shown_running;
 static bool config_dirty;
@@ -73,8 +75,7 @@ static const struct {
 	int from;
 	const char *name;
 } TEMPOS[] = {
-	{0, "Grave"},		{40, "Largo"},	   {60, "Larghetto"}, {66, "Adagio"}, {76, "Andante"},
-	{108, "Moderato"},	{120, "Allegro"},  {156, "Vivace"},	  {176, "Presto"}, {200, "Prestissimo"},
+	{0, "Grave"}, {40, "Largo"}, {60, "Larghetto"}, {66, "Adagio"}, {76, "Andante"}, {108, "Moderato"}, {120, "Allegro"}, {156, "Vivace"}, {176, "Presto"}, {200, "Prestissimo"},
 };
 
 static const char *tempo_name(int bpm) {
@@ -101,8 +102,7 @@ static lv_point_precise_t pt(float x, float y) {
 	return p;
 }
 
-static void line(lv_layer_t *layer, float x1, float y1, float x2, float y2, float width, lv_color_t color,
-				 lv_opa_t opa) {
+static void line(lv_layer_t *layer, float x1, float y1, float x2, float y2, float width, lv_color_t color, lv_opa_t opa) {
 	lv_draw_line_dsc_t dsc;
 	lv_draw_line_dsc_init(&dsc);
 	dsc.p1 = pt(x1, y1);
@@ -115,8 +115,7 @@ static void line(lv_layer_t *layer, float x1, float y1, float x2, float y2, floa
 	lv_draw_line(layer, &dsc);
 }
 
-static void triangle(lv_layer_t *layer, lv_point_precise_t a, lv_point_precise_t b, lv_point_precise_t c,
-					 lv_color_t color) {
+static void triangle(lv_layer_t *layer, lv_point_precise_t a, lv_point_precise_t b, lv_point_precise_t c, lv_color_t color) {
 	lv_draw_triangle_dsc_t dsc;
 	lv_draw_triangle_dsc_init(&dsc);
 	dsc.p[0] = a;
@@ -138,8 +137,7 @@ static void circle(lv_layer_t *layer, float x, float y, float r, lv_color_t colo
 
 // A trapezoid with rounded corners, symmetric about `cx`: filled inside its
 // corners' centres, and its edges stroked round with the corners' diameter.
-static void trapezoid(lv_layer_t *layer, float cx, float top, float bottom, float top_half, float bottom_half,
-					  float radius, lv_color_t color) {
+static void trapezoid(lv_layer_t *layer, float cx, float top, float bottom, float top_half, float bottom_half, float radius, lv_color_t color) {
 	// Moved in along the slanted sides by a little more than the radius, so
 	// the round stroke lands on the outline.
 	float slant = (bottom_half - top_half) / (bottom - top);
@@ -271,8 +269,7 @@ static void stop(void) {
 // Anything sounding: a track, a station, a phone playing to the player over
 // Bluetooth or AirPlay. The metronome never plays over it.
 static bool something_playing(void) {
-	if (audio_get_status() == AUDIO_STATUS_PLAYING || radio_is_playing() || radio_is_connecting() ||
-		btreceiver_is_streaming()) {
+	if (audio_get_status() == AUDIO_STATUS_PLAYING || radio_is_playing() || radio_is_connecting() || btreceiver_is_streaming()) {
 		return true;
 	}
 	airplay_state_t airplay;
@@ -298,9 +295,7 @@ static void play_cb(lv_event_t *e) {
 	}
 }
 
-static void step_cb(lv_event_t *e) {
-	set_bpm(metronome_bpm() + (int)(intptr_t)lv_event_get_user_data(e));
-}
+static void step_cb(lv_event_t *e) { set_bpm(metronome_bpm() + (int)(intptr_t)lv_event_get_user_data(e)); }
 
 static void slider_cb(lv_event_t *e) {
 	(void)e;
@@ -439,6 +434,7 @@ static void refresh_theme(void) {
 		lv_obj_set_style_text_color(pill_labels[i], t->text_primary, 0);
 	}
 	lv_obj_set_style_bg_color(play_btn, t->accent, 0);
+	lv_obj_set_style_image_recolor(play_glyph, sx_pal()->on_accent, 0);
 	theme_apply_slider_knob(slider);
 	paint_dots();
 	lv_obj_invalidate(drawing);
@@ -481,7 +477,8 @@ bool metronomepage_key(gui_key_t key) {
 	return true;
 }
 
-void metronomepage_init(gui_config_t *cfg) {
+static void build_page(gui_config_t *cfg) {
+	sx_mini_hide_on_screen(metronomepage_screen);
 	metronome_set_bpm((int)config_get_int("metronome", "bpm", DEFAULT_BPM));
 	metronome_set_beats((int)config_get_int("metronome", "beats", DEFAULT_BEATS));
 
@@ -555,7 +552,7 @@ void metronomepage_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
 	lv_obj_add_style(slider, &theme_style_accent_bg, LV_PART_INDICATOR);
 	lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-	lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
+	lv_obj_set_style_bg_color(slider, sx_pal()->on_accent, LV_PART_KNOB);
 	lv_obj_set_style_pad_all(slider, 8, LV_PART_KNOB);
 	lv_obj_set_style_shadow_width(slider, 8, LV_PART_KNOB);
 	lv_obj_set_style_shadow_opa(slider, LV_OPA_30, LV_PART_KNOB);
@@ -572,7 +569,7 @@ void metronomepage_init(gui_config_t *cfg) {
 	// On the press, not the release: a tap is timed by when the finger lands.
 	lv_obj_add_event_cb(pill_btns[0], tap_cb, LV_EVENT_PRESSED, NULL);
 	play_btn = round_button(bottom, PLAY_BTN, &icon_play_large, &play_glyph);
-	lv_obj_set_style_image_recolor(play_glyph, lv_color_white(), 0);
+	lv_obj_set_style_image_recolor(play_glyph, sx_pal()->on_accent, 0);
 	lv_obj_set_style_image_recolor_opa(play_glyph, LV_OPA_COVER, 0);
 	lv_obj_add_event_cb(play_btn, play_cb, LV_EVENT_CLICKED, NULL);
 	pill_btns[1] = pill_button(bottom, BEAT_NAMES[metronome_beats()], &pill_labels[1]);
@@ -589,4 +586,9 @@ void metronomepage_init(gui_config_t *cfg) {
 
 	frame_timer = lv_timer_create(frame_cb, FRAME_MS, NULL);
 	lv_timer_pause(frame_timer);
+}
+
+void metronomepage_init(gui_config_t *cfg) {
+	(void)cfg;
+	gui_page_defer(metronomepage_screen, build_page);
 }

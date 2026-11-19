@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "src/system/library/library.h"
 
 // User playlists.
 //
@@ -46,10 +47,13 @@ bool playlists_exists(const char *name);
 
 // Creates an empty playlist. Fails if the name is unusable or it exists.
 bool playlists_create(const char *name);
+bool playlists_name_valid(const char *name);
 
 // Appends a track, creating the playlist if it is not there yet. Duration and
 // display name come from the file's tags, like the stock player's entries.
 bool playlists_add_track(const char *name, const char *track_path);
+// Worker-only metadata preparation, shared by batch/staged writers.
+bool playlists_track_row(const char *track_path, library_playlist_row_t *row);
 
 // The name and artist a track is listed under: the index's, else the file's
 // tags, else the file name for the title. The artist may come back empty, the

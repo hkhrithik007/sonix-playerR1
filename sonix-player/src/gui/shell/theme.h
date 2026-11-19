@@ -15,7 +15,9 @@ typedef struct {
 	lv_color_t cover_bg;	   // behind the artwork, when a track has none
 	lv_color_t text_primary;
 	lv_color_t text_secondary;
-	lv_color_t accent;		   // the active control colour
+	lv_color_t accent;		   // the colour of active things: the cover's, or a preset
+	lv_color_t accent_text;	   // readable foreground, distinct from the action fill
+	lv_color_t on_accent;	   // text and glyphs on an accent fill (white, except on a pale accent)
 	bool dark;
 } theme_palette_t;
 
@@ -70,10 +72,15 @@ bool theme_is_dark(void);
 // Switches between the two presets and repaints the UI.
 void theme_toggle(void);
 
-// The accent colour, chosen from a fixed set of presets (Appearance > Accent
-// colour): 0 blue, 1 orange, 2 yellow, 3 Spotify green (default), 4 purple, 5 pink.
-// Applies to both dark and light palettes, persists in the config.
-#define THEME_ACCENT_COUNT 6
+// Graphite (-2) is the default when the setting is absent. Cover (-1) and the
+// six saved preset indices (0..5) keep their meanings. Gray is appended at 6.
+#define THEME_ACCENT_PALETTE (-3)
+#define THEME_PALETTE_COUNT 9
+#define THEME_LCD_LAMP_COUNT 5
+#define THEME_ACCENT_COUNT 7
+#define THEME_ACCENT_GRAY 6
+#define THEME_ACCENT_COVER (-1)
+#define THEME_ACCENT_GRAPHITE (-2)
 lv_color_t theme_accent_preset(int index);
 int theme_get_accent(void);
 void theme_set_accent(int index);
@@ -81,12 +88,24 @@ void theme_set_accent(int index);
 // Picks a specific theme rather than flipping; no-op when already active.
 void theme_set_dark(bool dark);
 
-// The dynamic tint (Appearance > Dynamic tint): the neutral colours --
-// backgrounds, cards, the status bar -- borrow the accent's hue, the way
-// Material You colours a system from one seed. Each colour keeps its brightest
-// channel, so a tinted surface stays at the level the preset put it at instead
-// of drifting towards the accent's own; text and the monochrome icons are left
-// alone entirely. Off by default, persists in the config.
+// "Tint from cover" (Appearance; called Dynamic tint before 2.0, same config
+// key): the neutral colours -- backgrounds, cards, the status bar -- take the
+// hue of the cover playing (or of the album page shown), at the lightness the
+// cover tokens give each of them. Off by default for Graphite; a saved
+// preference is preserved.
+//
+// The hue itself moves without any call here: sx_palette_track_changed() and
+// sx_palette_push_hue() recolour the interface in place, running the refresh
+// callbacks above as a theme change does.
+bool theme_monochrome_covers(void);
+bool theme_set_monochrome_covers(bool on);
+int theme_get_palette(void);
+void theme_set_palette(int family);
+int theme_get_lcd_lamp(void);
+void theme_set_lcd_lamp(int lamp);
+bool theme_force_color_placeholders(void);
+void theme_set_force_color_placeholders(bool on);
+
 bool theme_dynamic_tint(void);
 void theme_set_dynamic_tint(bool on);
 

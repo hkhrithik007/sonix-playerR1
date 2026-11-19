@@ -3,12 +3,12 @@
  */
 
 #include "power.h"
+#include "src/system/device/recoveryprep.h"
 
 // LVGL 9.2 made lv_timer_t opaque. There is a lv_timer_set_period() but no
 // getter, and both places here have to read the period before changing it.
 #include "lvgl/src/misc/lv_timer_private.h"
 
-#include "src/system/audio/waveform.h"
 #include "src/system/device/ota.h"
 #include "src/system/device/system.h"
 
@@ -16,38 +16,37 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 
+#include "src/gui/shell/gui.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/audio/audio.h"
 #include "src/system/audio/headset.h"
-#include "src/system/library/audiobookdb.h"
-#include "src/system/device/clock.h"
-#include "src/system/playback/device_state.h"
-#include "src/system/remote/dlna.h"
-#include "src/system/remote/sonixlink.h"
-#include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/podcastdl.h"
-#include "src/system/streaming/tidalcache.h"
-#include "src/system/device/adb.h"
-#include "src/system/library/library.h"
-#include "src/system/remote/airplay.h"
-#include "src/system/streaming/radio.h"
-#include "src/system/net/wifi.h"
-#include "src/system/net/wifitransfer.h"
-#include "src/system/listenbrainz/listenbrainz.h"
+#include "src/system/audio/metronome.h"
+#include "src/system/audio/usbdac.h"
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/bluetooth/btreceiver.h"
 #include "src/system/core/config.h"
 #include "src/system/core/logging.h"
-#include "src/system/device/usb.h"
-#include "src/system/audio/usbdac.h"
-#include "src/system/gearboy/gearboy.h"
-#include "src/system/audio/metronome.h"
-#include "src/system/device/led.h"
-#include "src/system/device/sysinfo.h"
+#include "src/system/device/adb.h"
 #include "src/system/device/axpcharge.h"
 #include "src/system/device/chargescreen.h"
-#include "src/gui/shell/gui.h"
+#include "src/system/device/clock.h"
+#include "src/system/device/led.h"
+#include "src/system/device/sysinfo.h"
+#include "src/system/device/usb.h"
+#include "src/system/gearboy/gearboy.h"
+#include "src/system/listenbrainz/listenbrainz.h"
+#include "src/system/library/audiobookdb.h"
+#include "src/system/library/library.h"
+#include "src/system/net/wifi.h"
+#include "src/system/net/wifitransfer.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/remote/airplay.h"
+#include "src/system/remote/dlna.h"
+#include "src/system/remote/sonixlink.h"
+#include "src/system/streaming/podcastcache.h"
+#include "src/system/streaming/podcastdl.h"
+#include "src/system/streaming/provider.h"
+#include "src/system/streaming/radio.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -63,6 +62,14 @@
 // How often the power state machine polls. Kept short so a power-button press
 // feels responsive; the work done per tick is trivial.
 #define POWER_TICK_MS 250
+
+// ... and with the screen dark, where nothing waits on it: the power button
+// is taken at once anyway (power_notify_power_button makes the timer ready),
+// and everything else it watches then -- the radios' minute, the standby
+// minute, the cable, the charger -- is counted in seconds or more. Hours of
+// listening in a pocket are spent here, at a quarter of the wake-ups and of
+// the sysfs reads (the cable, the charger) a tick makes.
+#define POWER_TICK_DARK_MS 1000
 
 // How long ago a marker was stamped, from the tick the caller is working with.
 //
@@ -123,6 +130,10 @@ static lv_timer_t *g_refr_timer; // display refresh timer, paused while screen i
 static long g_max_brightness = -1;
 static lv_timer_t *g_power_timer;
 static bool g_screen_on = true;
+
+// The tick's period as it stands (see POWER_TICK_DARK_MS), for the windows
+// that are counted in ticks.
+static uint32_t power_tick_ms(void) { return g_screen_on ? POWER_TICK_MS : POWER_TICK_DARK_MS; }
 static uint32_t g_screen_off_at; // lv_tick when the panel last went dark
 
 // The standby countdown: the idle wait before a suspend attempt. It restarts at
@@ -592,6 +603,17 @@ static void headset_keys_wake(void) {
 #define RADIO_PARK_AFTER_MS_DEFAULT (60 * 1000)
 static uint32_t g_radio_park_after_ms = RADIO_PARK_AFTER_MS_DEFAULT;
 
+// Bluetooth's own wait, which the user can stretch ("Keep Bluetooth on" on the
+// Bluetooth audio page, [power] bt_park_seconds). Never shorter than 15 s, and
+// by default the same minute as Wi-Fi's.
+//
+// Longer is for a pause that ends with the headphones going back on: a radio
+// still up means they reconnect by themselves in a second or two, a parked one
+// means the stack is rebuilt first. The cost is the radio idling (a few mA) and,
+// when this wait is longer than the standby one, the SoC staying out of "mem"
+// until it has run out -- see suspend_if_idle().
+static uint32_t g_bt_park_after_ms = RADIO_PARK_AFTER_MS_DEFAULT;
+
 // No settings switch for this: parking is always on, and the two in_use() tests
 // below are the only places that decide when not to switch off.
 static bool g_wifi_parked; // this module switched it off, so it switches it back on
@@ -620,13 +642,13 @@ static bool streaming_playback_active(void) {
 	if (!path[0]) {
 		return false;
 	}
-	return qobuzcache_owns(path) || tidalcache_owns(path) || podcastcache_owns(path);
+	return stream_provider_owns(path) || podcastcache_owns(path);
 }
 
 // Whether the network is the point rather than an idle drain: an AirPlay
 // receiver waiting to be found, a DLNA server, a browser halfway through an
-// upload, a station streaming, a Qobuz/Tidal/podcast fetch or a
-// ListenBrainz request in flight.
+// upload, a station streaming, a Qobuz/Tidal/podcast fetch or a ListenBrainz submission
+// in flight.
 //
 // The *_network_wanted() halves matter as much as the downloading ones: between
 // the end of one track and the first bytes of the next there is an HTTPS request
@@ -638,8 +660,7 @@ static bool wifi_in_use(void) {
 	// teardown it did not expect.
 	return wifi_busy() || wifi_scan_running() || streaming_playback_active() || airplay_get_enabled() ||
 		   dlna_get_enabled() || sonixlink_get_enabled() ||
-		   wifitransfer_get_enabled() || qobuzcache_downloading_id() > 0 ||
-		   qobuzcache_network_wanted() || tidalcache_downloading_id() > 0 || tidalcache_network_wanted() ||
+		   wifitransfer_get_enabled() || stream_provider_any_network_wanted() ||
 		   podcastcache_downloading_id() > 0 || podcastcache_network_wanted() || podcastdl_busy() ||
 		   listenbrainz_network_wanted() || ota_busy();
 }
@@ -690,14 +711,14 @@ static bool bluetooth_in_use(void) {
 // shutdown timer is for.
 static bool player_is_busy(bool playing, uint32_t input_idle) {
 	return playing ||							   // a track or a station
-		   input_idle < POWER_TICK_MS * 4 ||	   // a key just pressed
+		   input_idle < power_tick_ms() * 4 ||	   // a key just pressed
 		   usbdac_is_active() ||				   // a computer feeding the DAC
 		   usb_storage_active() ||				   // the card exported over USB
 		   gearboy_running() ||					   // the emulator
-		   library_scan_running() ||			   // a scan, which is also writing to the card
+		   library_scan_running() || library_playlist_stage_busy() || // local database writes
 		   audiobookdb_scan_running() || wifitransfer_running() || dlna_running() || airplay_running() ||
 		   sonixlink_is_connected() || // a phone driving the player, not a switch left on
-		   qobuzcache_downloading_id() > 0 || tidalcache_downloading_id() > 0 || podcastcache_downloading_id() > 0 ||
+		   stream_provider_any_downloading() || podcastcache_downloading_id() > 0 ||
 		   ota_busy(); // a firmware update being fetched
 }
 
@@ -759,7 +780,7 @@ static void park_radios_if_idle(uint32_t now) {
 	// both in the same tick means writing to the SDIO chip while its neighbour's
 	// teardown is still in flight, which wedges the suspend path. The next pass
 	// is 250 ms away; the second radio can wait for it.
-	if (!g_bt_parked && bluetooth_get_enabled() && since(g_bt_idle_since, now) >= g_radio_park_after_ms) {
+	if (!g_bt_parked && bluetooth_get_enabled() && since(g_bt_idle_since, now) >= g_bt_park_after_ms) {
 		fprintf(stderr, "power: parking Bluetooth after %u ms unused\n", since(g_bt_idle_since, now));
 		park_bluetooth_now();
 		return;
@@ -1009,14 +1030,15 @@ static void rtc_alarm_arm(void) {
 	g_rtc_battery_armed = battery_first;
 	g_rtc_alarm_boot_at = boottime_ms() + (uint32_t)auto_off_s * 1000u;
 	g_rtc_battery_boot_at = boottime_ms() + (uint32_t)battery_s * 1000u;
-	printf("power: mem: RTC wake in %ld s %s\n", remaining_s,
-		   battery_first ? "to look at the battery" : "for the automatic shutdown");
+	printf("power: mem: RTC wake in %ld s %s\n", remaining_s, battery_first ? "to look at the battery" : "for the automatic shutdown");
 }
 
 void power_shutdown(void) {
+	if (recovery_prep_active())
+		return;
 	// Where the music had got to, before anything else stops. The player's own
-	// poll writes this only every ten seconds while playing and on a change of
-	// state, so without this flush a power-off loses up to ten seconds -- and a
+	// poll writes this only every thirty seconds while playing and on a change
+	// of state, so without this flush a power-off loses up to that much -- and a
 	// position seeked to while paused, which changes no state at all, would
 	// never be written.
 	device_state_remember_flush();
@@ -1033,8 +1055,7 @@ void power_shutdown(void) {
 	// Streamed and downloaded tracks are transient and must not survive a
 	// power cycle: without this the hidden folders carry a gigabyte of files
 	// the user never put there and will not listen to again.
-	qobuzcache_clear_on_exit();
-	tidalcache_clear_on_exit();
+	stream_provider_clear_on_exit_all();
 	podcastcache_clear_on_exit();
 	dlna_clear_on_exit();
 
@@ -1082,10 +1103,19 @@ static void power_auto_off_now(const char *why) {
 }
 
 static void suspend_to_ram(void) {
+	if (recovery_prep_active())
+		return;
 	const char *path = g_cfg.power_state_path;
 
 	printf("power: mem: starting the sequence (screen off for %u s)\n",
 		   (unsigned)((lv_tick_get() - g_screen_off_at) / 1000));
+
+	// 0. Where the music had got to, while the engine still knows: the freeze
+	//    below closes the track context, and a battery that runs flat during
+	//    the sleep is a power-off that never passes through power_shutdown().
+	//    The periodic write is thirty seconds apart (device_state.c), so this
+	//    is the one that makes the position exact. Also the book's.
+	device_state_remember_flush();
 
 	// 1. The freeze: a real stop, waited on until the track context is gone --
 	//    play_file() returned, decoder and FILE* closed, gapless empty, PCM
@@ -1239,8 +1269,7 @@ static void suspend_to_ram(void) {
 	}
 	// The battery's own wake: a few seconds of slack, as the RTC counts whole
 	// seconds and the wake takes a moment.
-	bool battery_wake =
-		rtc_woke_it && g_rtc_battery_armed && (int32_t)(boottime_ms() - g_rtc_battery_boot_at) >= -5000;
+	bool battery_wake = rtc_woke_it && g_rtc_battery_armed && (int32_t)(boottime_ms() - g_rtc_battery_boot_at) >= -5000;
 	if (battery_wake) {
 		printf("power: mem: RTC wake to look at the battery\n");
 	}
@@ -1282,6 +1311,13 @@ static void suspend_if_idle(uint32_t now, bool playing) {
 		mem_skip("music is playing");
 		return;
 	}
+	// Manual screen-off and a scan started after card insertion can bypass
+	// the scan page's screen hold. Let local database work finish before mem
+	// freezes its workers until the next user wake, just as for network work.
+	if (library_scan_running() || audiobookdb_scan_running() || library_playlist_stage_busy()) {
+		mem_skip("a library scan or queue save is running");
+		return;
+	}
 	// Pause counts as a stopped state: the PCM is already released after five
 	// seconds ("DAC powered down" in the log) and resuming always reopens the
 	// device from scratch, route included, which is the path every unpause
@@ -1302,6 +1338,15 @@ static void suspend_if_idle(uint32_t now, bool playing) {
 		return;
 	}
 	if (bluetooth_get_enabled()) {
+		// Kept on longer than the radios' usual wait, at the user's request: the
+		// suspend waits for it, because "mem" would mean parking the radio now
+		// and the point of the setting is that it is not parked yet. Only when
+		// the setting is longer than the usual wait, so the default behaves as
+		// it always has (the suspend takes the radio down as soon as it is due).
+		if (g_bt_park_after_ms > g_radio_park_after_ms && since(g_bt_idle_since, now) < g_bt_park_after_ms) {
+			mem_skip("Bluetooth is kept on for a while (Keep Bluetooth on)");
+			return;
+		}
 		// Enabled but idle: the park takes it down now and the suspend goes on
 		// the next round, the same way Wi-Fi is handled below.
 		park_bluetooth_now();
@@ -1480,7 +1525,6 @@ static bool (*g_wake_hook)(void);
 void power_set_wake_hook(bool (*cb)(void)) { g_wake_hook = cb; }
 
 void power_screen_off(void) {
-	waveform_set_screen_on(false); // told, but not a reason to stop -- see waveform.h
 	if (!g_screen_on) {
 		return;
 	}
@@ -1543,6 +1587,10 @@ void power_screen_off(void) {
 
 	led_set_standby(true); // the LED standby option keys off this
 
+	if (g_power_timer) {
+		lv_timer_set_period(g_power_timer, POWER_TICK_DARK_MS);
+	}
+
 	// The screen going dark is the natural moment to write the time down: a
 	// battery pulled out while the device sits in standby then costs a few
 	// seconds of clock, not however long was left on the slow timer.
@@ -1576,7 +1624,6 @@ void power_keep_animations_paused(void) {
 }
 
 void power_screen_on(void) {
-	waveform_set_screen_on(true);
 	if (g_screen_on) {
 		return;
 	}
@@ -1680,10 +1727,16 @@ void power_screen_on(void) {
 
 	led_set_standby(false);
 
+	if (g_power_timer) {
+		lv_timer_set_period(g_power_timer, POWER_TICK_MS);
+	}
+
 	fprintf(stderr, "power: screen on (brightness=%ld)\n", g_cfg.brightness);
 }
 
 void power_toggle_screen(void) {
+	if (recovery_prep_active())
+		return;
 	if (g_screen_on) {
 		power_screen_off();
 	} else {
@@ -1725,6 +1778,16 @@ static void power_timer_cb(lv_timer_t *timer) {
 		now = lv_tick_get();
 	}
 
+	// 1a. the dark screen keeps its animations stopped (power_screen_off): one
+	//     started since -- a list scrolling to the new track -- resumes LVGL's
+	//     animation timer by itself, which would then run until the wake.
+	if (!g_screen_on) {
+		lv_timer_t *anim_timer = lv_anim_get_timer();
+		if (anim_timer && !lv_timer_get_paused(anim_timer)) {
+			lv_timer_pause(anim_timer);
+		}
+	}
+
 	// 2. music playing keeps resetting the suspend clock (but not the screen
 	//    clock -- the screen still dims while a track plays untouched)
 	// A live stream goes out through audio_external_*, which audio.c's own
@@ -1738,8 +1801,7 @@ static void power_timer_cb(lv_timer_t *timer) {
 	// with the phone paused is exactly the idle state the timer exists for.
 	// The metronome counts as music: a player clicking in a pocket with the
 	// screen dark must not go to sleep under it.
-	bool playing = (audio_get_status() == AUDIO_STATUS_PLAYING) || radio_is_playing() || btreceiver_is_streaming() ||
-				   metronome_running();
+	bool playing = (audio_get_status() == AUDIO_STATUS_PLAYING) || radio_is_playing() || btreceiver_is_streaming() || metronome_running();
 	if (playing) {
 		g_last_playing_ms = now;
 	}
@@ -1754,7 +1816,7 @@ static void power_timer_cb(lv_timer_t *timer) {
 	// cannot fall in the middle of a track change.
 	bool usb_now = usb_vbus_present();
 	bool usb_changed = g_usb_present_known && usb_now != g_usb_present_last;
-	if (playing || input_idle < POWER_TICK_MS * 2 || usb_changed) {
+	if (playing || input_idle < power_tick_ms() * 2 || usb_changed) {
 		g_mem_active_ms = now;
 	}
 	g_usb_present_last = usb_now;
@@ -1972,6 +2034,7 @@ void power_init(const power_config_t *cfg, lv_display_t *disp) {
 		park_secs = 15; // any lower and a pocket checked twice re-associates for nothing
 	}
 	g_radio_park_after_ms = (uint32_t)park_secs * 1000u;
+	power_set_bt_park_seconds((uint32_t)config_get_int("power", "bt_park_seconds", park_secs));
 
 	g_power_timer = lv_timer_create(power_timer_cb, POWER_TICK_MS, NULL);
 
@@ -1981,3 +2044,14 @@ void power_init(const power_config_t *cfg, lv_display_t *disp) {
 }
 
 bool power_radios_parked(void) { return g_wifi_parked || g_bt_parked; }
+
+// UI thread, like everything else in this file. Not saved here: the page does
+// that, so init can apply the stored value through the same clamp.
+void power_set_bt_park_seconds(uint32_t seconds) {
+	if (seconds < 15) {
+		seconds = 15; // the same floor as the radios' own wait
+	}
+	g_bt_park_after_ms = seconds * 1000u;
+}
+
+uint32_t power_bt_park_seconds(void) { return g_bt_park_after_ms / 1000u; }

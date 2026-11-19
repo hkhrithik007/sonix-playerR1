@@ -13,6 +13,7 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/gui/streaming/podcastpage.h"
@@ -58,10 +59,10 @@ static char chosen_file[512];
 
 typedef enum {
 	FEED_LOOKING,
-	FEED_FOUND,	   // in the catalogue or read from the feed, and not followed yet
-	FEED_ALREADY,  // followed already
-	FEED_MISSING,  // the catalogue does not have it
-	FEED_FAILED,   // the catalogue could not be asked
+	FEED_FOUND,	  // in the catalogue or read from the feed, and not followed yet
+	FEED_ALREADY, // followed already
+	FEED_MISSING, // the catalogue does not have it
+	FEED_FAILED,  // the catalogue could not be asked
 } feed_state_t;
 
 typedef struct {
@@ -329,8 +330,7 @@ static void make_feed_row(int i) {
 	lv_obj_set_event_bubble(f->box, true);
 	f->tick = lv_image_create(f->box);
 	lv_image_set_src(f->tick, &icon_check_small);
-	lv_obj_set_style_image_recolor(f->tick, lv_color_white(), 0);
-	lv_obj_set_style_image_recolor_opa(f->tick, LV_OPA_COVER, 0);
+	lv_obj_add_style(f->tick, &sx_style_icon_on_accent, 0); // on the accent box
 	lv_obj_center(f->tick);
 	lv_obj_set_event_bubble(f->tick, true);
 
@@ -566,13 +566,12 @@ static void follow_cb(lv_event_t *e) {
 	lv_obj_set_style_radius(open, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_shadow_width(open, 0, 0);
 	lv_obj_set_style_border_width(open, 0, 0);
-	lv_obj_add_style(open, &theme_style_accent_bg, 0);
+	lv_obj_add_style(open, &sx_style_accent, 0); // the fill and its own ink
 	lv_obj_set_style_margin_top(open, 10, 0);
 	lv_obj_add_event_cb(open, open_followed_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_t *open_label = lv_label_create(open);
 	lv_label_set_text(open_label, tr("podcast_opml_open_followed"));
 	lv_obj_set_style_text_font(open_label, &font_ui_22, 0);
-	lv_obj_set_style_text_color(open_label, lv_color_white(), 0);
 	lv_obj_center(open_label);
 
 	switch_screen(result_screen);
@@ -679,7 +678,8 @@ static void feeds_unloaded_cb(lv_event_t *e) {
 static bool export_busy;
 
 static void export_write(void) {
-	const char *root = podcastdl_root();
+	char root[512];
+	podcastdl_root(root, sizeof(root));
 	if (!root[0]) {
 		toast_error(tr("sd_card_missing"));
 		return;
@@ -780,7 +780,8 @@ void podcastopml_export(void) {
 	if (export_busy) {
 		return;
 	}
-	if (podcastdl_root()[0] && podcastsubs_count() > 0 && podcast_configured() && network_up()) {
+	char root[512];
+	if (podcastdl_root(root, sizeof(root)) && podcastsubs_count() > 0 && podcast_configured() && network_up()) {
 		long long *ids = calloc(PODCASTSUBS_MAX + 1, sizeof(*ids));
 		if (ids && podcastsubs_missing_urls(ids, PODCASTSUBS_MAX) > 0) {
 			pthread_t thread;
@@ -889,12 +890,11 @@ void podcastopml_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(follow_btn, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_shadow_width(follow_btn, 0, 0);
 	lv_obj_set_style_border_width(follow_btn, 0, 0);
-	lv_obj_add_style(follow_btn, &theme_style_accent_bg, 0);
+	lv_obj_add_style(follow_btn, &sx_style_accent, 0); // the fill and its own ink
 	lv_obj_add_event_cb(follow_btn, follow_cb, LV_EVENT_CLICKED, NULL);
 	follow_label = lv_label_create(follow_btn);
 	lv_label_set_text(follow_label, "");
 	lv_obj_set_style_text_font(follow_label, &font_ui_22, 0);
-	lv_obj_set_style_text_color(follow_label, lv_color_white(), 0);
 	lv_obj_center(follow_label);
 
 	switcher_attach_back_gesture(feeds_screen);

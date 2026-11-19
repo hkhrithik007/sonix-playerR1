@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "src/gui/shell/sx_palette.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include "src/gui/shell/confirm.h"
 #include "src/gui/settings/devoptions.h"
 #include "src/gui/settings/language.h"
+#include "src/gui/settings/musicsettings.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/settings/kblayoutpage.h"
 #include "src/gui/shell/keyboard.h"
@@ -19,6 +21,8 @@
 #include "src/gui/settings/screensaver.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_card.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/gui/settings/systempage.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/settings/timeset.h"
@@ -55,7 +59,6 @@ static void headset_toggled_cb(lv_event_t *e) {
 
 static lv_obj_t *screensettings_screen;
 static lv_obj_t *othersettings_screen;
-static lv_obj_t *keyboard_screen;
 static lv_obj_t *brightness_slider;
 static lv_obj_t *brightness_value;
 static lv_obj_t *screen_off_value;
@@ -182,8 +185,11 @@ static void screen_off_changed_cb(lv_event_t *e) {
 	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[index].label));
 }
 
-// The dimmest backlight level on the slider: 0 would put the backlight out.
-#define BRIGHTNESS_FLOOR 1
+// 0..100 scale -- anything under that is indistinguishable from off.
+static long brightness_floor(long max) {
+	long floor = max / 20;
+	return floor > 0 ? floor : 1;
+}
 
 static void brightness_show_value(long value, long max) {
 	lv_label_set_text_fmt(brightness_value, "%d%%", (int)((value * 100 + max / 2) / max));
@@ -213,10 +219,10 @@ static void screensettings_loaded_cb(lv_event_t *e) {
 	if (max <= 0) {
 		max = 100;
 	}
-	lv_slider_set_range(brightness_slider, BRIGHTNESS_FLOOR, (int32_t)max);
+	lv_slider_set_range(brightness_slider, (int32_t)brightness_floor(max), (int32_t)max);
 
 	long value = power_get_brightness();
-	if (value < BRIGHTNESS_FLOOR) {
+	if (value < brightness_floor(max)) {
 		value = max;
 	}
 	lv_slider_set_value(brightness_slider, (int32_t)value, LV_ANIM_OFF);
@@ -227,8 +233,8 @@ static void screensettings_loaded_cb(lv_event_t *e) {
 static void refresh_brightness_slider(void) {
 	theme_apply_slider_knob(brightness_slider);
 	if (brightness_slider) {
-		lv_obj_set_style_bg_color(brightness_slider, theme()->accent, LV_PART_INDICATOR);
-		lv_obj_set_style_bg_color(brightness_slider, theme()->text_secondary, LV_PART_MAIN);
+		lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_accent, LV_PART_INDICATOR);
+		lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_text2, LV_PART_MAIN);
 	}
 }
 
@@ -241,23 +247,23 @@ static void build_screen_page(gui_config_t *cfg) {
 	lv_obj_t *card = lv_obj_create(container);
 	lv_obj_set_width(card, lv_pct(100));
 	lv_obj_set_height(card, 140);
-	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 12, 0);
-	lv_obj_set_style_border_width(card, 0, 0);
-	lv_obj_set_style_shadow_width(card, 0, 0);
-	lv_obj_set_style_pad_hor(card, 20, 0);
+	// The 2.0 card's look, as on the slider cards under it (settingsrow.c):
+	// not a button, so no pressed fill.
+	sx_card_style(card);
+	lv_obj_remove_style(card, &sx_style_panel_press, LV_STATE_PRESSED);
 	lv_obj_set_style_pad_ver(card, 14, 0);
 	lv_obj_set_scrollable(card, false);
+	lv_obj_set_event_bubble(card, true);
 
 	lv_obj_t *label = lv_label_create(card);
 	lv_label_set_text(label, tr("brightness"));
-	lv_obj_add_style(label, &theme_style_text, 0);
+	lv_obj_add_style(label, &sx_style_panel_text, 0);
 	lv_obj_set_style_text_font(label, &font_ui_24, 0);
 	lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, 0);
 
 	brightness_value = lv_label_create(card);
-	lv_obj_add_style(brightness_value, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(brightness_value, &font_ui_24, 0);
+	lv_obj_add_style(brightness_value, &sx_style_panel_text2, 0);
+	lv_obj_set_style_text_font(brightness_value, &font_ui_22, 0);
 	lv_obj_align(brightness_value, LV_ALIGN_TOP_RIGHT, 0, 0);
 	lv_label_set_text(brightness_value, "");
 
@@ -266,14 +272,14 @@ static void build_screen_page(gui_config_t *cfg) {
 	lv_obj_set_width(brightness_slider, lv_pct(100));
 	lv_obj_set_height(brightness_slider, 10);
 	lv_obj_align(brightness_slider, LV_ALIGN_BOTTOM_MID, 0, -14);
-	lv_slider_set_range(brightness_slider, BRIGHTNESS_FLOOR, 100);
+	lv_slider_set_range(brightness_slider, 5, 100);
 
 	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-	lv_obj_set_style_bg_color(brightness_slider, theme()->text_secondary, LV_PART_MAIN);
+	lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_text2, LV_PART_MAIN);
 	lv_obj_set_style_bg_opa(brightness_slider, LV_OPA_40, LV_PART_MAIN);
 
 	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-	lv_obj_set_style_bg_color(brightness_slider, theme()->accent, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_accent, LV_PART_INDICATOR);
 
 	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
 	lv_obj_set_style_bg_color(brightness_slider, lv_color_white(), LV_PART_KNOB);
@@ -365,38 +371,19 @@ static lv_obj_t *kbtype_buttons[2]; // 0 = QWERTY, 1 = T9
 static void refresh_kbtype_buttons(void) {
 	int active = config_get_int("other", "keyboard_t9", 0) != 0 ? 1 : 0;
 	for (int i = 0; i < 2; i++) {
-		if (!kbtype_buttons[i]) {
-			continue;
-		}
-		bool on = i == active;
-		lv_obj_set_style_bg_color(kbtype_buttons[i], on ? theme()->accent : theme()->surface_pressed, 0);
-		lv_obj_set_style_text_color(lv_obj_get_child(kbtype_buttons[i], 0),
-									on ? lv_color_white() : theme()->text_primary, 0);
+		settingsrow_pill_active(kbtype_buttons[i], i == active);
 	}
 }
 
 static void kbtype_pick_cb(lv_event_t *e) {
+	if (switcher_back_drag_active()) {
+		return;
+	}
 	int t9 = (int)(intptr_t)lv_event_get_user_data(e);
 	config_set_int("other", "keyboard_t9", t9);
 	config_save();
 	keyboard_refresh_type();
 	refresh_kbtype_buttons();
-}
-
-static lv_obj_t *make_kbtype_pill(lv_obj_t *parent, const char *text, int t9) {
-	lv_obj_t *btn = lv_btn_create(parent);
-	lv_obj_set_size(btn, LV_SIZE_CONTENT, 64);
-	lv_obj_set_style_pad_hor(btn, 22, 0);
-	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0); // the Adwaita pill
-	lv_obj_set_style_shadow_width(btn, 0, 0);
-	lv_obj_set_style_border_width(btn, 0, 0);
-	lv_obj_add_event_cb(btn, kbtype_pick_cb, LV_EVENT_CLICKED, (void *)(intptr_t)t9);
-
-	lv_obj_t *label = lv_label_create(btn);
-	lv_label_set_text(label, text);
-	lv_obj_set_style_text_font(label, &font_ui_22, 0);
-	lv_obj_center(label);
-	return btn;
 }
 
 // Screenshots, on the keys shown under the switch.
@@ -433,11 +420,9 @@ static void screenshot_toggled_cb(lv_event_t *e) {
 	screenshot_set_enabled(lv_obj_has_state(screenshot_switch, LV_STATE_CHECKED));
 }
 
-static void build_screenshot_card(lv_obj_t *container);
-
 static void build_other_page(gui_config_t *cfg) {
 	othersettings_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(othersettings_screen, cfg, "settings_keys");
+	lv_obj_t *container = settingsrow_page(othersettings_screen, cfg, "more");
 
 	settingsrow_toggle(container, "settings_in_line_remote", &headset_switch, headset_toggled_cb);
 	if (headset_controls_enabled()) {
@@ -452,115 +437,108 @@ static void build_other_page(gui_config_t *cfg) {
 	lv_slider_set_value(volume_step_slider, step - VOLUME_STEP_MIN, LV_ANIM_OFF);
 	lv_label_set_text_fmt(volume_step_value, "%d", step);
 	input_set_volume_step(step);
-
-	// Screenshots: the option carries the key combination as a fixed subtitle.
-	// Without it the switch would enable something without saying how to use it.
-	build_screenshot_card(container);
-
-	switcher_attach_back_gesture(othersettings_screen);
-}
-
-static void build_keyboard_page(gui_config_t *cfg) {
-	keyboard_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(keyboard_screen, cfg, "settings_keyboard");
+	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
 
 	// Which alphabets the keyboard can be laid out in, above the shape of the
 	// keys: the letters matter more than whether they come ten to a row or
 	// three to a key.
 	settingsrow_add(container, "keyboard_layout", NULL, switch_screen_cb, kblayoutpage_screen);
 
-	// Keyboard type: the two pills on a card, like the MSEB radius control.
-	lv_obj_t *kb_card = lv_obj_create(container);
-	lv_obj_set_width(kb_card, lv_pct(100));
-	lv_obj_set_height(kb_card, LV_SIZE_CONTENT);
-	lv_obj_add_style(kb_card, &theme_style_card, 0);
-	lv_obj_set_style_radius(kb_card, 12, 0);
-	lv_obj_set_style_border_width(kb_card, 0, 0);
-	lv_obj_set_style_shadow_width(kb_card, 0, 0);
-	lv_obj_set_style_pad_all(kb_card, 16, 0);
-	lv_obj_set_style_pad_row(kb_card, 12, 0);
-	lv_obj_set_scrollable(kb_card, false);
-	lv_obj_set_flex_flow(kb_card, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(kb_card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-
-	lv_obj_t *kb_title = lv_label_create(kb_card);
-	lv_label_set_text(kb_title, tr("settings_keyboard_type"));
-	lv_obj_add_style(kb_title, &theme_style_text, 0);
-	lv_obj_set_style_text_font(kb_title, &font_ui_24, 0);
-
-	lv_obj_t *kb_pills = lv_obj_create(kb_card);
-	lv_obj_set_width(kb_pills, lv_pct(100));
-	lv_obj_set_height(kb_pills, LV_SIZE_CONTENT);
-	lv_obj_set_style_bg_opa(kb_pills, 0, 0);
-	lv_obj_set_style_border_width(kb_pills, 0, 0);
-	lv_obj_set_style_pad_all(kb_pills, 0, 0);
-	lv_obj_set_style_pad_column(kb_pills, 8, 0);
-	lv_obj_set_scrollable(kb_pills, false);
-	lv_obj_set_flex_flow(kb_pills, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(kb_pills, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-	kbtype_buttons[0] = make_kbtype_pill(kb_pills, "QWERTY", 0);
-	kbtype_buttons[1] = make_kbtype_pill(kb_pills, "T9", 1);
+	// Keyboard type: the two pills on a card, like the clock position.
+	lv_obj_t *kb_pills = NULL;
+	settingsrow_pills(container, "settings_keyboard_type", &kb_pills);
+	kbtype_buttons[0] = settingsrow_pill_text(kb_pills, "QWERTY", 0, kbtype_pick_cb);
+	kbtype_buttons[1] = settingsrow_pill_text(kb_pills, "T9", 1, kbtype_pick_cb);
 	refresh_kbtype_buttons();
 	theme_register_refresh(refresh_kbtype_buttons);
 
-	switcher_attach_back_gesture(keyboard_screen);
-}
-
-static void build_screenshot_card(lv_obj_t *container) {
-	lv_obj_t *shot_card = settingsrow_toggle(container, "devoptions_enable_screenshots", &screenshot_switch, screenshot_toggled_cb);
-	lv_obj_t *shot_name = lv_obj_get_child(shot_card, 0);
-	lv_obj_t *shot_toggle = lv_obj_get_child(shot_card, 1);
-
-	lv_obj_t *shot_hint = lv_label_create(shot_card);
-	lv_label_set_text(shot_hint, tr("devoptions_screenshot_keys"));
-	lv_obj_set_width(shot_hint, lv_pct(100));
-	lv_obj_set_style_pad_right(shot_hint, lv_obj_get_style_pad_right(shot_name, LV_PART_MAIN), 0);
-	lv_obj_add_style(shot_hint, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(shot_hint, &font_ui_18, 0);
-
-	// Name on top, keys at the bottom, in a column the card grows around: the
-	// keys take two lines in a long language or with large text, and a row of
-	// fixed height would draw them over the name. The row's own height stays
-	// the least it is, and the switch keeps to the middle of it.
-	int32_t row_height = lv_obj_get_style_height(shot_card, LV_PART_MAIN);
-	lv_obj_set_height(shot_card, LV_SIZE_CONTENT);
-	lv_obj_set_style_min_height(shot_card, row_height, 0);
-	lv_obj_set_flex_flow(shot_card, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(shot_card, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-	lv_obj_set_style_pad_row(shot_card, 2, 0);
-	lv_obj_set_ignore_layout(shot_toggle, true);
-
+	// Screenshots: the option carries the key combination inside its card,
+	// under its name. Without it the switch would enable something without
+	// saying how to use it.
+	settingsrow_switch_card(container, "devoptions_enable_screenshots", "devoptions_screenshot_keys", &screenshot_switch,
+							screenshot_toggled_cb);
 	if (screenshot_enabled()) {
 		lv_obj_add_state(screenshot_switch, LV_STATE_CHECKED);
 	}
+
+	switcher_attach_back_gesture(othersettings_screen);
+}
+
+// ---------------------------------------------------------------------------
+// The settings list itself
+//
+// 2.0: every row a card that says where it leads and, where there is one
+// worth knowing before going in, what is set there now -- "Appearance · Dark",
+// "Screen · 30 seconds", "Language · English" -- with the chevron after it,
+// so the page answers the commonest question without a tap. The values are
+// read again each time the page comes up: all three can change elsewhere
+// (the theme from the control centre's long press, the language from the
+// first-boot panel), and three label writes cost nothing.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *appearance_value;
+static lv_obj_t *screen_value;
+static lv_obj_t *language_value;
+
+static lv_obj_t *nav_card(lv_obj_t *parent, const char *tag, lv_event_cb_t cb, void *user, lv_obj_t **value_out) {
+	lv_obj_t *card = sx_card_create(parent);
+	sx_card_title(card, tr(tag));
+	if (value_out) {
+		*value_out = sx_card_value(card, "");
+	}
+	sx_card_chevron(card);
+	sx_card_on_click(card, cb, user);
+	return card;
+}
+
+static void refresh_values(void) {
+	if (appearance_value) {
+		lv_label_set_text(appearance_value, tr(theme_is_dark() ? "appearance_dark" : "appearance_light"));
+	}
+	if (screen_value) {
+		lv_label_set_text(screen_value, tr(SCREEN_OFF[screen_off_index()].label));
+	}
+	if (language_value) {
+		char label[64];
+		lang_display_name(lang_current(), label, sizeof(label));
+		lv_label_set_text(language_value, label);
+	}
+}
+
+static void settings_loaded_cb(lv_event_t *e) {
+	(void)e;
+	refresh_values();
 }
 
 void settings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(settings_screen, cfg, "settings");
+	container = sx_card_nav_group(container);
 
 	build_screen_page(cfg);
 	build_other_page(cfg);
-	build_keyboard_page(cfg);
 
-	// In groups, like Music: how it looks, how it is driven, the device.
-	settingsrow_heading(container, "settings_section_personal");
-	settingsrow_add(container, "appearance", NULL, switch_screen_cb, appearance_screen);
-	settingsrow_add(container, "settings_screen", NULL, switch_screen_cb, screensettings_screen);
-	language_bind_menu_row(settingsrow_add(container, "language", NULL, switch_screen_cb, language_screen));
+	nav_card(container, "appearance", switch_screen_cb, appearance_screen, &appearance_value);
+	// Music's own settings (playback, EQ, DAC filters, scan options...). The
+	// gear in the Music header that used to lead there is gone in 2.0 (no
+	// header button repeating a page), so this row is the way in now -- next
+	// to Appearance, the other page people come to Settings for.
+	nav_card(container, "music", switch_screen_cb, musicsettings_screen, NULL);
+	nav_card(container, "settings_screen", switch_screen_cb, screensettings_screen, &screen_value);
+	nav_card(container, "date_and_time", clock_clicked_cb, NULL, NULL);
+	nav_card(container, "power", switch_screen_cb, powersettings_screen, NULL);
+	// Its title is two languages' words joined (language.c), which the page
+	// that owns it keeps up to date.
+	lv_obj_t *language_card = nav_card(container, "language", switch_screen_cb, language_screen, &language_value);
+	language_bind_menu_row(sx_card_title(language_card, tr("language")));
 
-	settingsrow_heading(container, "settings_section_controls");
-	settingsrow_add(container, "settings_keys", NULL, switch_screen_cb, othersettings_screen);
-	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
-	settingsrow_add(container, "settings_keyboard", NULL, switch_screen_cb, keyboard_screen);
-
-	settingsrow_heading(container, "settings_section_device");
-	settingsrow_add(container, "date_and_time", NULL, clock_clicked_cb, NULL);
-	settingsrow_add(container, "power", NULL, switch_screen_cb, powersettings_screen);
-	settingsrow_add(container, "system", NULL, switch_screen_cb, systempage_screen);
+	nav_card(container, "more", switch_screen_cb, othersettings_screen, NULL);
+	nav_card(container, "system", switch_screen_cb, systempage_screen, NULL);
 	// Hidden until the build number in System > Info is tapped five times.
 	// Built regardless, so unlocking is a visibility change rather than a
 	// rebuild of the page.
-	devoptions_row = settingsrow_add(container, "developer_options", NULL, switch_screen_cb, devoptions_screen);
+	devoptions_row = nav_card(container, "developer_options", switch_screen_cb, devoptions_screen, NULL);
 	settings_refresh_devoptions();
+
+	refresh_values();
+	lv_obj_add_event_cb(settings_screen, settings_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 }

@@ -6,19 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-// alac.c declares this extern and leaves the definition to the caller. Without
-// a definition the file does not link, and a wrong value silently byte-swaps
-// every sample, so the real value is probed at runtime in alacdec_open().
-int host_bigendian = 0;
+// Constant for this build, so independent decoder opens do not race on it.
+const int host_bigendian = __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__;
 
 // Exact length of ALACSpecificConfig, big-endian.
 #define COOKIE_SIZE 24
-
-// alac.c reads bits from the access unit without knowing where it ends, so the
-// access unit is copied into a buffer with this much zero padding behind it. A
-// decoder that overruns stays inside the allocation and reads zeros instead of
-// someone else's memory.
-#define INPUT_SLACK 4096
 
 struct alacdec {
 	alac_file *alac;
@@ -27,9 +19,6 @@ struct alacdec {
 	int sample_rate;
 	int bits;
 	int frame_samples; // frameLength: maximum samples per access unit
-
-	unsigned char *in; // access unit + zero padding
-	int in_capacity;
 
 	unsigned char *raw; // raw decoder output, packed 16 or 24 bit
 	int raw_capacity;
@@ -45,11 +34,11 @@ static uint32_t be32(const unsigned char *p) {
 // it. The buffer is an array of uint32_t on purpose: that function reads 32-
 // and 16-bit integers straight off the pointer, and on MIPS an unaligned read
 // is not merely slow.
-static void feed_config(alac_file *alac, const unsigned char *cookie) {
+static bool feed_config(alac_file *alac, const unsigned char *cookie) {
 	uint32_t buf[(24 + COOKIE_SIZE) / 4];
 	memset(buf, 0, 24);
 	memcpy((unsigned char *)buf + 24, cookie, COOKIE_SIZE);
-	alac_set_info(alac, (char *)buf);
+	return alac_set_info(alac, (char *)buf) != 0;
 }
 
 alacdec_t *alacdec_open(const unsigned char *cookie, int cookie_len) {
@@ -78,15 +67,10 @@ alacdec_t *alacdec_open(const unsigned char *cookie, int cookie_len) {
 		fprintf(stderr, "alac: %d channels not supported (mono and stereo only)\n", channels);
 		return NULL;
 	}
-	if (frame_length == 0 || frame_length > 65536 || sample_rate == 0) {
+	if (frame_length == 0 || frame_length > 65536 || sample_rate == 0 || cookie[4] != 0 || cookie[8] > 31) {
 		fprintf(stderr, "alac: implausible configuration (frameLength %u, %u Hz)\n", frame_length, sample_rate);
 		return NULL;
 	}
-
-	// Probed once, rather than trusting a macro: a wrong value here produces
-	// noise, not an error.
-	const uint16_t probe = 0x0001;
-	host_bigendian = (*(const unsigned char *)&probe == 0) ? 1 : 0;
 
 	alacdec_t *a = calloc(1, sizeof(*a));
 	if (!a) {
@@ -102,20 +86,17 @@ alacdec_t *alacdec_open(const unsigned char *cookie, int cookie_len) {
 		free(a);
 		return NULL;
 	}
-	feed_config(a->alac, cookie);
+	if (!feed_config(a->alac, cookie)) {
+		alacdec_close(a);
+		return NULL;
+	}
 
 	// The decoder writes (bits/8) bytes per sample per channel, at most one
 	// frameLength at a time.
 	a->raw_capacity = a->frame_samples * channels * (bits / 8);
 	a->raw = malloc((size_t)a->raw_capacity);
 
-	// A compressed access unit can only be marginally larger than the
-	// uncompressed one; maxFrameBytes would be the right measure but not every
-	// tagger writes it, so start generous and grow if needed.
-	a->in_capacity = a->raw_capacity + INPUT_SLACK;
-	a->in = calloc(1, (size_t)a->in_capacity);
-
-	if (!a->raw || !a->in) {
+	if (!a->raw) {
 		alacdec_close(a);
 		return NULL;
 	}
@@ -132,7 +113,6 @@ void alacdec_close(alacdec_t *a) {
 	// buffers create_alac() allocates. See alac/README.md.
 	free_alac(a->alac);
 	free(a->raw);
-	free(a->in);
 	free(a);
 }
 
@@ -146,28 +126,15 @@ int alacdec_decode(alacdec_t *a, const unsigned char *au, int au_len, int32_t *o
 		return 0;
 	}
 
-	// The access unit must fit in the buffer together with its zero padding.
-	if (au_len + INPUT_SLACK > a->in_capacity) {
-		int want = au_len + INPUT_SLACK;
-		unsigned char *grown = realloc(a->in, (size_t)want);
-		if (!grown) {
-			return 0;
-		}
-		a->in = grown;
-		a->in_capacity = want;
-	}
-	memcpy(a->in, au, (size_t)au_len);
-	memset(a->in + au_len, 0, (size_t)(a->in_capacity - au_len));
-
 	int raw_bytes = 0;
-	decode_frame(a->alac, a->in, a->raw, &raw_bytes);
+	decode_frame(a->alac, au, au_len, a->raw, &raw_bytes);
 
 	int bytes_per_frame = a->channels * (a->bits / 8);
 	if (raw_bytes <= 0 || bytes_per_frame <= 0) {
 		return 0;
 	}
 	if (raw_bytes > a->raw_capacity) {
-		// The frameLength clamp inside alac.c should prevent this, but if it
+		// The frameLength guard inside alac.c should prevent this, but if it
 		// happens the decoder has already written past the buffer, and the only
 		// sane response is not to compound it by reading.
 		fprintf(stderr, "alac: %d byte frame beyond the %d expected; skipping it\n", raw_bytes, a->raw_capacity);
@@ -184,7 +151,7 @@ int alacdec_decode(alacdec_t *a, const unsigned char *au, int au_len, int32_t *o
 		// The decoder writes int16 in host byte order.
 		const int16_t *src = (const int16_t *)(const void *)a->raw;
 		for (int i = 0; i < samples; i++) {
-			out[i] = (int32_t)src[i] << 16;
+			out[i] = (int32_t)src[i] * 65536;
 		}
 	} else {
 		// 24 bit: three bytes per sample, little-endian, as alac.c writes them.

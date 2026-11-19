@@ -8,24 +8,29 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "src/system/core/config.h"
-#include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 
 // Where the log goes when it is on: beside everything else the player writes.
 #define LOG_SUBDIR ".local"
 #define LOG_FILE_NAME "sonix_player.log"
+#define LOG_FILE_MAX (8 * 1024 * 1024)
 
 // The player prints a good deal before the card is mounted: which block device
 // it found, what the battery reported, whether the clock survived. That cannot
@@ -51,7 +56,14 @@
 static FILE *early_stream;
 
 static char sd_log_path[512];
-static bool on_sd;
+static atomic_bool on_sd;
+static bool explicit_log;
+static int child_fd_limit;
+
+static void child_fd_limit_init(void) {
+	struct rlimit limit;
+	child_fd_limit = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur <= INT_MAX ? (int)limit.rlim_cur : -1;
+}
 
 // The stream stdout/stderr currently feed. Kept so a switch can close the
 // previous one: dup2 copies the descriptor into 1 and 2, but the original stays
@@ -59,6 +71,7 @@ static bool on_sd;
 // the USB export can never unmount it. Every log file is opened close-on-exec,
 // so no child process inherits that original.
 static FILE *active_stream;
+static atomic_bool holding_output;
 
 // The card can go away under the log: the USB export unmounts it, and so does
 // pulling it out. While it is gone everything printed is held the same way and
@@ -260,8 +273,7 @@ static void emit(int fd, const char *data, size_t size) {
 	pthread_mutex_lock(&queue_lock);
 	if (queue_dropped > 0) {
 		char note[80];
-		int len = snprintf(note, sizeof(note), "---- %lu bytes of log dropped: the card fell behind ----\n",
-						   queue_dropped);
+		int len = snprintf(note, sizeof(note), "---- %lu bytes of log dropped: the card fell behind ----\n", queue_dropped);
 		if (len > 0 && queue_record(fd, note, (size_t)len)) {
 			queue_dropped = 0;
 		}
@@ -283,6 +295,137 @@ static long queue_now_ms(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+// Only the writer rotates the managed card log, with log_lock held. Do not
+// use redirect_to() here: it waits for this same writer to finish its batch.
+// Explicit SONIX_LOG destinations keep their existing unbounded semantics.
+static bool rotate_card_log(const struct stat *st) {
+	char previous[sizeof(sd_log_path) + 8];
+	snprintf(previous, sizeof(previous), "%s.1", sd_log_path);
+	int old_fd = fileno(active_stream);
+	if (st->st_size > LOG_FILE_MAX) {
+		// An old unbounded log can be enormous. Copy only its newest 8 MiB,
+		// on this worker, before shortening the original. A failed copy or
+		// rename leaves the original intact. Never reuse somebody else's temp.
+		char temporary[sizeof(sd_log_path) + 24];
+		snprintf(temporary, sizeof(temporary), "%s.1.tmp.XXXXXX", sd_log_path);
+		int dest = mkostemp(temporary, O_CLOEXEC);
+		if (dest < 0) {
+			return false;
+		}
+		int source = open(sd_log_path, O_RDONLY | O_CLOEXEC);
+		struct stat current;
+		bool ok = source >= 0 && fstat(source, &current) == 0 && current.st_dev == st->st_dev && current.st_ino == st->st_ino;
+		char chunk[8192];
+		off_t offset = st->st_size - LOG_FILE_MAX;
+		while (ok && offset < st->st_size) {
+			size_t want = (size_t)(st->st_size - offset);
+			if (want > sizeof(chunk)) {
+				want = sizeof(chunk);
+			}
+			ssize_t got = pread(source, chunk, want, offset);
+			if (got < 0 && errno == EINTR) {
+				continue;
+			}
+			if (got <= 0) {
+				ok = false;
+				break;
+			}
+			size_t written = 0;
+			while (written < (size_t)got) {
+				ssize_t done = write(dest, chunk + written, (size_t)got - written);
+				if (done < 0 && errno == EINTR) {
+					continue;
+				}
+				if (done <= 0) {
+					ok = false;
+					break;
+				}
+				written += (size_t)done;
+			}
+			offset += got;
+		}
+		if (source >= 0) {
+			close(source);
+		}
+		if (ok && fdatasync(dest) != 0) {
+			ok = false;
+		}
+		if (close(dest) != 0) {
+			ok = false;
+		}
+		if (!ok || rename(temporary, previous) != 0) {
+			unlink(temporary);
+			return false;
+		}
+		if (ftruncate(old_fd, 0) != 0) {
+			return false; // original and the saved tail are both still present
+		}
+	} else {
+		if (rename(sd_log_path, previous) != 0) {
+			return false;
+		}
+		FILE *file = fopen(sd_log_path, "ae");
+		if (!file) {
+			rename(previous, sd_log_path);
+			return false;
+		}
+		int fd = fileno(file);
+		if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+			dup2(old_fd, STDOUT_FILENO);
+			dup2(old_fd, STDERR_FILENO);
+			fclose(file);
+			unlink(sd_log_path);
+			rename(previous, sd_log_path);
+			return false;
+		}
+		fclose(active_stream);
+		active_stream = file;
+	}
+	synced_size = -1;
+	return true;
+}
+
+static long rotate_retry_at;
+
+static bool try_rotate_card_log(const struct stat *st) {
+	long now = queue_now_ms();
+	if (now < rotate_retry_at) {
+		return false;
+	}
+	bool ok = rotate_card_log(st);
+	// A read-only or failing card must not cause a retry on every printed line.
+	rotate_retry_at = ok ? 0 : now + 5000;
+	return ok;
+}
+
+static void write_queued(int fd, const char *data, size_t size) {
+	if (explicit_log || !atomic_load(&on_sd)) {
+		write_all(fd, data, size);
+		return;
+	}
+	// USB/toggle callers hold log_lock while draining the queue. Never wait
+	// for them here. At the boundary discard excess output until rotation can
+	// run; ordinary queued writes and the drain still make progress.
+	bool locked = pthread_mutex_trylock(&log_lock) == 0;
+	struct stat st;
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > LOG_FILE_MAX - (off_t)size) {
+		if (locked && on_sd && active_stream && try_rotate_card_log(&st)) {
+			st.st_size = 0;
+		}
+		size_t room = st.st_size < LOG_FILE_MAX ? (size_t)(LOG_FILE_MAX - st.st_size) : 0;
+		if (size > room) {
+			pthread_mutex_lock(&queue_lock);
+			queue_dropped += size - room;
+			pthread_mutex_unlock(&queue_lock);
+			size = room;
+		}
+	}
+	if (locked) {
+		pthread_mutex_unlock(&log_lock);
+	}
+	write_all(fd, data, size);
 }
 
 static void sync_card(void);
@@ -347,7 +490,7 @@ static void *queue_writer(void *arg) {
 		pthread_mutex_unlock(&queue_lock);
 
 		if (size > 0) {
-			write_all(fd, out, size);
+			write_queued(fd, out, size);
 			unsynced = true;
 		}
 		if (unsynced && queue_now_ms() - synced_at >= QUEUE_SYNC_MS) {
@@ -505,7 +648,54 @@ static void relay_start(void) {
 	pthread_attr_destroy(&tattr);
 }
 
-void logging_child_stdio(void) {
+#if defined(__has_attribute)
+#if __has_attribute(no_profile_instrument_function)
+#define CHILD_NO_PROFILE __attribute__((no_profile_instrument_function))
+#endif
+#endif
+#ifndef CHILD_NO_PROFILE
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 9
+#define CHILD_NO_PROFILE __attribute__((no_profile_instrument_function))
+#else
+#define CHILD_NO_PROFILE
+#endif
+#endif
+
+CHILD_NO_PROFILE void logging_child_stdio(void) {
+	// Daemons must not retain a decoder's open track (some third-party
+	// decoders do not use O_CLOEXEC). Set flags in the forked child's own FD
+	// table, before making the deliberate stdout/stderr and relay-reader dup.
+	// Only async-signal-safe operations are used between fork and exec.
+	if (child_fd_limit < 0) {
+		_exit(127);
+	}
+	for (int fd = 3; fd < child_fd_limit; fd++) {
+		int rc;
+		do {
+			rc = fcntl(fd, F_SETFD, FD_CLOEXEC);
+		} while (rc < 0 && errno == EINTR);
+		if (rc < 0) {
+			if (errno == EBADF)
+				continue;
+			_exit(127);
+		}
+		struct stat st;
+		do {
+			rc = fstat(fd, &st);
+		} while (rc < 0 && errno == EINTR);
+		if (rc < 0) {
+			if (errno == EBADF)
+				continue;
+			_exit(127);
+		}
+		// CLOEXEC alone retains hardware until exec (including GCOV flush).
+		// Release only this child's sound reference before reaching that step.
+		if (S_ISCHR(st.st_mode) && major(st.st_rdev) == 116) {
+			// Linux releases the FD entry even on EINTR: never retry close.
+			if (close(fd) < 0 && errno != EINTR && errno != EBADF)
+				_exit(127);
+		}
+	}
 	if (relay_write < 0) {
 		return;
 	}
@@ -517,10 +707,23 @@ void logging_child_stdio(void) {
 }
 
 static void write_all(int fd, const char *data, size_t size) {
+	if ((fd == STDOUT_FILENO || fd == STDERR_FILENO) && atomic_load(&holding_output)) {
+		// The held file lives on tmpfs: limiting only drain_held() would still
+		// let hours of USB diagnostics consume all available RAM. This common
+		// path also covers startup/fork output without the writer thread.
+		struct stat st;
+		if (fstat(fd, &st) != 0 || st.st_size >= HELD_MAX) {
+			return;
+		}
+		size_t room = (size_t)(HELD_MAX - st.st_size);
+		if (size > room) {
+			size = room;
+		}
+	}
 	while (size > 0) {
 		ssize_t done = write(fd, data, size);
-		if (done < 0) {
-			if (errno == EINTR) {
+		if (done <= 0) {
+			if (done < 0 && errno == EINTR) {
 				continue;
 			}
 			return; // a card that went away mid-line; nothing to be done here
@@ -547,8 +750,7 @@ static void write_stamp(int fd) {
 		emit(fd, text, len);
 	}
 
-	int len = snprintf(text, sizeof(text), "%02d:%02d:%02d.%03ld ", local.tm_hour, local.tm_min, local.tm_sec,
-					   now.tv_nsec / 1000000L);
+	int len = snprintf(text, sizeof(text), "%02d:%02d:%02d.%03ld ", local.tm_hour, local.tm_min, local.tm_sec, now.tv_nsec / 1000000L);
 	if (len > 0) {
 		emit(fd, text, (size_t)len);
 	}
@@ -632,6 +834,7 @@ static bool redirect_to(FILE *stream) {
 	if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
 		return false;
 	}
+	atomic_store(&holding_output, stream == early_stream || stream == usb_stream);
 
 	if (active_stream && active_stream != stream) {
 		fclose(active_stream);
@@ -642,11 +845,14 @@ static bool redirect_to(FILE *stream) {
 }
 
 void logging_init(void) {
+	// Resolve the bound in the parent, not through libc after a threaded fork.
+	child_fd_limit_init();
+	const char *override = getenv("SONIX_LOG");
+	explicit_log = override && override[0];
 	stamp_install();
 	queue_start();
 	relay_start();
 
-	const char *override = getenv("SONIX_LOG");
 	if (override && override[0]) {
 		FILE *file = fopen(override, "we");
 		if (file && redirect_to(file)) {
@@ -731,8 +937,7 @@ static void logging_attach_sd_locked(const char *sd_root) {
 		char folder[512];
 		if (snprintf(folder, sizeof(folder), "%s/%s", sd_root, LOG_SUBDIR) < (int)sizeof(folder)) {
 			mkdir(folder, 0755);
-			if (snprintf(sd_log_path, sizeof(sd_log_path), "%s/%s", folder, LOG_FILE_NAME) >=
-				(int)sizeof(sd_log_path)) {
+			if (snprintf(sd_log_path, sizeof(sd_log_path), "%s/%s", folder, LOG_FILE_NAME) >= (int)sizeof(sd_log_path)) {
 				sd_log_path[0] = '\0';
 			}
 		}
@@ -881,6 +1086,12 @@ static void sync_card(void) {
 		int fd = fileno(active_stream);
 		struct stat st;
 		if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size != synced_size) {
+			// Startup/USB held output is drained directly under log_lock. If
+			// it crossed the cap, finish the deferred rotation on the writer.
+			if (queue_running && !explicit_log && st.st_size >= LOG_FILE_MAX && try_rotate_card_log(&st)) {
+				fd = fileno(active_stream);
+				st.st_size = 0;
+			}
 			if (fdatasync(fd) == 0) {
 				synced_size = st.st_size;
 			}
@@ -1115,8 +1326,7 @@ void logging_follow_kernel(void) {
 // first three; the last two are what a card that stops answering looks like,
 // and that ends a scan just as abruptly.
 static const char *const KERNEL_INTERESTING[] = {
-	"Out of memory", "oom-kill", "Killed process", "lowmemorykiller",
-	"mmc0: ",		 "I/O error", "EXT4-fs error",  "FAT-fs error",
+	"Out of memory", "oom-kill", "Killed process", "lowmemorykiller", "mmc0: ", "I/O error", "EXT4-fs error", "FAT-fs error",
 };
 
 static bool kernel_line_interesting(const char *line) {

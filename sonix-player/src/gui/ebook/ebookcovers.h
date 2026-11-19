@@ -24,10 +24,11 @@
 // the middle of.
 //
 // Nothing the worker touches belongs to the page. It gets its own copy of the
-// list, which it frees itself, and each result is a message the UI thread takes
-// ownership of. What ties them together is a generation number: ebookcovers_stop()
-// moves it on, and a worker or a message from a page that is gone finds a number
-// that no longer matches and frees what it was carrying.
+// list, which it frees itself, and one retained result the UI thread takes
+// ownership of through ebookcovers_service_completion(). The token identifies
+// that run: stop invalidates it and wakes the worker's local stop predicate.
+// A queued doorbell owns no result; cancelled pixels stay with the old worker
+// until it can free them without touching the page.
 // ---------------------------------------------------------------------------
 
 // Called on the UI THREAD, once per book, in the order they were asked for.
@@ -71,5 +72,13 @@ void ebookcovers_want_visible(uint32_t token, lv_obj_t *view, lv_obj_t *const *i
 // that started its covers on the way in would otherwise have them cancelled a
 // moment later by the page on the way out.
 void ebookcovers_stop(uint32_t token);
+
+// GUI thread: service retained results on the existing GUI loop, independently
+// of bounded gui_post admission. A posted doorbell can call this as well.
+void ebookcovers_service_completion(void);
+
+// GUI thread: reject new runs and cancel the current run without joining.
+// Call before shutting down GUI completion service; process-lifetime shutdown.
+void ebookcovers_shutdown_completions(void);
 
 #endif /* EBOOKCOVERS_H */

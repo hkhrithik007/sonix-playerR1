@@ -117,19 +117,28 @@ typedef struct {
 	char arg_a[WIFI_SSID_MAX];
 	char arg_b[128];
 	int arg_int;
+	uint64_t op_ticket;
 } job_t;
 
 #define JOB_QUEUE_LEN 8
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// Serialize user preference saves without holding the worker's state lock.
+static pthread_mutex_t preference_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
 static pthread_t worker;
 static bool worker_running;
 
 static job_t queue[JOB_QUEUE_LEN];
 static int queue_head, queue_count;
+// Reserved intents, not an unbounded command queue. New commands cannot pass
+// them: take_job refills the FIFO before releasing its lock.
+static job_t deferred[2];
+static int deferred_count;
+static bool power_active, scan_active;
 
 static bool g_enabled;			 // the switch, as the user left it
+static bool g_saved_enabled;	 // transient parking never changes this preference
 static bool g_power_busy;		 // a power job is in flight
 static bool g_scanning;
 static wifi_status_t g_status;
@@ -141,6 +150,7 @@ static wifi_op_t g_op = WIFI_OP_IDLE;
 static char g_op_ssid[WIFI_SSID_MAX];
 static wifi_fail_t g_fail = WIFI_FAIL_NONE;
 static wifi_opkind_t g_opkind = WIFI_OPKIND_CONNECT;
+static uint64_t g_op_ticket, active_op_ticket;
 
 // Set when the user leaves or forgets a network, cleared as soon as the radio
 // reports a link again.
@@ -516,21 +526,17 @@ static void read_status(char *buf, size_t size) {
 // interface, so it takes the same lock everything else shared does.
 static void set_fail(wifi_fail_t reason) {
 	pthread_mutex_lock(&lock);
-	g_fail = reason;
-	pthread_mutex_unlock(&lock);
-}
-
-static void set_opkind(wifi_opkind_t kind) {
-	pthread_mutex_lock(&lock);
-	g_opkind = kind;
+	if (active_op_ticket && active_op_ticket == g_op_ticket)
+		g_fail = reason;
 	pthread_mutex_unlock(&lock);
 }
 
 static void set_op(wifi_op_t op, const char *ssid) {
 	pthread_mutex_lock(&lock);
-	g_op = op;
-	if (ssid) {
-		snprintf(g_op_ssid, sizeof(g_op_ssid), "%s", ssid);
+	if (active_op_ticket && active_op_ticket == g_op_ticket) {
+		g_op = op;
+		if (ssid)
+			snprintf(g_op_ssid, sizeof(g_op_ssid), "%s", ssid);
 	}
 	pthread_mutex_unlock(&lock);
 }
@@ -1208,6 +1214,10 @@ static void poll_status(void) {
 	ssid_unescape(status.ssid); // wpa_supplicant escapes this one too
 	status_field(buf, "ip_address", status.ip, sizeof(status.ip));
 	status_field(buf, "address", status.mac, sizeof(status.mac));
+	char freq[16];
+	if (status_field(buf, "freq", freq, sizeof(freq))) {
+		status.freq_mhz = atoi(freq); // signal_poll's FREQUENCY, below, has the last word
+	}
 
 	if (status.state == WIFI_STATE_CONNECTED) {
 		char signal_buf[512];
@@ -1215,6 +1225,13 @@ static void poll_status(void) {
 		if (wpa1("signal_poll", signal_buf, sizeof(signal_buf)) == 0 &&
 			status_field(signal_buf, "RSSI", rssi, sizeof(rssi))) {
 			status.signal = atoi(rssi);
+			char field[16];
+			if (status_field(signal_buf, "FREQUENCY", field, sizeof(field))) {
+				status.freq_mhz = atoi(field);
+			}
+			if (status_field(signal_buf, "LINKSPEED", field, sizeof(field))) {
+				status.link_mbps = atoi(field);
+			}
 		}
 		status.bars = status.signal ? bars_for(status.signal) : 3;
 
@@ -1256,23 +1273,156 @@ static void poll_status(void) {
 // worker loop
 // ---------------------------------------------------------------------------
 
-static bool take_job(job_t *out) {
-	if (queue_count == 0) {
+// Queue helpers below require lock. Only the worker removes accepted commands.
+static bool queued_type(job_type_t type) {
+	for (int i = 0; i < queue_count; i++)
+		if (queue[(queue_head + i) % JOB_QUEUE_LEN].type == type)
+			return true;
+	for (int i = 0; i < deferred_count; i++)
+		if (deferred[i].type == type)
+			return true;
+	return false;
+}
+
+static void refresh_activity(void) {
+	g_power_busy = power_active || queued_type(JOB_POWER);
+	g_scanning = scan_active || queued_type(JOB_SCAN);
+}
+
+static void flush_deferred(void) {
+	while (deferred_count && queue_count < JOB_QUEUE_LEN) {
+		queue[(queue_head + queue_count++) % JOB_QUEUE_LEN] = deferred[0];
+		deferred_count--;
+		if (deferred_count)
+			deferred[0] = deferred[1];
+	}
+}
+
+static void drop_pending_scans(void) {
+	int kept = 0;
+	for (int i = 0; i < queue_count; i++) {
+		job_t *job = &queue[(queue_head + i) % JOB_QUEUE_LEN];
+		if (job->type != JOB_SCAN)
+			queue[(queue_head + kept++) % JOB_QUEUE_LEN] = *job;
+	}
+	queue_count = kept;
+	kept = 0;
+	for (int i = 0; i < deferred_count; i++)
+		if (deferred[i].type != JOB_SCAN)
+			deferred[kept++] = deferred[i];
+	deferred_count = kept;
+}
+
+static bool post_job_locked(const job_t *job) {
+	// Turning off supersedes scans that have not started, never accepted joins.
+	if (job->type == JOB_POWER && !job->arg_int)
+		drop_pending_scans();
+	flush_deferred();
+	job_t *tail = deferred_count ? &deferred[deferred_count - 1] :
+		queue_count ? &queue[(queue_head + queue_count - 1) % JOB_QUEUE_LEN] : NULL;
+	if (job->type == JOB_POWER && tail && tail->type == JOB_POWER) {
+		*tail = *job;
+	} else if (queue_count < JOB_QUEUE_LEN) {
+		queue[(queue_head + queue_count++) % JOB_QUEUE_LEN] = *job;
+	} else if ((job->type == JOB_POWER || job->type == JOB_SCAN) && deferred_count < 2) {
+		deferred[deferred_count++] = *job;
+	} else {
 		return false;
 	}
-	*out = queue[queue_head];
-	queue_head = (queue_head + 1) % JOB_QUEUE_LEN;
-	queue_count--;
+	refresh_activity();
+	pthread_cond_signal(&wake);
 	return true;
 }
 
-static void post_job(const job_t *job) {
+static bool post_job(const job_t *job) {
 	pthread_mutex_lock(&lock);
-	if (queue_count < JOB_QUEUE_LEN) {
-		queue[(queue_head + queue_count) % JOB_QUEUE_LEN] = *job;
-		queue_count++;
-		pthread_cond_signal(&wake);
+	bool accepted = post_job_locked(job);
+	pthread_mutex_unlock(&lock);
+	return accepted;
+}
+
+static bool take_job(job_t *out) {
+	flush_deferred();
+	if (!queue_count)
+		return false;
+	*out = queue[queue_head];
+	queue_head = (queue_head + 1) % JOB_QUEUE_LEN;
+	queue_count--;
+	power_active = out->type == JOB_POWER;
+	scan_active = out->type == JOB_SCAN;
+	active_op_ticket = out->op_ticket;
+	flush_deferred();
+	refresh_activity();
+	return true;
+}
+
+static void post_operation(job_t *job, wifi_opkind_t kind) {
+	pthread_mutex_lock(&lock);
+	job->op_ticket = ++g_op_ticket;
+	bool accepted = worker_running && post_job_locked(job);
+	g_opkind = kind;
+	g_op = accepted ? WIFI_OP_BUSY : WIFI_OP_FAILED;
+	g_fail = accepted ? WIFI_FAIL_NONE : WIFI_FAIL_REFUSED;
+	snprintf(g_op_ssid, sizeof(g_op_ssid), "%s", job->arg_a);
+	pthread_mutex_unlock(&lock);
+}
+
+static void perform_job(const job_t *job) {
+	switch (job->type) {
+	case JOB_POWER:
+		do_power(job->arg_int != 0);
+		pthread_mutex_lock(&lock);
+		bool scan = job->arg_int && g_enabled;
+		if (!job->arg_int) {
+			memset(&g_status, 0, sizeof(g_status));
+			g_status.state = WIFI_STATE_OFF;
+			g_network_count = 0;
+			g_serial++;
+		}
+		if (scan) {
+			scan_active = true;
+			// A scan immediately after bring-up is covered by its automatic scan.
+			if (queue_count && queue[queue_head].type == JOB_SCAN) {
+				queue_head = (queue_head + 1) % JOB_QUEUE_LEN;
+				queue_count--;
+				flush_deferred();
+			}
+		}
+		refresh_activity();
+		pthread_mutex_unlock(&lock);
+		if (scan) {
+			poll_status();
+			do_scan();
+		}
+		break;
+	case JOB_SCAN:
+		pthread_mutex_lock(&lock);
+		bool enabled = g_enabled;
+		pthread_mutex_unlock(&lock);
+		if (enabled)
+			do_scan();
+		break;
+	case JOB_CONNECT:
+		do_connect(job->arg_a, job->arg_b);
+		poll_status();
+		break;
+	case JOB_DISCONNECT:
+		do_disconnect();
+		poll_status();
+		break;
+	case JOB_FORGET:
+		do_forget(job->arg_a);
+		poll_status();
+		break;
+	case JOB_NONE:
+	default:
+		break;
 	}
+	pthread_mutex_lock(&lock);
+	power_active = false;
+	scan_active = false;
+	active_op_ticket = 0;
+	refresh_activity();
 	pthread_mutex_unlock(&lock);
 }
 
@@ -1303,50 +1453,7 @@ static void *wifi_worker(void *arg) {
 		pthread_mutex_unlock(&lock);
 
 		if (have_job) {
-			switch (job.type) {
-			case JOB_POWER:
-				do_power(job.arg_int != 0);
-				pthread_mutex_lock(&lock);
-				g_power_busy = false;
-				if (!job.arg_int) {
-					memset(&g_status, 0, sizeof(g_status));
-					g_status.state = WIFI_STATE_OFF;
-					g_network_count = 0;
-					g_serial++;
-				}
-				pthread_mutex_unlock(&lock);
-				if (job.arg_int) {
-					poll_status();
-					do_scan();
-				}
-				break;
-
-			case JOB_SCAN:
-				do_scan();
-				pthread_mutex_lock(&lock);
-				g_scanning = false;
-				pthread_mutex_unlock(&lock);
-				break;
-
-			case JOB_CONNECT:
-				do_connect(job.arg_a, job.arg_b);
-				poll_status();
-				break;
-
-			case JOB_DISCONNECT:
-				do_disconnect();
-				poll_status();
-				break;
-
-			case JOB_FORGET:
-				do_forget(job.arg_a);
-				poll_status();
-				break;
-
-			case JOB_NONE:
-			default:
-				break;
-			}
+			perform_job(&job);
 			continue;
 		}
 
@@ -1371,6 +1478,7 @@ void wifi_init(void) {
 	}
 
 	g_enabled = config_get_int("wireless", "wifi", 0) != 0;
+	g_saved_enabled = g_enabled;
 	g_status.state = WIFI_STATE_OFF;
 
 	if (pthread_create(&worker, NULL, wifi_worker, NULL) != 0) {
@@ -1383,8 +1491,10 @@ void wifi_init(void) {
 
 	if (g_enabled && wifi_available()) {
 		job_t job = {.type = JOB_POWER, .arg_int = 1};
-		g_power_busy = true;
-		post_job(&job);
+		if (!post_job(&job)) {
+			fprintf(stderr, "wifi: initial power request refused\n");
+			g_enabled = false;
+		}
 	} else if (g_enabled) {
 		g_enabled = false; // no interface, so the switch must not read as on
 	}
@@ -1398,32 +1508,44 @@ bool wifi_get_enabled(void) {
 }
 
 static void set_enabled(bool on, bool remember) {
-	if (!worker_running) {
-		return;
-	}
-
+	if (remember)
+		pthread_mutex_lock(&preference_lock);
 	pthread_mutex_lock(&lock);
-	if (g_enabled == on) {
+	// A wake belonging to an earlier park cannot undo a later user disable.
+	if (!worker_running || (!remember && on && !g_saved_enabled)) {
 		pthread_mutex_unlock(&lock);
+		if (remember)
+			pthread_mutex_unlock(&preference_lock);
 		return;
 	}
-	g_enabled = on;
-	g_power_busy = true;
-	if (!on) {
-		memset(&g_status, 0, sizeof(g_status));
-		g_status.state = WIFI_STATE_OFF;
-		g_network_count = 0;
-		g_serial++;
+	if (g_enabled != on) {
+		job_t job = {.type = JOB_POWER, .arg_int = on ? 1 : 0};
+		if (!post_job_locked(&job)) {
+			pthread_mutex_unlock(&lock);
+			if (remember)
+				pthread_mutex_unlock(&preference_lock);
+			fprintf(stderr, "wifi: power request refused\n");
+			return;
+		}
+		g_enabled = on;
+		if (!on) {
+			memset(&g_status, 0, sizeof(g_status));
+			g_status.state = WIFI_STATE_OFF;
+			g_network_count = 0;
+			g_serial++;
+		}
 	}
+	bool save = remember && g_saved_enabled != on;
+	if (save)
+		g_saved_enabled = on;
 	pthread_mutex_unlock(&lock);
 
-	if (remember) {
+	if (save) {
 		config_set_int("wireless", "wifi", on ? 1 : 0);
 		config_save();
 	}
-
-	job_t job = {.type = JOB_POWER, .arg_int = on ? 1 : 0};
-	post_job(&job);
+	if (remember)
+		pthread_mutex_unlock(&preference_lock);
 }
 
 void wifi_set_enabled(bool on) { set_enabled(on, true); }
@@ -1489,18 +1611,12 @@ void wifi_get_status(wifi_status_t *out) {
 
 void wifi_scan_start(void) {
 	pthread_mutex_lock(&lock);
-	bool skip = g_scanning || !g_enabled;
-	if (!skip) {
-		g_scanning = true;
+	if (worker_running && !g_scanning && g_enabled) {
+		job_t job = {.type = JOB_SCAN};
+		if (!post_job_locked(&job))
+			fprintf(stderr, "wifi: scan request refused\n");
 	}
 	pthread_mutex_unlock(&lock);
-
-	if (skip) {
-		return;
-	}
-
-	job_t job = {.type = JOB_SCAN};
-	post_job(&job);
 }
 
 bool wifi_scan_running(void) {
@@ -1532,35 +1648,26 @@ void wifi_connect(const char *ssid, const char *psk) {
 	if (!ssid || !ssid[0]) {
 		return;
 	}
-	set_opkind(WIFI_OPKIND_CONNECT);
-	set_op(WIFI_OP_BUSY, ssid);
-
 	job_t job = {.type = JOB_CONNECT};
 	snprintf(job.arg_a, sizeof(job.arg_a), "%s", ssid);
 	snprintf(job.arg_b, sizeof(job.arg_b), "%s", psk ? psk : "");
-	post_job(&job);
+	post_operation(&job, WIFI_OPKIND_CONNECT);
 }
 
 void wifi_disconnect(void) {
 	// Reported like the other two: leaving a network is something the user
 	// asked for and wants told about.
-	set_opkind(WIFI_OPKIND_DISCONNECT);
-	set_op(WIFI_OP_BUSY, NULL);
-
 	job_t job = {.type = JOB_DISCONNECT};
-	post_job(&job);
+	post_operation(&job, WIFI_OPKIND_DISCONNECT);
 }
 
 void wifi_forget(const char *ssid) {
 	if (!ssid || !ssid[0]) {
 		return;
 	}
-	set_opkind(WIFI_OPKIND_FORGET);
-	set_op(WIFI_OP_BUSY, ssid);
-
 	job_t job = {.type = JOB_FORGET};
 	snprintf(job.arg_a, sizeof(job.arg_a), "%s", ssid);
-	post_job(&job);
+	post_operation(&job, WIFI_OPKIND_FORGET);
 }
 
 wifi_op_t wifi_take_op_result(char *ssid_out, int ssid_size) {

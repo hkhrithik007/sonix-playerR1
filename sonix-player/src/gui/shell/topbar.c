@@ -4,39 +4,40 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <time.h>
 
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/clocklabel.h"
-#include "src/gui/shell/icons.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/main_menu.h"
 #include "src/gui/shell/quickpanel.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
-#include "src/system/remote/airplay.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/audio/audio.h"
 #include "src/system/audio/usbaudio.h"
-#include "src/system/bluetooth/bluetooth.h"
-#include "src/system/device/clock.h"
-#include "src/system/core/config.h"
-#include "src/system/playback/device_state.h"
-#include "src/system/bluetooth/btreceiver.h"
-#include "src/system/device/led.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/device/power.h"
-#include "src/system/remote/sonixlink.h"
-#include "src/system/device/usb.h"
 #include "src/system/audio/usbdac.h"
+#include "src/system/bluetooth/bluetooth.h"
+#include "src/system/bluetooth/btreceiver.h"
+#include "src/system/core/config.h"
+#include "src/system/device/clock.h"
+#include "src/system/device/led.h"
+#include "src/system/device/power.h"
+#include "src/system/device/usb.h"
 #include "src/system/net/wifi.h"
 #include "src/system/net/wifitransfer.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/remote/airplay.h"
+#include "src/system/remote/sonixlink.h"
+#include "src/system/streaming/podcastcache.h"
 
 // The battery bitmaps are rendered from 24x24 SVGs at this size. The shell is
 // drawn by the icon; the charge level is a plain rectangle behind it, showing
 // through the icon's transparent middle.
-#define BATTERY_ICON_SIZE 38
+#define BATTERY_ICON_SIZE 24
 
 // The inner cavity of the battery shell, in the SVG's 24x24 coordinates: the
 // body rect runs 2..18 with a 2px stroke centred on it, so the hole is 3..17
@@ -96,16 +97,58 @@ static lv_obj_t *bat_bolt;
 static lv_obj_t *bat_label;
 static lv_obj_t *vol_label;
 static lv_obj_t *vol_icon;
-static lv_obj_t *hp_icon; // headphone jack indicator: hidden / theme / gold
-static lv_obj_t *play_icon;		 // play/pause indicator: hidden when nothing is loaded
-static lv_obj_t *library_icon;	 // Detect changes at work, or just done
+static lv_obj_t *hp_icon;		  // headphones or USB audio output
+static lv_obj_t *airplay_icon;	  // incoming AirPlay, not local play/pause
+static lv_obj_t *library_icon;	  // Detect changes at work, or just done
 static lv_timer_t *library_timer; // takes the check glyph away
-static lv_obj_t *sonixlink_icon; // shown while a phone is driving the player
-static void refresh_play_icon(const device_state_t *state);
+static lv_obj_t *sonixlink_icon;  // shown while a phone is driving the player
+static void refresh_airplay_icon(void);
+
+// ---------------------------------------------------------------------------
+// Writing only what changed
+//
+// The bar is refreshed from polls -- the player's progress poll every half
+// second while playing, the radios every two seconds, volume and battery
+// every five -- and nearly every refresh finds what was already there. LVGL
+// does not know that: setting an image's source, a style property or a text
+// invalidates the widget and repaints it every time, the same glyph over
+// itself (a frame a second on a home page doing nothing, five on the player).
+// These write only a value that differs. Where the theme's own style should
+// come back, the local one is removed only if there is one to remove.
+// ---------------------------------------------------------------------------
+
+static void bar_set_src(lv_obj_t *img, const void *src) {
+	if (lv_image_get_src(img) != src) {
+		lv_image_set_src(img, src);
+	}
+}
+
+static void bar_set_hidden(lv_obj_t *obj, bool hidden) {
+	if (lv_obj_is_hidden(obj) != hidden) {
+		lv_obj_set_hidden(obj, hidden);
+	}
+}
+
+static void bar_set_local(lv_obj_t *obj, lv_style_prop_t prop, lv_style_value_t value) {
+	lv_style_value_t now;
+	if (lv_obj_get_local_style_prop(obj, prop, &now, 0) == LV_STYLE_RES_FOUND && memcmp(&now, &value, sizeof(now)) == 0) {
+		return;
+	}
+	lv_obj_set_local_style_prop(obj, prop, value, 0);
+}
+
+static void bar_remove_local(lv_obj_t *obj, lv_style_prop_t prop) {
+	lv_style_value_t now;
+	if (lv_obj_get_local_style_prop(obj, prop, &now, 0) == LV_STYLE_RES_FOUND) {
+		lv_obj_remove_local_style_prop(obj, prop, 0);
+	}
+}
+
+static void bar_set_image_opa(lv_obj_t *obj, lv_opa_t opa) { bar_set_local(obj, LV_STYLE_IMAGE_OPA, (lv_style_value_t){.num = opa}); }
 static void refresh_sonixlink_icon(void);
 static lv_obj_t *clock_label;
-static lv_obj_t *bt_icon;   // bluetooth, leftmost of the right-hand group
-static lv_obj_t *wifi_icon; // wifi, between bluetooth and the charge percentage
+static lv_obj_t *bt_icon;		  // bluetooth, leftmost of the right-hand group
+static lv_obj_t *wifi_icon;		  // wifi, between bluetooth and the charge percentage
 static lv_obj_t *container_left;  // volume group (and the clock, when "left")
 static lv_obj_t *container_right; // battery group (and the clock, when "right")
 static lv_timer_t *battery_timer;
@@ -124,14 +167,12 @@ static int last_battery_charging = -1;
 //
 // The glyphs and the labels wear two styles added after the theme's, empty
 // until a tint is in force, so a glyph whose colour means something -- the
-// gold jack, the codec on the Bluetooth glyph, the volume warning -- keeps it:
-// those are set on the object itself and win over any style.
+// volume warning keeps its semantic colour above the shared status ink.
 static lv_obj_t *tint_screen;
 static lv_obj_t *tint_page;
 static lv_color_t tint_bg;
 static lv_color_t tint_ink;
 static bool tint_active;
-static bool tint_held; // topbar_tint_hold()
 static lv_style_t tint_text_style;
 static lv_style_t tint_icon_style;
 
@@ -140,16 +181,51 @@ static lv_style_t tint_icon_style;
 // Up over the player's artwork (topbar_set_over_artwork): white on the
 // picture, whatever the theme or the page underneath says.
 static bool over_art;
+static bool control_panel_palette;
+static bool playback_palette;
+static bool over_art_blur;		// asked for a blur behind the bar
+static bool over_art_blur_held; // ...and topbar_hold_backdrop_blur() holds it off
 
 static lv_color_t shell_color(bool known) {
+	if (control_panel_palette)
+		return known ? sx_pal()->mini_ink : sx_mix(sx_pal()->mini_ink, sx_pal()->mini_bg, 65);
 	if (over_art) {
 		return known ? lv_color_white() : lv_color_make(200, 200, 200);
 	}
+	if (playback_palette)
+		return sx_pal()->np_text2;
 	if (tint_active) {
 		return known ? tint_ink : lv_color_mix(tint_ink, tint_bg, 140);
 	}
-	return known ? theme()->text_primary : theme()->text_secondary;
+	return theme()->text_secondary;
 }
+// Warnings use one readable role; normal hardware states remain neutral.
+static lv_color_t warning_color(void) {
+	bool dark_surface = control_panel_palette ? lv_color_brightness(sx_pal()->mini_bg) < 128 : over_art || theme_is_dark();
+	return lv_color_hex(dark_surface ? SX_DANGER_TEXT : SX_L_DANGER_TEXT);
+}
+
+static void refresh_status_ink(void) {
+	if (control_panel_palette) {
+		lv_obj_set_style_bg_color(top_bar, sx_pal()->mini_bg, 0);
+		lv_obj_set_style_bg_opa(top_bar, LV_OPA_COVER, 0);
+	} else if (playback_palette && !over_art) {
+		lv_obj_set_style_bg_color(top_bar, sx_pal()->np_bg, 0);
+		lv_obj_set_style_bg_opa(top_bar, LV_OPA_COVER, 0);
+	}
+	lv_color_t ink = shell_color(true);
+	lv_style_set_text_color(&tint_text_style, ink);
+	lv_style_set_image_recolor(&tint_icon_style, ink);
+	lv_style_set_image_recolor_opa(&tint_icon_style, LV_OPA_COVER);
+	lv_obj_report_style_change(&tint_text_style);
+	lv_obj_report_style_change(&tint_icon_style);
+	lv_obj_set_style_image_recolor(bat_shell, shell_color(last_battery_percent >= 0), 0);
+	lv_obj_set_style_image_recolor(bat_bolt, ink, 0);
+	lv_obj_set_style_bg_color(bat_fill, last_battery_percent >= 0 && last_battery_percent <= BATTERY_LOW_PERCENT ? warning_color() : ink, 0);
+	if (vol_label && lv_label_get_text(vol_label)[0] >= '0' && lv_label_get_text(vol_label)[0] <= '9')
+		topbar_refresh_volume(atoi(lv_label_get_text(vol_label)));
+}
+
 static lv_timer_t *clock_timer;
 static lv_timer_t *radio_timer;
 
@@ -207,30 +283,35 @@ static void update_battery_indicator(int percent, bool charging) {
 	lv_obj_set_pos(bat_fill, cavity_x, cavity_y);
 	lv_obj_set_size(bat_fill, width, cavity_h);
 
-	lv_color_t color = (percent <= BATTERY_LOW_PERCENT) ? lv_color_make(220, 60, 50) : lv_color_make(60, 190, 90);
+	lv_color_t color = (percent <= BATTERY_LOW_PERCENT) ? warning_color() : shell_color(true);
 	lv_obj_set_style_bg_color(bat_fill, color, 0);
 }
 
 // Redraws the clock. Before the time has been set there is nothing truthful to
 // show, so it reads as blank rather than as 1970.
-void topbar_refresh_clock(void) { clocklabel_refresh(clock_label); }
+void topbar_refresh_clock(void) {
+	if (!clock_label) {
+		return;
+	}
+
+	if (!clock_is_set()) {
+		lv_label_set_text(clock_label, "--:--");
+		return;
+	}
+
+	time_t now = time(NULL);
+	struct tm local;
+	localtime_r(&now, &local);
+
+	char text[16];
+	clock_format_hm(text, sizeof(text), local.tm_hour, local.tm_min);
+	lv_label_set_text(clock_label, text);
+}
 
 static void clock_timer_cb(lv_timer_t *timer) {
 	(void)timer;
-	// A time zone the network has just located goes in place first, so the
-	// bar shows the time in it.
-	clock_poll();
 	topbar_refresh_clock();
 }
-
-static void clock_changed_cb(void *unused) {
-	(void)unused;
-	clock_poll();
-	topbar_refresh_clock();
-}
-
-// From the network attempt's thread: onto this one.
-static void clock_changed(void) { gui_post(clock_changed_cb, NULL); }
 
 static void remember_timer_cb(lv_timer_t *timer) {
 	(void)timer;
@@ -256,14 +337,29 @@ void topbar_refresh_volume(int percent) {
 		percent = 100;
 	}
 
-	lv_label_set_text_fmt(vol_label, "%d", percent);
+	char text[8];
+	snprintf(text, sizeof(text), "%d", percent);
+	if (strcmp(lv_label_get_text(vol_label), text) != 0) {
+		lv_label_set_text(vol_label, text);
+	}
 
 	// Past this threshold the number turns red, warning that the next steps are
 	// the loud ones. The volume pop-up uses the same threshold.
 	if (percent > VOLUME_WARN_PERCENT) {
-		lv_obj_set_style_text_color(vol_label, VOLUME_WARN_COLOR, 0);
+		bar_set_local(vol_label, LV_STYLE_TEXT_COLOR, (lv_style_value_t){.color = control_panel_palette ? lv_color_white() : warning_color()});
 	} else {
-		lv_obj_remove_local_style_prop(vol_label, LV_STYLE_TEXT_COLOR, 0);
+		bar_remove_local(vol_label, LV_STYLE_TEXT_COLOR);
+	}
+	if (control_panel_palette && percent > VOLUME_WARN_PERCENT) {
+		bar_set_local(vol_label, LV_STYLE_BG_COLOR, (lv_style_value_t){.color = lv_color_hex(SX_DANGER_BG)});
+		bar_set_local(vol_label, LV_STYLE_BG_OPA, (lv_style_value_t){.num = LV_OPA_COVER});
+		bar_set_local(vol_label, LV_STYLE_RADIUS, (lv_style_value_t){.num = 4});
+		bar_set_local(vol_label, LV_STYLE_PAD_LEFT, (lv_style_value_t){.num = 2});
+		bar_set_local(vol_label, LV_STYLE_PAD_RIGHT, (lv_style_value_t){.num = 2});
+	} else {
+		bar_remove_local(vol_label, LV_STYLE_BG_OPA);
+		bar_remove_local(vol_label, LV_STYLE_PAD_LEFT);
+		bar_remove_local(vol_label, LV_STYLE_PAD_RIGHT);
 	}
 
 	const lv_image_dsc_t *icon = &icon_volume_high;
@@ -272,7 +368,7 @@ void topbar_refresh_volume(int percent) {
 	} else if (percent < VOLUME_HIGH_PERCENT) {
 		icon = &icon_volume_low;
 	}
-	lv_image_set_src(vol_icon, icon);
+	bar_set_src(vol_icon, icon);
 }
 
 // Shows or hides the headphone glyph to match what is in the jacks. Four times
@@ -340,70 +436,6 @@ static void refresh_headphone_icon(void) {
 	}
 
 	lv_obj_set_hidden(hp_icon, false);
-	if (state == JACK_BALANCED) {
-		// Gold marks the balanced output.
-		lv_obj_set_style_image_recolor(hp_icon, lv_color_make(212, 175, 55), 0);
-		lv_obj_set_style_image_recolor_opa(hp_icon, LV_OPA_COVER, 0);
-	} else {
-		// The single-ended jack keeps the theme's icon colour.
-		lv_obj_remove_local_style_prop(hp_icon, LV_STYLE_IMAGE_RECOLOR, 0);
-		lv_obj_remove_local_style_prop(hp_icon, LV_STYLE_IMAGE_RECOLOR_OPA, 0);
-	}
-}
-
-// The codec the Bluetooth link is carrying, in whichever direction it runs:
-// headphones being fed from here, or a phone sending to this player. Both are
-// cache reads, so this is safe on the poll. Empty when nothing is connected.
-static void bt_current_codec(char *out, size_t size) {
-	out[0] = '\0';
-
-	if (bluetooth_audio_active()) {
-		char offered[BT_MAX_CODECS][BT_CODEC_MAX];
-		char selected[BT_CODEC_MAX] = "";
-		bluetooth_get_codecs(offered, BT_MAX_CODECS, selected, sizeof(selected));
-		snprintf(out, size, "%s", selected);
-		return;
-	}
-
-	bt_stream_t stream;
-	if (bluetooth_receiver_stream(&stream)) {
-		snprintf(out, size, "%s", stream.codec);
-	}
-}
-
-// The Bluetooth glyph wears the colour of the codec family in use, out of the
-// Adwaita palette the rest of the interface is drawn from: orange for SBC,
-// green for AAC, purple for aptX, blue for LDAC, each in the light or dark
-// variant the palette gives for it.
-//
-// By family and not by name: aptX-HD is aptX and SBC-XQ is SBC, and a codec
-// this has never heard of gets no colour at all rather than a wrong one.
-// Compared on letters and digits only, in lower case, the way bluetooth.c
-// compares them -- bluealsa spells it "aptX-HD" and a config file might say
-// "aptx_hd".
-static bool bt_codec_color(const char *codec, lv_color_t *out) {
-	char key[BT_CODEC_MAX];
-	size_t used = 0;
-	for (const char *p = codec; *p && used + 1 < sizeof(key); p++) {
-		if (isalnum((unsigned char)*p)) {
-			key[used++] = (char)tolower((unsigned char)*p);
-		}
-	}
-	key[used] = '\0';
-
-	bool dark = theme_is_dark();
-	if (strncmp(key, "ldac", 4) == 0) {
-		*out = dark ? lv_color_make(0x62, 0xA0, 0xEA) : lv_color_make(0x1A, 0x5F, 0xB4);
-	} else if (strncmp(key, "aptx", 4) == 0) {
-		*out = dark ? lv_color_make(0xDC, 0x8A, 0xDD) : lv_color_make(0x81, 0x3D, 0x9C);
-	} else if (strncmp(key, "aac", 3) == 0) {
-		*out = dark ? lv_color_make(0x57, 0xE3, 0x89) : lv_color_make(0x26, 0xA2, 0x69);
-	} else if (strncmp(key, "sbc", 3) == 0) {
-		*out = dark ? lv_color_make(0xFF, 0xA3, 0x48) : lv_color_make(0xC6, 0x46, 0x00);
-	} else {
-		return false;
-	}
-	return true;
 }
 
 // The two radios, immediately left of the charge percentage: bluetooth first,
@@ -421,9 +453,9 @@ void topbar_refresh_radios(void) {
 		// bringing the radio up takes a second or two during which the status
 		// still reads OFF.
 		if (!wifi_get_enabled()) {
-			lv_obj_set_hidden(wifi_icon, true);
+			bar_set_hidden(wifi_icon, true);
 		} else {
-			lv_obj_set_hidden(wifi_icon, false);
+			bar_set_hidden(wifi_icon, false);
 
 			if (status.state == WIFI_STATE_CONNECTED) {
 				// Connected: the arc shows the signal strength.
@@ -435,14 +467,14 @@ void topbar_refresh_radios(void) {
 				} else if (status.bars == 2) {
 					glyph = &icon_wifi_high;
 				}
-				lv_image_set_src(wifi_icon, glyph);
-				lv_obj_set_style_image_opa(wifi_icon, LV_OPA_COVER, 0);
+				bar_set_src(wifi_icon, glyph);
+				bar_set_image_opa(wifi_icon, LV_OPA_COVER);
 			} else {
 				// On but attached to nothing: the full arc, faded. The empty
 				// glyph is a single dot at this size and reads as a speck of dust
 				// rather than a radio.
-				lv_image_set_src(wifi_icon, &icon_wifi_max);
-				lv_obj_set_style_image_opa(wifi_icon, RADIO_IDLE_OPA, 0);
+				bar_set_src(wifi_icon, &icon_wifi_max);
+				bar_set_image_opa(wifi_icon, RADIO_IDLE_OPA);
 			}
 		}
 	}
@@ -453,25 +485,10 @@ void topbar_refresh_radios(void) {
 		// status bar that stays empty for all of them looks like the switch did
 		// nothing.
 		if (!bluetooth_get_enabled()) {
-			lv_obj_set_hidden(bt_icon, true);
+			bar_set_hidden(bt_icon, true);
 		} else {
-			lv_obj_set_hidden(bt_icon, false);
-			lv_obj_set_style_image_opa(bt_icon,
-									   bluetooth_get_state() == BT_STATE_CONNECTED ? LV_OPA_COVER : RADIO_IDLE_OPA, 0);
-
-			// A local colour while a codec is known, and the shared icon style
-			// back when it is not: a radio that is merely on has no codec to
-			// name, and the glyph belongs to the theme again.
-			char codec[BT_CODEC_MAX];
-			lv_color_t color;
-			bt_current_codec(codec, sizeof(codec));
-			if (codec[0] && bt_codec_color(codec, &color)) {
-				lv_obj_set_style_image_recolor(bt_icon, color, 0);
-				lv_obj_set_style_image_recolor_opa(bt_icon, LV_OPA_COVER, 0);
-			} else {
-				lv_obj_remove_local_style_prop(bt_icon, LV_STYLE_IMAGE_RECOLOR, 0);
-				lv_obj_remove_local_style_prop(bt_icon, LV_STYLE_IMAGE_RECOLOR_OPA, 0);
-			}
+			bar_set_hidden(bt_icon, false);
+			bar_set_image_opa(bt_icon, bluetooth_get_state() == BT_STATE_CONNECTED ? LV_OPA_COVER : RADIO_IDLE_OPA);
 		}
 	}
 
@@ -489,9 +506,9 @@ static void refresh_sonixlink_icon(void) {
 		return;
 	}
 	if (sonixlink_is_connected()) {
-		lv_obj_set_hidden(sonixlink_icon, false);
+		bar_set_hidden(sonixlink_icon, false);
 	} else {
-		lv_obj_set_hidden(sonixlink_icon, true);
+		bar_set_hidden(sonixlink_icon, true);
 	}
 }
 
@@ -532,60 +549,20 @@ void topbar_set_library_check(topbar_library_t state) {
 static void radio_timer_cb(lv_timer_t *timer) {
 	(void)timer;
 	topbar_refresh_radios();
+	main_menu_poll_network();
 }
 
-// The playback indicator: the play glyph while a track runs, the pause glyph
-// while one is loaded but stopped, nothing at all when there is no track. It
-// takes the same colour as everything else in the bar rather than the accent,
-// which would make it shout.
-void topbar_refresh_playback(void) {
-	device_state_t state;
-	device_state_get(&state);
-	refresh_play_icon(&state);
-}
+// Playback callers also notify us when the source changes to or from AirPlay.
+void topbar_refresh_playback(void) { refresh_airplay_icon(); }
 
-static void refresh_play_icon(const device_state_t *state) {
-	if (!play_icon) {
+// Keep the source indicator for incoming AirPlay. Local transport state is
+// already visible on the mini-player and does not belong in the status bar.
+static void refresh_airplay_icon(void) {
+	if (!airplay_icon)
 		return;
-	}
-
-	// The AirPlay glyph replaces play/pause rather than sitting beside it. Only
-	// one thing comes out of the DAC, so showing both would claim two, and the
-	// play triangle would be wrong anyway: the local track is stopped while the
-	// phone is the one playing.
-	//
-	// The swap happens only while audio is actually arriving, not as soon as the
-	// receiver is switched on: AirPlay stays enabled on its own (see
-	// quickpanel.c), so enabled and playing are different states and the bar has
-	// to report the second.
 	airplay_state_t ap;
 	airplay_get_state(&ap);
-	if (ap.playing) {
-		lv_image_set_src(play_icon, &icon_airplay_status);
-		lv_obj_remove_local_style_prop(play_icon, LV_STYLE_IMAGE_RECOLOR, 0);
-		lv_obj_set_hidden(play_icon, false);
-		return;
-	}
-
-	if (state->status == AUDIO_STATUS_PLAYING) {
-		lv_image_set_src(play_icon, &icon_play_status);
-	} else if (state->current_file[0]) {
-		lv_image_set_src(play_icon, &icon_pause_status);
-	} else {
-		lv_obj_set_hidden(play_icon, true);
-		return;
-	}
-
-	// The play glyph turns blue while the sound is leaving over Bluetooth, so a
-	// glance at the bar says where the music is going, not just that it is
-	// going. A fixed Bluetooth blue rather than the accent colour, because it
-	// means wireless, not active.
-	if (state->status == AUDIO_STATUS_PLAYING && bluetooth_audio_active()) {
-		lv_obj_set_style_image_recolor(play_icon, lv_color_make(0, 122, 255), 0);
-	} else {
-		lv_obj_remove_local_style_prop(play_icon, LV_STYLE_IMAGE_RECOLOR, 0);
-	}
-	lv_obj_set_hidden(play_icon, false);
+	bar_set_hidden(airplay_icon, !ap.playing);
 }
 
 // The things noticed with the hands, on their own fast timer: what is in the
@@ -687,15 +664,13 @@ static void timer_update_cb(lv_timer_t *timer) {
 	device_state_get(&state);
 
 	topbar_refresh_volume((int)state.volume);
-	refresh_play_icon(&state);
+	refresh_airplay_icon();
 
 	// The battery and the charge LED ride jack_timer instead, which runs often
 	// enough for plugging the charger in to show at once. What is on this poll
 	// is what nobody is standing over -- the playback colour, Wi-Fi transfer,
 	// DAC mode.
-	led_update_playback(state.status == AUDIO_STATUS_PLAYING, state.stream_sample_rate,
-						!state.live && podcastcache_is_episode(state.current_file),
-						!state.live && audio_get_dsd_multiple() > 0);
+	led_update_playback(state.status == AUDIO_STATUS_PLAYING, state.stream_sample_rate, !state.live && podcastcache_is_episode(state.current_file), !state.live && audio_get_dsd_multiple() > 0);
 	// Wi-Fi transfer takes the same route: its pattern stays lit, screen off
 	// included, for as long as the transfer is on. The switch rather than the
 	// process, because this poll is five seconds apart and the server takes a
@@ -745,16 +720,9 @@ void topbar_set_clock_position(int pos) {
 	}
 }
 
-// Re-runs the battery paint so its colours follow a theme switch. The reading
-// is thrown away first, or the poll would see the same numbers as last time and
-// keep the old colours.
-//
-// The radios come with it: the Bluetooth glyph carries a codec colour set by
-// hand, which has a light and a dark variant and would otherwise keep the one
-// from before the switch until the next poll.
+// Repaint all status ink immediately, including warnings and the battery fill.
 static void topbar_refresh_theme(void) {
-	last_battery_percent = -2;
-	last_battery_charging = -1;
+	refresh_status_ink();
 	if (jack_timer) {
 		lv_timer_ready(jack_timer);
 	}
@@ -762,6 +730,9 @@ static void topbar_refresh_theme(void) {
 		lv_timer_ready(radio_timer);
 	}
 }
+
+// How far a tap on the bar may wander and still be a tap.
+#define TAP_SLOP_PX 12
 
 // A downward drag starting on the status bar pulls the control panel in, and the
 // panel follows the finger the whole way instead of snapping open the moment the
@@ -823,6 +794,15 @@ static void topbar_drag_cb(lv_event_t *e) {
 		// far below where it landed.
 		if (dy >= FLICK_OPEN_PX) {
 			quickpanel_open();
+			return;
+		}
+
+		// 2.0: a tap on the bar opens it too (the handoff's frame: "status bar,
+		// tap -> control centre"). A tap is a release near where the finger
+		// landed; a sideways drag along the bar is neither.
+		int dx = p.x - start.x;
+		if (LV_ABS(dx) < TAP_SLOP_PX && LV_ABS(dy) < TAP_SLOP_PX) {
+			quickpanel_open();
 		}
 	}
 }
@@ -877,13 +857,13 @@ void topbar_init(gui_config_t *cfg) {
 	// The left-hand group: volume, then the jack and playback indicators, laid
 	// out as a flex row so the two sides of the bar balance around the clock.
 	container_left = lv_obj_create(top_bar);
-	lv_obj_set_size(container_left, cfg->screen_width / 2, cfg->top_bar_height);
+	lv_obj_set_size(container_left, LV_SIZE_CONTENT, cfg->top_bar_height);
 	lv_obj_align(container_left, LV_ALIGN_LEFT_MID, cfg->padding, 0);
 	lv_obj_set_style_bg_opa(container_left, 0, 0);
 	lv_obj_set_style_border_width(container_left, 0, 0);
 	lv_obj_set_style_radius(container_left, 0, 0);
 	lv_obj_set_style_pad_all(container_left, 0, 0);
-	lv_obj_set_style_pad_gap(container_left, 8, 0);
+	lv_obj_set_style_pad_gap(container_left, 4, 0);
 	lv_obj_set_scrollable(container_left, false);
 	// Not clickable, so presses reach the bar itself, whose drag handler pulls
 	// the control panel down.
@@ -899,21 +879,20 @@ void topbar_init(gui_config_t *cfg) {
 	vol_label = lv_label_create(container_left);
 	lv_label_set_text(vol_label, "--");
 	lv_obj_add_style(vol_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(vol_label, &font_ui_24, 0);
+	lv_obj_set_style_text_font(vol_label, &font_ui_20, 0); // Prototype compact text
 
-	// The jack indicator: appears when headphones are plugged in, theme-coloured
-	// for the 3.5 mm jack and gold for the 4.4 mm balanced one.
+	// Jack and USB output details remain available in the audio-chain view.
 	hp_icon = lv_image_create(container_left);
 	lv_image_set_src(hp_icon, &icon_headphones);
 	lv_obj_add_style(hp_icon, &theme_style_icon, 0);
 	lv_obj_set_hidden(hp_icon, true);
 
-	// What the player is doing, right of the jack indicator: play while a track
-	// runs, pause while one is loaded and stopped, hidden when nothing is loaded.
-	play_icon = lv_image_create(container_left);
-	lv_image_set_src(play_icon, &icon_play_status);
-	lv_obj_add_style(play_icon, &theme_style_icon, 0);
-	lv_obj_set_hidden(play_icon, true);
+	// Incoming AirPlay is a source, unlike local transport state.
+	airplay_icon = lv_image_create(container_left);
+	lv_image_set_src(airplay_icon, &icon_airplay_status);
+	lv_obj_set_hidden(airplay_icon, true);
+	lv_obj_add_style(airplay_icon, &theme_style_icon, 0);
+	lv_obj_set_hidden(airplay_icon, true);
 
 	// Right of it, Detect changes while it runs and briefly once it is done
 	// (topbar_set_library_check).
@@ -923,9 +902,7 @@ void topbar_init(gui_config_t *cfg) {
 	lv_obj_set_hidden(library_icon, true);
 
 	// And right of that, the SonixLink logo while a phone is on the other end.
-	// Alongside play/pause rather than in place of it: the phone is driving this
-	// player, not taking the sound away from it, so what the DAC is doing stays
-	// true and this only adds who is asking.
+	// The phone is driving this player, so this identifies remote control.
 	sonixlink_icon = lv_image_create(container_left);
 	lv_image_set_src(sonixlink_icon, &icon_sonixlink_status);
 	lv_obj_add_style(sonixlink_icon, &theme_style_icon, 0);
@@ -934,7 +911,7 @@ void topbar_init(gui_config_t *cfg) {
 	// The right-hand group: radios, charge percentage and battery, packed to the
 	// right edge.
 	container_right = lv_obj_create(top_bar);
-	lv_obj_set_size(container_right, cfg->screen_width, cfg->top_bar_height);
+	lv_obj_set_size(container_right, LV_SIZE_CONTENT, cfg->top_bar_height);
 	lv_obj_align(container_right, LV_ALIGN_RIGHT_MID, -cfg->padding, 0);
 	lv_obj_set_style_bg_opa(container_right, 0, 0);
 	lv_obj_set_style_border_width(container_right, 0, 0);
@@ -942,7 +919,7 @@ void topbar_init(gui_config_t *cfg) {
 	// The container's default padding would push the battery about ten pixels
 	// further in than the page padding everything else lines up with.
 	lv_obj_set_style_pad_all(container_right, 0, 0);
-	lv_obj_set_style_pad_gap(container_right, 8, 0);
+	lv_obj_set_style_pad_gap(container_right, 4, 0);
 	lv_obj_set_scrollable(container_right, false);
 	lv_obj_set_clickable(container_right, false);
 	lv_obj_set_flex_flow(container_right, LV_FLEX_FLOW_ROW);
@@ -951,6 +928,7 @@ void topbar_init(gui_config_t *cfg) {
 	// The radios come first in the group and so sit leftmost: bluetooth, then
 	// wifi, then the charge percentage and the battery. Both start hidden;
 	// topbar_refresh_radios() decides what is shown.
+
 	bt_icon = lv_image_create(container_right);
 	lv_image_set_src(bt_icon, &icon_bluetooth_status);
 	lv_obj_add_style(bt_icon, &theme_style_icon, 0);
@@ -966,7 +944,7 @@ void topbar_init(gui_config_t *cfg) {
 	lv_label_set_text(bat_label, "--%");
 	topbar_set_battery_percent(config_get_int("screen", "battery_percent", 1) != 0);
 	lv_obj_add_style(bat_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(bat_label, &font_ui_24, 0);
+	lv_obj_set_style_text_font(bat_label, &font_ui_20, 0);
 
 	// The battery indicator is stacked fill first, shell over it, charging bolt
 	// above both. The cavity is sized by scaling both edges and taking the
@@ -987,7 +965,7 @@ void topbar_init(gui_config_t *cfg) {
 	bat_fill = lv_obj_create(bat_widget);
 	lv_obj_set_pos(bat_fill, cavity_x, cavity_y);
 	lv_obj_set_size(bat_fill, cavity_w, cavity_h);
-	lv_obj_set_style_bg_color(bat_fill, lv_color_make(60, 190, 90), 0);
+	lv_obj_set_style_bg_color(bat_fill, shell_color(true), 0);
 	lv_obj_set_style_bg_opa(bat_fill, LV_OPA_COVER, 0);
 	lv_obj_set_style_border_width(bat_fill, 0, 0);
 	lv_obj_set_style_radius(bat_fill, 1, 0);
@@ -996,29 +974,29 @@ void topbar_init(gui_config_t *cfg) {
 
 	bat_shell = lv_image_create(bat_widget);
 	lv_image_set_src(bat_shell, &icon_battery);
-	lv_obj_set_style_image_recolor(bat_shell, theme()->text_primary, 0);
+	lv_obj_set_style_image_recolor(bat_shell, theme()->text_secondary, 0);
 	lv_obj_set_style_image_recolor_opa(bat_shell, LV_OPA_COVER, 0);
 	lv_obj_set_pos(bat_shell, 0, 0);
 
 	bat_bolt = lv_image_create(bat_widget);
 	lv_image_set_src(bat_bolt, &icon_battery_charging_bolt);
-	lv_obj_set_style_image_recolor(bat_bolt, lv_color_make(245, 205, 60), 0);
+	lv_obj_set_style_image_recolor(bat_bolt, shell_color(true), 0);
 	lv_obj_set_style_image_recolor_opa(bat_bolt, LV_OPA_COVER, 0);
 	lv_obj_set_pos(bat_bolt, 0, 0);
 	lv_obj_set_hidden(bat_bolt, true);
 
 	// Clock, centred on the bar and independent of everything around it.
-	clock_label = clocklabel_create(top_bar, &font_ui_24, 24, &font_ui_14, 14);
+	clock_label = lv_label_create(top_bar);
 	lv_obj_add_style(clock_label, &theme_style_text, 0);
+	lv_obj_set_style_text_font(clock_label, &font_ui_20, 0);
 	lv_obj_align(clock_label, LV_ALIGN_CENTER, 0, 0);
 	topbar_refresh_clock();
 	topbar_set_clock_position((int)config_get_int("screen", "clock_pos", TOPBAR_CLOCK_CENTER));
 
-	// The tint's two styles, after the theme's so that they win over it; empty
-	// until a tinted page is shown (topbar_tint_on_screen).
+	// One ink for all normal states, overridden together over album artwork.
 	lv_style_init(&tint_text_style);
 	lv_style_init(&tint_icon_style);
-	lv_obj_t *tinted_icons[] = {vol_icon, hp_icon, play_icon, library_icon, sonixlink_icon, bt_icon, wifi_icon};
+	lv_obj_t *tinted_icons[] = {vol_icon, hp_icon, airplay_icon, library_icon, sonixlink_icon, bt_icon, wifi_icon};
 	for (size_t i = 0; i < sizeof(tinted_icons) / sizeof(tinted_icons[0]); i++) {
 		lv_obj_add_style(tinted_icons[i], &tint_icon_style, 0);
 	}
@@ -1027,9 +1005,19 @@ void topbar_init(gui_config_t *cfg) {
 		lv_obj_add_style(tinted_labels[i], &tint_text_style, 0);
 	}
 
+	// Match the prototype's compact 20px status glyphs and 24px battery.
+	for (size_t i = 0; i < sizeof(tinted_icons) / sizeof(tinted_icons[0]); i++) {
+		lv_obj_set_size(tinted_icons[i], 20, 20);
+		lv_image_set_inner_align(tinted_icons[i], LV_IMAGE_ALIGN_STRETCH);
+	}
+	lv_obj_set_size(bat_shell, BATTERY_ICON_SIZE, BATTERY_ICON_SIZE);
+	lv_image_set_inner_align(bat_shell, LV_IMAGE_ALIGN_STRETCH);
+	lv_obj_set_size(bat_bolt, BATTERY_ICON_SIZE, BATTERY_ICON_SIZE);
+	lv_image_set_inner_align(bat_bolt, LV_IMAGE_ALIGN_STRETCH);
+	refresh_status_ink();
+
 	// Ten seconds keeps the minute from ever looking stale and costs nothing.
 	clock_timer = lv_timer_create(clock_timer_cb, 10000, NULL);
-	clock_set_change_hook(clock_changed);
 	power_pause_in_standby(clock_timer); // a clock nobody can see is pure drain
 
 	// The current time is written to the config, and checked against the RTC, so
@@ -1098,10 +1086,10 @@ void topbar_set_battery_percent(bool shown) {
 
 // Puts the bar in the tint or back in the theme, for the page now shown.
 static void tint_apply(void) {
-	if (!top_bar || over_art) {
+	if (!top_bar || over_art || control_panel_palette || playback_palette) {
 		return; // the artwork's look holds for as long as the player is up
 	}
-	bool active = tint_screen && tint_page == tint_screen && !tint_held;
+	bool active = tint_screen && tint_page == tint_screen;
 	if (active == tint_active && !active) {
 		return;
 	}
@@ -1109,29 +1097,25 @@ static void tint_apply(void) {
 
 	if (active) {
 		lv_obj_set_style_bg_color(top_bar, tint_bg, 0);
-		lv_style_set_text_color(&tint_text_style, tint_ink);
-		lv_style_set_image_recolor(&tint_icon_style, tint_ink);
-		lv_style_set_image_recolor_opa(&tint_icon_style, LV_OPA_COVER);
 	} else {
 		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BG_COLOR, 0);
-		lv_style_remove_prop(&tint_text_style, LV_STYLE_TEXT_COLOR);
-		lv_style_remove_prop(&tint_icon_style, LV_STYLE_IMAGE_RECOLOR);
-		lv_style_remove_prop(&tint_icon_style, LV_STYLE_IMAGE_RECOLOR_OPA);
 	}
-	lv_obj_report_style_change(&tint_text_style);
-	lv_obj_report_style_change(&tint_icon_style);
-
-	// The shell carries its colour on itself; it is painted now, and the next
-	// poll paints the whole indicator again.
-	lv_obj_set_style_image_recolor(bat_shell, shell_color(last_battery_percent >= 0), 0);
-	last_battery_percent = -2;
+	refresh_status_ink();
 }
 
-// The blur and the dimming behind the bar, or neither.
+// The blur and the dimming behind the bar, or neither. While the blur is held
+// off (topbar_hold_backdrop_blur) the dimming stays and only the blur goes.
 static void over_art_backdrop(bool blur) {
+	over_art_blur = blur;
 	if (blur) {
 		lv_obj_set_style_bg_color(top_bar, lv_color_black(), 0);
 		lv_obj_set_style_bg_opa(top_bar, OVER_ART_DIM_OPA, 0);
+		if (over_art_blur_held) {
+			lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_RADIUS, 0);
+			lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_BACKDROP, 0);
+			lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_QUALITY, 0);
+			return;
+		}
 		lv_obj_set_style_blur_radius(top_bar, OVER_ART_BLUR_RADIUS, 0);
 		lv_obj_set_style_blur_backdrop(top_bar, true, 0);
 		lv_obj_set_style_blur_quality(top_bar, LV_BLUR_QUALITY_SPEED, 0);
@@ -1143,18 +1127,29 @@ static void over_art_backdrop(bool blur) {
 	}
 }
 
+void topbar_hold_backdrop_blur(bool hold) {
+	if (hold == over_art_blur_held) {
+		return;
+	}
+	over_art_blur_held = hold;
+	if (top_bar && over_art && over_art_blur && !control_panel_palette) {
+		over_art_backdrop(true);
+	}
+}
+
 void topbar_set_over_artwork(bool on, bool blur) {
 	if (!top_bar) {
+		return;
+	}
+	if (control_panel_palette) {
+		over_art = on;
+		over_art_blur = blur;
 		return;
 	}
 	if (on) {
 		over_art = true;
 		over_art_backdrop(blur);
-		lv_style_set_text_color(&tint_text_style, lv_color_white());
-		lv_style_set_image_recolor(&tint_icon_style, lv_color_white());
-		lv_style_set_image_recolor_opa(&tint_icon_style, LV_OPA_COVER);
-		lv_obj_report_style_change(&tint_text_style);
-		lv_obj_report_style_change(&tint_icon_style);
+
 	} else if (over_art) {
 		over_art = false;
 		over_art_backdrop(false);
@@ -1166,8 +1161,7 @@ void topbar_set_over_artwork(bool on, bool blur) {
 	} else {
 		return;
 	}
-	lv_obj_set_style_image_recolor(bat_shell, shell_color(last_battery_percent >= 0), 0);
-	last_battery_percent = -2;
+	refresh_status_ink();
 }
 
 void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t ink) {
@@ -1190,18 +1184,40 @@ void topbar_page_shown(lv_obj_t *screen) {
 	tint_apply();
 }
 
-void topbar_tint_hold(bool held) {
-	if (tint_held == held) {
-		return;
-	}
-	tint_held = held;
-	tint_apply();
-}
-
 void topbar_bring_to_front(void) {
 	if (top_bar) {
 		lv_obj_move_foreground(top_bar);
 	}
+}
+
+void topbar_set_control_panel(bool shown) {
+	if (!top_bar || control_panel_palette == shown)
+		return;
+	control_panel_palette = shown;
+	if (shown) {
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_RADIUS, 0);
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_BACKDROP, 0);
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BLUR_QUALITY, 0);
+	} else if (over_art) {
+		over_art_backdrop(over_art_blur);
+	} else {
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BG_OPA, 0);
+		tint_active = true;
+		tint_apply();
+	}
+	refresh_status_ink();
+}
+
+void topbar_set_playback(bool shown) {
+	if (!top_bar || playback_palette == shown)
+		return;
+	playback_palette = shown;
+	if (!shown && !over_art && !control_panel_palette) {
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BG_OPA, 0);
+		tint_active = true;
+		tint_apply();
+	}
+	refresh_status_ink();
 }
 
 // Shows or hides the whole bar. The player page hides it so the album art can

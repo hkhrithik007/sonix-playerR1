@@ -4,8 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "src/gui/shell/sx_mini.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/popover.h"
@@ -13,7 +15,11 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
+#include "src/gui/shell/touch.h"
+#include "src/gui/shell/sx_tokens.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/system/audio/eq.h"
+#include "src/system/audio/eqprofile.h"
 #include "src/system/core/lang.h"
 
 #define PRESET_NAME_MAX 100
@@ -22,8 +28,10 @@ static gui_config_t *config;
 
 static lv_obj_t *settings_screen;
 
-// The page's rows, built afresh each time it opens.
+// The preset list, built fresh each time it is opened.
+static lv_obj_t *list_screen;
 static lv_obj_t *list_container;
+static lv_obj_t *list_empty;
 
 // The name dialog behind "Save preset".
 static lv_obj_t *name_layer;
@@ -37,19 +45,13 @@ static char menu_name[PRESET_NAME_MAX + 1];
 
 void eqsettings_set_reload_cb(void (*cb)(void)) { reload_cb = cb; }
 
+lv_obj_t *eqsettings_screen(void) { return settings_screen; }
+
 // ---------------------------------------------------------------------------
-// the page: saving, the ready-made curves, the user's own
+// the ready-made curves
 // ---------------------------------------------------------------------------
 
-static void rebuild(void);
-
-static void applied(const char *toast) {
-	if (reload_cb) {
-		reload_cb();
-	}
-	toast_success(toast);
-	back_btn_cb(NULL);
-}
+static lv_obj_t *default_screen;
 
 static void default_preset_cb(lv_event_t *e) {
 	if (switcher_back_drag_active()) {
@@ -60,8 +62,34 @@ static void default_preset_cb(lv_event_t *e) {
 		return;
 	}
 	eq_apply_preset(&EQ_DEFAULT_PRESETS[index]);
-	applied("eq_preset_applied");
+	if (reload_cb) {
+		reload_cb();
+	}
+	toast_success("eq_preset_applied");
+	back_btn_cb(NULL);
 }
+
+static void open_default_list_cb(lv_event_t *e) {
+	(void)e;
+	switch_screen(default_screen);
+}
+
+static void build_default_list_page(gui_config_t *cfg) {
+	default_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(default_screen, cfg, "eq_default_presets");
+
+	for (int i = 0; i < EQ_DEFAULT_PRESET_COUNT; i++) {
+		settingsrow_action(container, EQ_DEFAULT_PRESETS[i].name, default_preset_cb, (void *)(intptr_t)i);
+	}
+
+	switcher_attach_back_gesture(default_screen);
+}
+
+// ---------------------------------------------------------------------------
+// the preset list
+// ---------------------------------------------------------------------------
+
+static void rebuild_preset_list(void);
 
 static void preset_row_delete_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
 
@@ -73,8 +101,13 @@ static void preset_clicked_cb(lv_event_t *e) {
 	if (!name) {
 		return;
 	}
+
 	if (eq_preset_load(name)) {
-		applied("preset_loaded");
+		if (reload_cb) {
+			reload_cb();
+		}
+		toast_success("preset_loaded");
+		back_btn_cb(NULL);
 	} else {
 		gui_notify_popup("cannot_load_the_preset");
 	}
@@ -83,7 +116,7 @@ static void preset_clicked_cb(lv_event_t *e) {
 static void do_delete_preset(void *user) {
 	(void)user;
 	if (menu_name[0] && eq_preset_delete(menu_name)) {
-		rebuild();
+		rebuild_preset_list();
 	}
 	menu_name[0] = '\0';
 }
@@ -125,7 +158,7 @@ static bool add_preset_row(const char *name, void *user) {
 	lv_obj_set_size(row, lv_pct(100), 84);
 	lv_obj_add_style(row, &theme_style_card, 0);
 	lv_obj_add_style(row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(row, 12, 0);
+	lv_obj_set_style_radius(row, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_shadow_width(row, 0, 0);
 	lv_obj_set_style_pad_hor(row, 16, 0);
@@ -154,6 +187,8 @@ static bool add_preset_row(const char *name, void *user) {
 
 	lv_obj_t *menu_btn = lv_btn_create(row);
 	lv_obj_set_size(menu_btn, 44, 44);
+	// A fingertip's worth (touch.h), kept within the row's own padding.
+	touch_grow(menu_btn, 44, 44, 14);
 	lv_obj_set_style_bg_opa(menu_btn, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(menu_btn, 0, 0);
 	lv_obj_set_style_shadow_width(menu_btn, 0, 0);
@@ -169,36 +204,23 @@ static bool add_preset_row(const char *name, void *user) {
 	return true;
 }
 
-static void open_name_dialog_cb(lv_event_t *e);
-
-// Saving first, then the ready-made curves, then the user's own: read again
-// every time the page opens, since a preset saved or deleted changes the last.
-static void rebuild(void) {
+static void rebuild_preset_list(void) {
 	lv_obj_clean(list_container);
 
-	settingsrow_action(list_container, "save_preset", open_name_dialog_cb, NULL);
-
-	settingsrow_heading(list_container, "eq_saved_presets");
 	int count = 0;
 	eq_preset_for_each(add_preset_row, &count);
-	if (count == 0) {
-		lv_obj_t *empty = lv_label_create(list_container);
-		lv_label_set_text(empty, tr("no_saved_presets"));
-		lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
-		lv_obj_set_width(empty, lv_pct(100));
-		lv_obj_add_style(empty, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(empty, &font_ui_22, 0);
-	}
 
-	settingsrow_heading(list_container, "eq_default_presets");
-	for (int i = 0; i < EQ_DEFAULT_PRESET_COUNT; i++) {
-		settingsrow_action(list_container, EQ_DEFAULT_PRESETS[i].name, default_preset_cb, (void *)(intptr_t)i);
+	if (count == 0) {
+		lv_obj_set_hidden(list_empty, false);
+	} else {
+		lv_obj_set_hidden(list_empty, true);
 	}
 }
 
-void eqsettings_open(void) {
-	rebuild();
-	switch_screen(settings_screen);
+static void open_preset_list_cb(lv_event_t *e) {
+	(void)e;
+	rebuild_preset_list();
+	switch_screen(list_screen);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,8 +230,8 @@ void eqsettings_open(void) {
 static void name_layer_hide(void) {
 	if (name_layer) {
 		lv_obj_set_hidden(name_layer, true);
+		sx_mini_update_visibility(); // its keyboard comes or goes with it
 	}
-	back_btn_hide_on_screen(settings_screen, false);
 }
 
 static void name_cancel_cb(lv_event_t *e) {
@@ -239,10 +261,6 @@ static void name_accept_cb(lv_event_t *e) {
 	}
 
 	name_layer_hide();
-	rebuild();
-	if (reload_cb) {
-		reload_cb();
-	}
 	toast_success("preset_saved");
 }
 
@@ -254,11 +272,9 @@ static void open_name_dialog_cb(lv_event_t *e) {
 	// forced on it; otherwise the caret sits there without blinking.
 	lv_obj_add_state(name_field, LV_STATE_FOCUSED);
 	lv_obj_send_event(name_field, LV_EVENT_FOCUSED, NULL);
-	// The layer has its own close in the corner: the chevron would leave the
-	// page with the keyboard still up, so it goes while the layer is up.
 	lv_obj_set_hidden(name_layer, false);
+	sx_mini_update_visibility(); // its keyboard comes or goes with it
 	lv_obj_move_foreground(name_layer);
-	back_btn_hide_on_screen(settings_screen, true);
 }
 
 static void build_name_dialog(gui_config_t *cfg) {
@@ -277,7 +293,7 @@ static void build_name_dialog(gui_config_t *cfg) {
 	lv_label_set_text(heading, tr("preset_name"));
 	lv_obj_add_style(heading, &theme_style_text, 0);
 	lv_obj_set_style_text_font(heading, &font_ui_24, 0);
-	lv_obj_align(heading, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 10);
+	lv_obj_align(heading, LV_ALIGN_TOP_LEFT, cfg->padding + 56 + 14, cfg->padding + cfg->top_bar_height + 10);
 
 	lv_obj_t *cancel = lv_btn_create(name_layer);
 	lv_obj_set_size(cancel, 56, 56);
@@ -301,10 +317,13 @@ static void build_name_dialog(gui_config_t *cfg) {
 	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_align(name_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
 	lv_obj_add_style(name_field, &theme_style_card, 0);
-	lv_obj_set_style_radius(name_field, 12, 0);
+	// The 2.0 input: a pill on the surface.
+	lv_obj_add_style(name_field, &sx_style_surface, 0);
+	lv_obj_set_style_radius(name_field, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_border_width(name_field, 0, 0);
 	lv_obj_set_style_shadow_width(name_field, 0, 0);
 	lv_obj_set_style_pad_all(name_field, 14, 0);
+	lv_obj_set_style_pad_hor(name_field, 22, 0);
 	lv_obj_set_style_text_font(name_field, &font_ui_24, 0);
 	keyboard_style_caret(name_field);
 
@@ -315,12 +334,64 @@ static void build_name_dialog(gui_config_t *cfg) {
 // construction
 // ---------------------------------------------------------------------------
 
-void eqsettings_init(gui_config_t *cfg) {
-	config = cfg;
+static void build_list_page(gui_config_t *cfg) {
+	list_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(list_screen, cfg, "load_preset");
+	list_container = container;
 
-	settings_screen = lv_obj_create(NULL);
-	list_container = settingsrow_page(settings_screen, cfg, "eq_presets");
+	list_empty = lv_label_create(list_screen);
+	lv_label_set_text(list_empty, tr("no_saved_presets"));
+	lv_obj_set_style_text_align(list_empty, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_add_style(list_empty, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(list_empty, &font_ui_24, 0);
+	lv_obj_align(list_empty, LV_ALIGN_TOP_MID, 0, settingsrow_content_top(cfg) + 100);
+	lv_obj_set_hidden(list_empty, true);
+
+	switcher_attach_back_gesture(list_screen);
+}
+
+// "EQ per output" (eqprofile.h). Here rather than on each equaliser's own page
+// because it is about all three at once: the graphic EQ, the PEQ and MSEB.
+static void per_output_cb(lv_event_t *e) {
+	lv_obj_t *sw = lv_event_get_target(e);
+	eqprofile_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
+}
+
+static void build_per_output(lv_obj_t *container) {
+	lv_obj_t *sw = NULL;
+	settingsrow_toggle(container, "eq_per_output", &sw, per_output_cb);
+	if (eqprofile_enabled()) {
+		lv_obj_add_state(sw, LV_STATE_CHECKED);
+	}
+	lv_obj_t *note = lv_label_create(container);
+	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(note, lv_pct(100));
+	lv_obj_add_style(note, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(note, &font_ui_22, 0);
+	lv_label_set_text(note, tr("eq_per_output_note"));
+}
+
+static void build(gui_config_t *cfg) {
+	lv_obj_t *container = settingsrow_page(settings_screen, cfg, "eq_settings");
+
+	settingsrow_add(container, "eq_default_presets", NULL, open_default_list_cb, NULL);
+	settingsrow_action(container, "save_preset", open_name_dialog_cb, NULL);
+	settingsrow_add(container, "load_preset", NULL, open_preset_list_cb, NULL);
+	build_per_output(container);
+
+	build_list_page(cfg);
+	build_default_list_page(cfg);
 	build_name_dialog(cfg);
 
 	switcher_attach_back_gesture(settings_screen);
+}
+
+// Built on the first visit (see gui_page_defer), with its two list pages and
+// the name dialog: only the screen, which musicsettings's gear points at, has
+// to exist from boot. The "EQ per output" switch reads eqprofile when it is
+// built, so a page built late still shows the current state.
+void eqsettings_init(gui_config_t *cfg) {
+	config = cfg;
+	settings_screen = lv_obj_create(NULL);
+	gui_page_defer(settings_screen, build);
 }

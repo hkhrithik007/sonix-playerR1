@@ -11,10 +11,12 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/gui/shell/theme.h"
+#include "src/system/core/lang.h"
 #include "src/system/playback/audiobook.h"
 #include "src/system/playback/device_state.h"
-#include "src/system/core/lang.h"
 
 lv_obj_t *chapters_screen;
 
@@ -22,12 +24,13 @@ lv_obj_t *chapters_screen;
 // is plainly rebuilt each time it opens, like the audiobook index itself. The
 // cap is there for a pathological file, not for any real book.
 #define MAX_ROWS 400
-#define ROW_HEIGHT 68
-#define ROW_RADIUS 12
 
 static lv_obj_t *chapter_list;
 static lv_obj_t *empty_label;
 static int listed_count;
+static unsigned listed_serial;
+static unsigned listed_history;
+static int listed_playing = -1;
 
 // A folder book lists its files here instead: each file is a chapter.
 static bool listing_parts;
@@ -48,42 +51,16 @@ static void format_clock(double seconds, char *out, size_t out_size) {
 	}
 }
 
-static void chapter_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-
-	int index = (int)(intptr_t)lv_event_get_user_data(e);
-	double start = 0;
-	if (!audiobook_chapter(index, NULL, 0, &start)) {
-		return;
-	}
-
-	device_state_seek(start);
-	// The position is written straight away rather than at the next ten-second
-	// tick: jumping to a chapter and then switching the player off immediately
-	// is normal with a book.
-	audiobook_note_position(start, 0, true);
-
-	player_refresh_now_playing();
-	back_btn_cb(NULL); // back to the player, which is where the jump is heard
-}
-
 // Starts part `index` of the folder book from its beginning, with the book's
 // parts as the queue again, whatever the queue had become.
-static void part_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-
-	int index = (int)(intptr_t)lv_event_get_user_data(e);
+static bool play_part(int index) {
 	int count = audiobook_part_count();
 	if (index < 0 || index >= count) {
-		return;
+		return false;
 	}
 	char **paths = calloc((size_t)count, sizeof(char *));
 	if (!paths) {
-		return;
+		return false;
 	}
 	int filled = 0;
 	for (int i = 0; i < count; i++) {
@@ -93,67 +70,74 @@ static void part_clicked_cb(lv_event_t *e) {
 		}
 		filled++;
 	}
-	if (filled == count) {
+	bool ok = filled == count;
+	if (ok) {
 		device_state_play_list_ordered((const char *const *)paths, count, index);
 	}
 	for (int i = 0; i < filled; i++) {
 		free(paths[i]);
 	}
 	free(paths);
+	return ok;
+}
 
+static void chapter_row_tap(lv_obj_t *row, void *user) {
+	(void)row;
+	if (player_sheet_drag_active() || switcher_back_drag_active())
+		return;
+	int index = (int)(intptr_t)user;
+	if (listing_parts) {
+		if (!play_part(index))
+			return;
+	} else {
+		double start;
+		if (!audiobook_chapter(index, NULL, 0, &start))
+			return;
+		device_state_seek(start);
+		audiobook_note_position(start, 0, true);
+	}
 	player_refresh_now_playing();
 	back_btn_cb(NULL);
 }
 
-static lv_obj_t *make_row(int i, const char *title, const char *clock, bool playing, lv_event_cb_t cb) {
-	lv_obj_t *row = lv_btn_create(chapter_list);
-	lv_obj_set_size(row, lv_pct(100), ROW_HEIGHT);
-	lv_obj_add_style(row, &theme_style_card, 0);
-	lv_obj_add_style(row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(row, ROW_RADIUS, 0);
-	lv_obj_set_style_border_width(row, 0, 0);
-	lv_obj_set_style_shadow_width(row, 0, 0);
-	lv_obj_set_style_pad_all(row, 14, 0);
-	lv_obj_set_style_pad_column(row, 12, 0);
-	lv_obj_set_event_bubble(row, true);
-	lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-	lv_obj_t *number = lv_label_create(row);
-	lv_label_set_text_fmt(number, "%d", i + 1);
-	lv_obj_set_width(number, 44);
-	lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
-	lv_obj_add_style(number, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(number, &font_ui_24, 0);
-
-	lv_obj_t *label = lv_label_create(row);
-	lv_label_set_text(label, title[0] ? title : tr("chapter"));
-	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-	lv_obj_set_flex_grow(label, 1);
-	// One line, then dots. Without a height the label wraps instead, and a
-	// long chapter name then grows past the fixed row it lives in.
-	lv_obj_set_height(label, 32);
-	lv_obj_add_style(label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(label, &font_ui_24, 0);
-
-	lv_obj_t *time_label = NULL;
-	if (clock) {
-		time_label = lv_label_create(row);
-		lv_label_set_text(time_label, clock);
-		lv_obj_add_style(time_label, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(time_label, &font_ui_18, 0);
+bool chapters_step(int direction) {
+	if (!audiobook_is_playing() || (direction != -1 && direction != 1)) {
+		return false;
 	}
-
-	// The chapter being listened to is marked the way the queue marks the
-	// playing track: the accent on the words, not a second widget.
-	if (playing) {
-		lv_obj_set_style_text_color(number, theme()->accent, 0);
-		lv_obj_set_style_text_color(label, theme()->accent, 0);
-		if (time_label) {
-			lv_obj_set_style_text_color(time_label, theme()->accent, 0);
+	if (audiobook_part_count() > 1) {
+		if (!play_part(audiobook_part_current() + direction)) {
+			return false;
 		}
+	} else {
+		device_state_t state;
+		device_state_get(&state);
+		int current = audiobook_chapter_at(state.progress_current_secs);
+		double start;
+		if (current < 0 || !audiobook_chapter(current + direction, NULL, 0, &start)) {
+			return false;
+		}
+		device_state_seek(start);
+		audiobook_note_position(start, 0, true);
 	}
+	player_refresh_now_playing();
+	return true;
+}
+
+static void row_state(lv_obj_t *row, int i, const char *clock, int playing) {
+	bool listened = listing_parts ? audiobook_part_listened(i) : audiobook_chapter_listened(i);
+	const char *status = i == playing ? "chapter_current_position" : listened ? "chapter_listened" : "chapter_not_listened";
+	sx_row_set_subtitle(row, tr(status), NULL, clock);
+	sx_row_set_playing(row, i == playing);
+	sx_row_set_trail(row, listened ? SX_ROW_TRAIL_CHECK : SX_ROW_TRAIL_NONE);
+}
+
+static lv_obj_t *make_row(int i, const char *title, const char *clock, int playing) {
+	const sx_row_handlers_t handlers = {.on_tap = chapter_row_tap};
+	lv_obj_t *row = sx_row_create(chapter_list, &handlers, false);
+	sx_row_set_user(row, (void *)(intptr_t)i);
+	sx_row_set_number(row, i + 1);
+	sx_row_set_title(row, title[0] ? title : tr("chapter"));
+	row_state(row, i, clock, playing);
 	return row;
 }
 
@@ -184,7 +168,7 @@ static void rebuild(void) {
 			if (!audiobook_part(i, title, sizeof(title), NULL, 0)) {
 				break;
 			}
-			make_row(i, title, NULL, i == playing, part_clicked_cb);
+			make_row(i, title, NULL, playing);
 		}
 		return;
 	}
@@ -219,7 +203,7 @@ static void rebuild(void) {
 
 		char clock[24];
 		format_clock(start, clock, sizeof(clock));
-		make_row(i, title, clock, i == playing, chapter_clicked_cb);
+		make_row(i, title, clock, playing);
 	}
 }
 
@@ -230,6 +214,9 @@ static void loaded_cb(lv_event_t *e) {
 	// Open on the chapter being listened to rather than at the top: on a book
 	// with sixty chapters, the one that matters is the one playing.
 	int playing = playing_row();
+	listed_playing = playing;
+	listed_serial = audiobook_serial();
+	listed_history = audiobook_history_serial();
 	if (playing > 0 && playing < listed_count) {
 		lv_obj_t *row = lv_obj_get_child(chapter_list, playing);
 		if (row) {
@@ -238,14 +225,42 @@ static void loaded_cb(lv_event_t *e) {
 	}
 }
 
+void chapters_refresh(void) {
+	if (!chapters_screen || lv_screen_active() != chapters_screen)
+		return;
+	int playing = playing_row();
+	if (listed_serial != audiobook_serial()) {
+		rebuild();
+		listed_serial = audiobook_serial();
+		playing = playing_row();
+	} else if (playing != listed_playing || listed_history != audiobook_history_serial()) {
+		for (int i = 0; i < listed_count; i++) {
+			lv_obj_t *row = lv_obj_get_child(chapter_list, i);
+			if (!row)
+				break;
+			char clock[24];
+			double start;
+			const char *time = NULL;
+			if (!listing_parts && audiobook_chapter(i, NULL, 0, &start)) {
+				format_clock(start, clock, sizeof(clock));
+				time = clock;
+			}
+			row_state(row, i, time, playing);
+		}
+	}
+	listed_playing = playing;
+	listed_history = audiobook_history_serial();
+}
+
 void chapters_open(void) {
+	bool return_to_player = player_sheet_is_open();
 	player_sheet_close(false);
 	switch_screen(chapters_screen);
-	switcher_set_player_return(chapters_screen);
+	switcher_set_player_return(return_to_player ? chapters_screen : NULL);
 }
 
 void chapters_init(gui_config_t *cfg) {
-	lv_obj_add_style(chapters_screen, &theme_style_screen, 0);
+	lv_obj_add_style(chapters_screen, &sx_style_page, 0);
 	settingsrow_title(chapters_screen, cfg, "chapters");
 
 	int content_top = settingsrow_content_top(cfg);

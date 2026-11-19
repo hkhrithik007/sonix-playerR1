@@ -15,15 +15,15 @@
 #include "src/system/audio/audio.h"
 #include "src/system/audio/eq.h"
 #include "src/system/core/config.h"
+#include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 #include "src/system/decode/aacdec.h"
 #include "src/system/net/hls.h"
 #include "src/system/net/http.h"
-#include "src/system/core/lang.h"
 #include "src/system/net/tls.h"
+#include "src/system/playback/playhistory.h"
 #include "src/system/streaming/onair.h"
 #include "src/system/streaming/radioflac.h"
-#include "src/system/playback/playhistory.h"
-#include "src/system/core/utils.h"
 
 // The MP3 frame decoder on its own -- no file, no seeking, no length. This is
 // minimp3's core, which dr_mp3 carries; the implementation is compiled once in
@@ -291,7 +291,7 @@ static int json_int(const char *obj, const char *obj_end, const char *key) {
 // pointed at the new one by editing a line beats a player that needs a new
 // build.
 static char *api_get(const char *path) {
-	const char *override = config_get("radio", "api_host", "");
+	const char *override = config_get_copy("radio", "api_host", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if (override && *override) {
 		char url[1400];
 		snprintf(url, sizeof(url), "http://%s%s", override, path);

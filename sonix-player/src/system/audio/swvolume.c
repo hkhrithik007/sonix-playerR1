@@ -4,7 +4,7 @@
 #include "src/system/audio/usbaudio.h"
 
 #include <math.h>
-#include <stdio.h>
+#include <pthread.h>
 #include <string.h>
 
 // SW/HDB, the one software curve the R3 Pro II's ot_devices.json defines, in
@@ -32,11 +32,9 @@ static const int SW_HDB[101] = {
 // and an unnecessary one to call per volume change: there are 101 answers and
 // they never change.
 static int64_t coefficient[101];
-static bool table_ready;
+static pthread_once_t table_once = PTHREAD_ONCE_INIT;
 
-// The index in force. A plain int, written by whoever moves the volume and read
-// by the playback thread; a word-sized load and store, so the worst a reader
-// can see is the level from a moment ago.
+// One atomic snapshot per block; changing the level never splits a block.
 static int sw_index = 100;
 
 static int clamp_index(int percent) {
@@ -59,9 +57,6 @@ static int64_t stock_q31(int effective_tenths) {
 }
 
 static void build_table(void) {
-	if (table_ready) {
-		return;
-	}
 	for (int i = 0; i <= 100; i++) {
 		coefficient[i] = stock_q31(SW_HDB[i]);
 	}
@@ -70,18 +65,17 @@ static void build_table(void) {
 	// out as a zeroed buffer; -150 dB leaves a coefficient of 67, which is a
 	// signal, and the one place a volume control must be exact is the bottom.
 	coefficient[0] = 0;
-	table_ready = true;
 }
 
 void swvolume_set_index(int percent) {
-	build_table();
-	sw_index = clamp_index(percent);
+	pthread_once(&table_once, build_table);
+	__atomic_store_n(&sw_index, clamp_index(percent), __ATOMIC_RELAXED);
 }
 
 int swvolume_millibel(int percent) { return SW_HDB[clamp_index(percent)]; }
 
 int64_t swvolume_coefficient(int percent) {
-	build_table();
+	pthread_once(&table_once, build_table);
 	return coefficient[clamp_index(percent)];
 }
 
@@ -101,24 +95,21 @@ int64_t swvolume_coefficient(int percent) {
 // Bluetooth is asked first and separately: usbaudio_poll() gives up as soon as
 // Bluetooth is playing, so a USB card that was in use keeps saying so while the
 // sound is going over the air.
-// The gain usbaudio.c asked for, as a Q31 coefficient; 0 is silence. Written
-// whole by the thread that moves the volume and read by the playback thread,
-// the same word-sized handoff as sw_index.
-static volatile int64_t usb_gain_q31 = 2147483648LL;
-static volatile bool usb_gain_set;
+// Attenuation, unity included, fits in an unsigned 32-bit word on MIPS.
+// Keep "unset" in that same atomic word instead of publishing a separate flag.
+#define USB_GAIN_UNSET UINT32_MAX
+#define Q31_UNITY UINT32_C(2147483648)
+static uint32_t usb_gain_q31 = USB_GAIN_UNSET;
 
 void swvolume_set_usb_gain(long db100, bool mute) {
 	if (db100 > 0) {
 		db100 = 0;
 	}
-	usb_gain_q31 = mute ? 0 : (int64_t)(pow(10.0, (double)db100 / 2000.0) * 2147483648.0);
-	usb_gain_set = true;
+	uint32_t gain = mute ? 0 : (uint32_t)(pow(10.0, (double)db100 / 2000.0) * 2147483648.0);
+	__atomic_store_n(&usb_gain_q31, gain, __ATOMIC_RELAXED);
 }
 
-void swvolume_clear_usb_gain(void) {
-	usb_gain_set = false;
-	usb_gain_q31 = 2147483648LL;
-}
+void swvolume_clear_usb_gain(void) { __atomic_store_n(&usb_gain_q31, USB_GAIN_UNSET, __ATOMIC_RELAXED); }
 
 bool swvolume_active(void) {
 	if (audio_output_is_bluetooth()) {
@@ -127,8 +118,9 @@ bool swvolume_active(void) {
 	if (!usbaudio_active()) {
 		return false;
 	}
-	if (usb_gain_set) {
-		return usb_gain_q31 < 2147483648LL;
+	uint32_t gain = __atomic_load_n(&usb_gain_q31, __ATOMIC_RELAXED);
+	if (gain != USB_GAIN_UNSET) {
+		return gain < Q31_UNITY;
 	}
 	return !usbaudio_has_volume_control();
 }
@@ -143,12 +135,13 @@ typedef enum {
 
 static sw_action_t gain_now(int64_t *gain) {
 	*gain = 0;
-	if (!table_ready || !swvolume_active()) {
+	if (audio_output_is_bluetooth() || !usbaudio_active()) {
 		return SW_PASS;
 	}
 
-	if (usb_gain_set) {
-		int64_t q31 = usb_gain_q31;
+	uint32_t usb_gain = __atomic_load_n(&usb_gain_q31, __ATOMIC_RELAXED);
+	if (usb_gain != USB_GAIN_UNSET) {
+		int64_t q31 = usb_gain;
 		if (q31 == 0) {
 			return SW_MUTE;
 		}
@@ -158,8 +151,11 @@ static sw_action_t gain_now(int64_t *gain) {
 		*gain = q31;
 		return SW_SCALE;
 	}
+	if (usbaudio_has_volume_control())
+		return SW_PASS;
 
-	int idx = clamp_index(sw_index);
+	pthread_once(&table_once, build_table);
+	int idx = __atomic_load_n(&sw_index, __ATOMIC_RELAXED);
 	if (idx == 0) {
 		return SW_MUTE;
 	}
@@ -167,12 +163,6 @@ static sw_action_t gain_now(int64_t *gain) {
 	int64_t q31 = coefficient[idx];
 	if (q31 == 2147483648LL) {
 		return SW_PASS; // unity: index 100
-	}
-
-	static int said = -1;
-	if (said != idx) {
-		said = idx;
-		fprintf(stderr, "swvolume: index %d -> %.1f dB (Q31 %lld)\n", idx, SW_HDB[idx] / 10.0, (long long)q31);
 	}
 
 	*gain = q31;

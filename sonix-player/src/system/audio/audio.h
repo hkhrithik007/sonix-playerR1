@@ -115,13 +115,6 @@ unsigned audio_loop_turns(void);
 void audio_set_gapless(bool enabled);
 bool audio_get_gapless(void);
 
-// Bit-perfect: the samples reach the DAC as the decoder made them -- no
-// ReplayGain, equaliser, effect or fade -- from the next buffer on. Over
-// Bluetooth the chain still runs. The software volume of a USB device with no
-// control of its own still applies.
-void audio_set_bit_perfect(bool on);
-bool audio_get_bit_perfect(void);
-
 // Fade: ramp the last seconds of a track down to silence and the first seconds
 // of the next up from it. One decoder means the two cannot truly overlap, so
 // this is the ramp-out/ramp-in version of the effect. `seconds` is clamped to
@@ -155,6 +148,13 @@ void audio_get_progress(double *current_secs, double *total_secs);
 void audio_get_stream_info(int *sample_rate, int *channels);
 int audio_get_stream_bits(void); // source bit depth (16/24/32); 0 while unknown
 
+// The rate the output device was opened at for the track playing: the track's
+// own, or what the player made of it on the way -- halved for a link that
+// does not carry it, or resampled 44.1 -> 48 kHz for the headphones (the
+// "resampled to ... here" line in the log). 0 while nothing is open. A rate
+// that differs from the Bluetooth link's after this is converted by alsa.
+int audio_get_device_rate(void);
+
 // What is inside the file currently playing, for the format line in the player
 // and for the details page. See decode.h: a lossy format has no bit depth of
 // its own and is described by bitrate instead.
@@ -175,6 +175,10 @@ int audio_get_dsd_multiple(void);
 
 void audio_seek(double seconds);
 
+// Unfloored engine progress, never the UI scrub preview. False while a play
+// or seek has not produced its first PCM block; serial changes on either.
+bool audio_get_listening_progress(double *current, double *total, unsigned *serial);
+
 // Playback speed. 1.0 is normal; anything else goes through a time stretcher,
 // so the pitch does not move -- see speed.h. Only the 16-bit path honours it,
 // which is every audiobook and every lossy track; a hi-res FLAC ignores it.
@@ -192,6 +196,17 @@ double audio_get_speed(void);
 // playback thread is not something worth doing to save two seconds.
 void audio_set_output_device(const char *pcm);
 void audio_get_output_device(char *out, size_t out_size);
+
+typedef struct {
+	unsigned rate; // negotiated PCM Hz
+	unsigned bits; // ALSA significant bits, or PCM format width if unavailable
+	unsigned channels;
+	bool dop; // DSD over PCM carrier, not PCM audio
+} audio_output_format_t;
+
+// Cached at a successful ALSA open; no device query or file IO on the UI path.
+// False when no matching current PCM is open or its format is unavailable.
+bool audio_get_output_format(audio_output_format_t *out);
 
 // Whether the stream is going out over Bluetooth. Asked outside this file by
 // the software volume, which stands down there: on A2DP the level belongs to

@@ -1,5 +1,11 @@
 #include "lyricsearch.h"
+#include "src/gui/shell/artview.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_tokens.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,14 +15,15 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_card.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/system/core/lang.h"
 
 lv_obj_t *lyricsearch_screen;
 
-#define ROW_HEIGHT 92
-#define ROW_RADIUS 12
 #define APPLY_W 230
 #define APPLY_H 64
 
@@ -30,6 +37,49 @@ static char file_path[1024];
 static lrclib_record_t *records;
 static int record_count;
 static int previewing = -1; // the record whose words are up, -1 on the list
+static unsigned generation;
+static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+	char path[1024];
+	char *text;
+	unsigned generation;
+	bool ok;
+} save_job_t;
+static save_job_t *save_done;
+static bool saving;
+
+static void *save_worker(void *arg) {
+	save_job_t *job = arg;
+	job->ok = lrclib_save(job->path, job->text);
+	free(job->text);
+	job->text = NULL;
+	pthread_mutex_lock(&save_lock);
+	save_done = job;
+	pthread_mutex_unlock(&save_lock);
+	return NULL;
+}
+
+static void save_poll(lv_timer_t *timer) {
+	pthread_mutex_lock(&save_lock);
+	save_job_t *job = save_done;
+	save_done = NULL;
+	pthread_mutex_unlock(&save_lock);
+	if (!job) {
+		return;
+	}
+	saving = false;
+	lv_timer_delete(timer);
+	if (!job->ok) {
+		toast_error("lyrics_not_saved");
+	} else {
+		if (job->generation == generation && lv_screen_active() == lyricsearch_screen) {
+			back_btn_cb(NULL);
+		}
+		player_lyrics_reload(job->path);
+		toast_success("lyrics_downloaded");
+	}
+	free(job);
+}
 
 static void format_length(int seconds, char *out, size_t size) {
 	if (seconds <= 0) {
@@ -124,110 +174,57 @@ static bool back_guard(void) {
 
 static bool back_peek(void) { return previewing >= 0; }
 
-static void row_clicked_cb(lv_event_t *e) {
-	if (switcher_back_drag_active()) {
-		return;
-	}
-	show_preview((int)(intptr_t)lv_event_get_user_data(e));
+static void result_tap(lv_obj_t *row, void *user) {
+	(void)row;
+	if (!switcher_back_drag_active())
+		show_preview((int)(intptr_t)user);
 }
 
 static void apply_cb(lv_event_t *e) {
 	(void)e;
-	if (switcher_back_drag_active() || previewing < 0) {
+	if (switcher_back_drag_active() || previewing < 0 || saving) {
 		return;
 	}
-	if (!lrclib_save(file_path, records[previewing].text)) {
+	save_job_t *job = calloc(1, sizeof(*job));
+	if (!job) {
 		toast_error("lyrics_not_saved");
 		return;
 	}
-	// The path outlives the page, which lets go of everything once it is left.
-	char path[sizeof(file_path)];
-	snprintf(path, sizeof(path), "%s", file_path);
-	show_list();
-	back_btn_cb(NULL); // back into the player
-	player_lyrics_reload(path);
-	toast_success("lyrics_downloaded");
+	job->text = strdup(records[previewing].text);
+	job->generation = generation;
+	snprintf(job->path, sizeof(job->path), "%s", file_path);
+	lv_timer_t *timer = job->text ? lv_timer_create(save_poll, 100, NULL) : NULL;
+	pthread_t thread;
+	if (!timer || pthread_create(&thread, NULL, save_worker, job) != 0) {
+		if (timer) {
+			lv_timer_delete(timer);
+		}
+		free(job->text);
+		free(job);
+		toast_error("lyrics_not_saved");
+		return;
+	}
+	saving = true;
+	pthread_detach(thread);
 }
 
 static void add_row(int index) {
-	const lrclib_record_t *r = &records[index];
-
-	lv_obj_t *row = lv_btn_create(list);
-	lv_obj_set_size(row, lv_pct(100), ROW_HEIGHT);
-	lv_obj_add_style(row, &theme_style_card, 0);
-	lv_obj_add_style(row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(row, ROW_RADIUS, 0);
-	lv_obj_set_style_border_width(row, 0, 0);
-	lv_obj_set_style_shadow_width(row, 0, 0);
-	lv_obj_set_style_pad_hor(row, 16, 0);
-	lv_obj_set_style_pad_ver(row, 10, 0);
-	lv_obj_set_style_pad_column(row, 12, 0);
-	lv_obj_set_scrollable(row, false);
-	lv_obj_set_event_bubble(row, true);
-	lv_obj_add_event_cb(row, row_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)index);
-	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-	// Title over artist and album.
-	lv_obj_t *names = lv_obj_create(row);
-	lv_obj_remove_style_all(names);
-	lv_obj_set_height(names, LV_SIZE_CONTENT);
-	lv_obj_set_flex_grow(names, 1);
-	lv_obj_set_flex_flow(names, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_style_pad_row(names, 4, 0);
-	lv_obj_set_scrollable(names, false);
-	lv_obj_set_event_bubble(names, true);
-
-	lv_obj_t *track = lv_label_create(names);
-	lv_label_set_text(track, r->track[0] ? r->track : "-");
-	lv_label_set_long_mode(track, LV_LABEL_LONG_DOT);
-	lv_obj_set_width(track, lv_pct(100));
-	lv_obj_set_height(track, lv_font_get_line_height(&font_ui_24));
-	lv_obj_add_style(track, &theme_style_text, 0);
-	lv_obj_set_style_text_font(track, &font_ui_24, 0);
-
-	char who[340];
-	if (r->album[0]) {
-		snprintf(who, sizeof(who), "%s - %s", r->artist, r->album);
-	} else {
-		snprintf(who, sizeof(who), "%s", r->artist);
-	}
-	lv_obj_t *sub = lv_label_create(names);
-	lv_label_set_text(sub, who);
-	lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
-	lv_obj_set_width(sub, lv_pct(100));
-	lv_obj_set_height(sub, lv_font_get_line_height(&font_ui_20));
-	lv_obj_add_style(sub, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(sub, &font_ui_20, 0);
-
-	// Length over kind, on the right.
-	lv_obj_t *facts = lv_obj_create(row);
-	lv_obj_remove_style_all(facts);
-	lv_obj_set_size(facts, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-	lv_obj_set_flex_flow(facts, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(facts, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-	lv_obj_set_style_pad_row(facts, 4, 0);
-	lv_obj_set_scrollable(facts, false);
-	lv_obj_set_event_bubble(facts, true);
-
-	char length[16];
-	format_length(r->duration, length, sizeof(length));
-	lv_obj_t *len_label = lv_label_create(facts);
-	lv_label_set_text(len_label, length);
-	lv_obj_add_style(len_label, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(len_label, &font_ui_20, 0);
-
-	lv_obj_t *kind = lv_label_create(facts);
-	lv_label_set_text(kind, tr(r->synced ? "lyrics_synced" : "lyrics_plain"));
-	lv_obj_set_style_text_font(kind, &font_ui_20, 0);
-	if (r->synced) {
-		lv_obj_set_style_text_color(kind, theme()->accent, 0);
-	} else {
-		lv_obj_add_style(kind, &theme_style_text_dim, 0);
-	}
+	const lrclib_record_t *record = &records[index];
+	const sx_row_handlers_t handlers = {.on_tap = result_tap};
+	lv_obj_t *row = sx_row_create(list, &handlers, false);
+	lv_obj_set_width(row, lv_pct(100));
+	sx_row_set_user(row, (void *)(intptr_t)index);
+	sx_row_set_title(row, record->track[0] ? record->track : "-");
+	char who[512], length[16];
+	snprintf(who, sizeof(who), "%s%s%s", record->artist, record->album[0] ? " - " : "", record->album);
+	format_length(record->duration, length, sizeof(length));
+	sx_row_set_subtitle(row, who, tr(record->synced ? "lyrics_synced" : "lyrics_plain"), length);
+	sx_row_set_glyph(row, &icon_lyrics_search, sx_placeholder_name(record->track));
+	sx_row_set_content(row, sx_palette_hue_of_name(record->track), false, false, 0);
 }
 
 void lyricsearch_open(const char *path, lrclib_record_t *records_in, int count) {
+	gui_page_ensure(lyricsearch_screen);
 	lrclib_free(records, record_count);
 	records = records_in;
 	record_count = count;
@@ -249,6 +246,7 @@ void lyricsearch_open(const char *path, lrclib_record_t *records_in, int count) 
 // but nothing needs them any more.
 static void unloaded_cb(lv_event_t *e) {
 	(void)e;
+	generation++;
 	show_list();
 	lv_obj_clean(list);
 	lrclib_free(records, record_count);
@@ -256,7 +254,8 @@ static void unloaded_cb(lv_event_t *e) {
 	record_count = 0;
 }
 
-void lyricsearch_init(gui_config_t *cfg) {
+static void build_page(gui_config_t *cfg) {
+	sx_mini_hide_on_screen(lyricsearch_screen);
 	lv_obj_add_style(lyricsearch_screen, &theme_style_screen, 0);
 	title_label = settingsrow_title(lyricsearch_screen, cfg, "lyrics_results");
 	settingsrow_title_corner_slots(title_label, cfg, 0);
@@ -273,7 +272,7 @@ void lyricsearch_init(gui_config_t *cfg) {
 	lv_obj_set_style_pad_hor(list, cfg->padding, 0);
 	lv_obj_set_style_pad_top(list, 0, 0);
 	lv_obj_set_style_pad_bottom(list, cfg->padding, 0);
-	lv_obj_set_style_pad_gap(list, 8, 0);
+	lv_obj_set_style_pad_gap(list, SX_ROW_GAP, 0);
 	lv_obj_set_scroll_dir(list, LV_DIR_VER);
 	lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_event_bubble(list, true);
@@ -322,7 +321,8 @@ void lyricsearch_init(gui_config_t *cfg) {
 	lv_obj_t *apply_label = lv_label_create(apply);
 	lv_label_set_text(apply_label, tr("lyrics_apply"));
 	lv_obj_set_style_text_font(apply_label, &font_ui_24, 0);
-	lv_obj_set_style_text_color(apply_label, lv_color_white(), 0);
+	lv_obj_add_style(apply_label, &sx_style_accent, 0);
+	lv_obj_set_style_bg_opa(apply_label, LV_OPA_TRANSP, 0);
 	lv_obj_center(apply_label);
 
 	show_list();
@@ -330,4 +330,9 @@ void lyricsearch_init(gui_config_t *cfg) {
 	switcher_set_back_guard(lyricsearch_screen, back_guard);
 	switcher_set_back_guard_peek(lyricsearch_screen, back_peek);
 	lv_obj_add_event_cb(lyricsearch_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+}
+
+void lyricsearch_init(gui_config_t *cfg) {
+	(void)cfg;
+	gui_page_defer(lyricsearch_screen, build_page);
 }

@@ -1,5 +1,8 @@
 #include "lrclib.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +10,7 @@
 #include <unistd.h>
 
 #include "src/system/core/json.h"
+#include "src/system/device/system.h"
 #include "src/system/net/http.h"
 
 #ifndef LRCLIB_API
@@ -239,12 +243,53 @@ static bool lrc_path_for(const char *path, char *out, size_t size) {
 // half file for lyrics_load() to find.
 bool lrclib_save(const char *path, const char *text) {
 	char target[1100], temp[1110];
-	if (!path || !text || !lrc_path_for(path, target, sizeof(target))) {
+	char root[1024], canonical_root[PATH_MAX], resolved[PATH_MAX];
+	if (!path || !text || !realpath(path, resolved)) {
 		return false;
 	}
-	snprintf(temp, sizeof(temp), "%s.part", target);
-	FILE *f = fopen(temp, "wb");
+	int pin = storage_pin_card(root, sizeof(root));
+	if (pin < 0) {
+		return false;
+	}
+	if (!realpath(root, canonical_root)) {
+		close(pin);
+		return false;
+	}
+	size_t root_len = strlen(canonical_root);
+	if (!storage_sd_writable() || strncmp(resolved, canonical_root, root_len) != 0 || resolved[root_len] != '/' || !lrc_path_for(resolved, target, sizeof(target))) {
+		close(pin);
+		return false;
+	}
+	char *slash = strrchr(target, '/');
+	if (!slash) {
+		close(pin);
+		return false;
+	}
+	*slash = '\0';
+	const char *name = slash + 1;
+	int directory = openat(pin, target + root_len + 1, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	// A file directly in the card root uses the pinned root itself.
+	if (strlen(target) == root_len)
+		directory = dup(pin);
+	if (directory < 0) {
+		close(pin);
+		return false;
+	}
+	int fd = -1;
+	for (int attempt = 0; attempt < 16 && fd < 0; attempt++) {
+		snprintf(temp, sizeof(temp), ".%s.%ld.%d.part", name, (long)getpid(), attempt);
+		fd = openat(directory, temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (fd < 0 && errno != EEXIST)
+			break;
+	}
+	FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
 	if (!f) {
+		if (fd >= 0) {
+			close(fd);
+			unlinkat(directory, temp, 0);
+		}
+		close(directory);
+		close(pin);
 		return false;
 	}
 	size_t len = strlen(text);
@@ -255,11 +300,17 @@ bool lrclib_save(const char *path, const char *text) {
 	ok = fflush(f) == 0 && ok;
 	ok = fsync(fileno(f)) == 0 && ok;
 	ok = fclose(f) == 0 && ok;
-	if (!ok || rename(temp, target) != 0) {
-		unlink(temp);
+	if (!ok || renameat(directory, temp, directory, name) != 0) {
+		unlinkat(directory, temp, 0);
+		close(directory);
+		close(pin);
 		fprintf(stderr, "lrclib: could not write %s\n", target);
 		return false;
 	}
+	ok = fsync(directory) == 0;
+	if (close(directory) != 0)
+		ok = false;
+	close(pin);
 	fprintf(stderr, "lrclib: saved %s (%zu bytes)\n", target, len);
-	return true;
+	return ok;
 }

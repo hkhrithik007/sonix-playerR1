@@ -48,7 +48,7 @@ struct radioflac {
 
 	int rate, channels, bits;
 
-	char title[256];
+	char title[260];
 	bool title_new;
 
 	// Ogg only from here on.

@@ -105,6 +105,9 @@ unsigned clock_network_sync_result(bool *running, bool *ok);
 // attempt has located the device at least once. The zone list and the daylight
 // saving switch are then the network's, not the user's.
 bool clock_zone_automatic(void);
+// Network zone discovery is explicitly enabled by the user, off by default.
+bool clock_zone_lookup_enabled(void);
+void clock_set_zone_lookup(bool on);
 
 // The located zone's IANA name ("Europe/Rome"), or "" while
 // clock_zone_automatic() is false.

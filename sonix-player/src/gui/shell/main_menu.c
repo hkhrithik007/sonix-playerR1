@@ -1,554 +1,526 @@
 #include "main_menu.h"
-
-#include <stdio.h>
-#include <string.h>
-
-#include "lvgl/lvgl.h"
-
-#include "src/gui/fonts/fonts.h"
+#include "bookresume.h"
+#include "icons.h"
+#include "morepage.h"
+#include "playbackplace.h"
+#include "settingsrow.h"
+#include "src/gui/library/audiobooks.h"
+#include "src/gui/library/browser.h"
+#include "src/gui/library/filespage.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/library/music.h"
 #include "src/gui/library/search.h"
+#include "src/gui/library/searchall.h"
+#include "src/gui/library/searchsource.h"
+#include "src/gui/library/shufflecard.h"
+#include "src/gui/nowplaying/coverflow.h"
 #include "src/gui/nowplaying/player.h"
-#include "src/gui/shell/gui.h"
-#include "src/gui/shell/icons.h"
-#include "src/gui/shell/morepage.h"
-#include "src/gui/shell/switcher.h"
-#include "src/gui/shell/theme.h"
+#include "src/gui/settings/hometiles.h"
 #include "src/gui/settings/settings.h"
 #include "src/gui/streaming/streaming.h"
-#include "src/gui/library/audiobooks.h"
+#include "src/gui/streaming/yandexpage.h"
+#include "switcher.h"
+#include "sx_sheet.h"
+#include "sx_styles.h"
+#include "toast.h"
+#include "touch.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#ifdef SONIX_ZVUK
+#include "src/gui/streaming/zvukpage.h"
+#endif
 #include "src/gui/wireless/wireless.h"
-#include "src/system/audio/audio.h"
+#include "src/system/bluetooth/bluetooth.h"
+#include "src/system/core/config.h"
 #include "src/system/core/lang.h"
-#include "src/system/playback/device_state.h"
-
-#define HOME_GAP 10
-#define HOME_TILE_HEIGHT 68
-#define HOME_NAV_HEIGHT 58
-#define HOME_PLAYER_HEIGHT 68
-#define HOME_PLAYER_BOTTOM 66
-#define HOME_SWIPE_PX 42
-#define HOME_PLAYER_REVEAL_MS 150
+#include "src/system/library/audiobookdb.h"
+#include "src/system/net/wifi.h"
+#include "src/system/streaming/yandex.h"
+#ifdef SONIX_ZVUK
+#include "src/system/streaming/zvuk.h"
+#endif
 
 lv_obj_t *main_menu_screen;
+static gui_config_t *page_cfg;
+static lv_obj_t *tile_grid;
+static home_item_t order[HOME_CUSTOM_SLOTS];
+static int order_n;
+static bool loaded;
+// UI-thread-only preference for this process; no configuration writes.
+static int last_search_scope = -1;
+static struct {
+	home_item_t source;
+	lv_obj_t *screen;
+	lv_obj_t *field;
+	lv_obj_t *title;
+} search_inputs[SEARCH_SOURCE_MAX + 2];
+static char shared_search_query[256];
+static int search_input_count;
+static const char *ids[] = {"music", "streaming", "networks", "audiobooks", "settings", "continue_book", "tidal", "qobuz", "radio", "podcasts", "subsonic", "yandex", "zvuk", "music_all", "music_albums", "music_artists", "music_album_artists", "music_genres", "music_years", "music_favourites", "music_most_played", "music_recent_added", "music_recent_played", "music_playlists", "music_browse", "search", "files", "yandex_wave", "yandex_liked", "spotify"};
+static const char *tags[] = {"music", "streaming", "wireless", "audiobooks", "settings", "home_resume_book", "tidal", "qobuz", "radio", "podcasts", "subsonic", "yandex", "zvuk", "music_all_tracks", "albums", "artists", "music_album_artists", "music_genres", "music_year", "favourites", "music_most_played", "music_recently_added", "music_recently_played", "playlists", "music_browse", "home_search", "file_explorer", "yandex_my_wave", "yandex_liked", "spotify"};
+static const lv_image_dsc_t *icons[] = {&icon_menu_music, &icon_menu_streaming, &icon_menu_wireless, &icon_menu_audiobooks, &icon_menu_settings, &icon_menu_audiobooks};
 
-static lv_obj_t *home_scroll;
-static lv_obj_t *mini_player;
-static lv_obj_t *mini_cover;
-static lv_obj_t *mini_title;
-static lv_obj_t *mini_artist;
-static lv_obj_t *mini_progress;
-static lv_obj_t *mini_play_icon;
-static lv_obj_t *mini_nav;
-static lv_obj_t *home_brand;
-static lv_point_t mini_press;
-static bool mini_swipe;
-static bool mini_seek_active;
-static double mini_seek_start;
-static double mini_seek_target;
-static double mini_seek_total;
-static audio_status_t mini_status = AUDIO_STATUS_STOPPED;
-static cover_image_t mini_cover_copy;
-static char mini_cover_key[1400];
-static bool mini_cover_ready;
-static bool mini_was_visible;
-static lv_obj_t *home_nav_icon;
-static lv_obj_t *home_nav_label;
-static bool home_visual_cache_valid;
-static lv_color_t home_accent_cache;
-static lv_color_t home_bg_cache;
+_Static_assert(sizeof(ids) / sizeof(ids[0]) == HOME_ITEM_COUNT, "Home IDs must match items");
+_Static_assert(sizeof(tags) / sizeof(tags[0]) == HOME_ITEM_COUNT, "Home tags must match items");
+_Static_assert(HOME_MUSIC_BROWSE - HOME_MUSIC_ALL + 1 == MUSIC_TILE_COUNT, "Music shortcuts must match tiles");
 
-static bool colors_equal(lv_color_t a, lv_color_t b) {
-	return a.red == b.red && a.green == b.green && a.blue == b.blue;
+static bool valid(home_item_t item) { return item >= 0 && item < HOME_ITEM_COUNT; }
+static bool contains(home_item_t item) {
+	for (int i = 0; i < order_n; i++)
+		if (order[i] == item)
+			return true;
+	return false;
 }
-
-// Carry the player's cover-derived accent onto the home screen as a soft
-// header wash and a fine mini-player outline/progress.
-static void home_visual_refresh(bool force) {
-	lv_color_t accent = player_cover_accent_color();
-	lv_color_t background = theme()->screen_bg;
-	if (!force && home_visual_cache_valid && colors_equal(accent, home_accent_cache) &&
-		colors_equal(background, home_bg_cache)) {
+static void defaults(void) {
+	order_n = HOME_CUSTOM_SLOTS;
+	for (int i = 0; i < order_n; i++)
+		order[i] = (home_item_t)i;
+}
+static void load(void) {
+	if (loaded)
+		return;
+	loaded = true;
+	const char *saved = config_get_copy("home", "tiles", NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
+	if (!saved) {
+		defaults();
 		return;
 	}
-	home_visual_cache_valid = true;
-	home_accent_cache = accent;
-	home_bg_cache = background;
-
-	lv_color_t wash = lv_color_mix(accent, background, theme()->dark ? 24 : 12);
-	lv_obj_set_style_bg_color(main_menu_screen, wash, 0);
-	lv_obj_set_style_bg_grad_color(main_menu_screen, background, 0);
-	lv_obj_set_style_bg_grad_dir(main_menu_screen, LV_GRAD_DIR_VER, 0);
-	lv_obj_set_style_bg_main_stop(main_menu_screen, 0, 0);
-	lv_obj_set_style_bg_grad_stop(main_menu_screen, 190, 0);
-
-	if (mini_player) {
-		lv_obj_set_style_border_color(mini_player, accent, 0);
-		lv_obj_set_style_bg_color(mini_progress, accent, LV_PART_INDICATOR);
-		lv_obj_set_style_image_recolor(mini_play_icon, accent, 0);
-		lv_obj_set_style_image_recolor_opa(mini_play_icon, LV_OPA_COVER, 0);
-	}
-}
-
-static void open_favourites(void) {
-	medialist_open(tr("favourites"), LIBRARY_LIST_FAVOURITES, LIBRARY_FILTER_NONE, NULL);
-}
-
-static void quick_action_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-	void (*action)(void) = (void (*)(void))lv_event_get_user_data(e);
-	action();
-}
-
-static void nav_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-	lv_obj_t *target = lv_event_get_user_data(e);
-	if (target != lv_screen_active()) {
-		switch_screen(target);
-	}
-}
-
-static void search_nav_cb(lv_event_t *e) {
-	(void)e;
-	if (!player_sheet_drag_active() && !switcher_back_drag_active()) {
-		search_open();
-	}
-}
-
-static void add_shortcut(lv_obj_t *grid, gui_config_t *cfg, const char *label, const lv_image_dsc_t *icon,
-						 lv_obj_t *target, void (*action)(void)) {
-	lv_obj_t *tile = lv_btn_create(grid);
-	int width = (cfg->screen_width - 2 * cfg->padding - HOME_GAP) / 2;
-	lv_obj_set_size(tile, width, HOME_TILE_HEIGHT);
-	lv_obj_add_style(tile, &theme_style_card, 0);
-	lv_obj_add_style(tile, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(tile, 12, 0);
-	lv_obj_set_style_border_width(tile, 0, 0);
-	lv_obj_set_style_shadow_width(tile, 0, 0);
-	lv_obj_set_style_pad_hor(tile, 10, 0);
-	lv_obj_set_style_pad_column(tile, 10, 0);
-	lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_event_bubble(tile, true);
-
-	lv_obj_t *image = lv_image_create(tile);
-	lv_image_set_src(image, icon);
-	lv_obj_set_size(image, 42, 42);
-	lv_image_set_inner_align(image, LV_IMAGE_ALIGN_CENTER);
-
-	lv_obj_t *text = lv_label_create(tile);
-	lv_label_set_text(text, tr(label));
-	lv_obj_set_width(text, width - 78);
-	lv_label_set_long_mode(text, LV_LABEL_LONG_DOT);
-	lv_obj_add_style(text, &theme_style_text, 0);
-	lv_obj_set_style_text_font(text, &font_ui_20_bold, 0);
-
-	if (target) {
-		lv_obj_add_event_cb(tile, switch_screen_cb, LV_EVENT_CLICKED, target);
-	} else {
-		lv_obj_add_event_cb(tile, quick_action_cb, LV_EVENT_CLICKED, (void *)action);
-	}
-}
-
-static void mini_play_cb(lv_event_t *e) {
-	lv_event_stop_bubbling(e);
-	if (!player_sheet_drag_active() && !switcher_back_drag_active()) {
-		player_key_play_pause();
-	}
-}
-
-static void mini_open_cb(lv_event_t *e) {
-	(void)e;
-	if (!mini_swipe && !player_sheet_drag_active() && !switcher_back_drag_active()) {
-		player_sheet_open(true);
-	}
-	mini_swipe = false;
-}
-
-static void mini_gesture_cb(lv_event_t *e) {
-	lv_event_code_t code = lv_event_get_code(e);
-	lv_indev_t *indev = lv_indev_active();
-	if (code == LV_EVENT_LONG_PRESSED) {
-		device_state_t state;
-		device_state_get(&state);
-		if (state.progress_total_secs > 0.0 && state.current_file[0]) {
-			mini_seek_active = true;
-			mini_swipe = true;
-			mini_seek_start = state.progress_current_secs;
-			mini_seek_target = mini_seek_start;
-			mini_seek_total = state.progress_total_secs;
+	order_n = 0;
+	while (*saved && order_n < HOME_CUSTOM_SLOTS) {
+		const char *end = strchr(saved, ',');
+		size_t length = end ? (size_t)(end - saved) : strlen(saved);
+		for (int i = 0; i < HOME_ITEM_COUNT; i++) {
+			if (strlen(ids[i]) == length && !strncmp(saved, ids[i], length) && !contains((home_item_t)i) && main_menu_available((home_item_t)i))
+				order[order_n++] = (home_item_t)i;
 		}
-		return;
+		if (!end)
+			break;
+		saved = end + 1;
 	}
-	if (!indev) {
-		return;
+}
+int main_menu_count(void) {
+	load();
+	return order_n;
+}
+home_item_t main_menu_at(int pos) {
+	load();
+	return pos >= 0 && pos < order_n ? order[pos] : HOME_ITEM_COUNT;
+}
+bool main_menu_contains(home_item_t item) {
+	load();
+	return contains(item);
+}
+bool main_menu_available(home_item_t item) {
+	if (item == HOME_YANDEX_WAVE || item == HOME_YANDEX_LIKED)
+		return streaming_home_entry("yandex", NULL);
+	return valid(item) && (item <= HOME_CONTINUE_BOOK || item >= HOME_MUSIC_ALL || streaming_home_entry(ids[item], NULL));
+}
+const char *main_menu_tag(home_item_t item) { return valid(item) ? tags[item] : "more"; }
+const lv_image_dsc_t *main_menu_icon(home_item_t item) {
+	if (item == HOME_YANDEX_WAVE)
+		return &icon_menu_tidal;
+	if (item == HOME_YANDEX_LIKED)
+		return &icon_menu_favourites;
+	grid_entry_t entry;
+	if (item >= HOME_MUSIC_ALL && item <= HOME_MUSIC_BROWSE && music_home_entry((music_tile_t)(item - HOME_MUSIC_ALL), &entry))
+		return entry.icon;
+	if (item == HOME_SEARCH)
+		return &icon_search;
+	if (item == HOME_FILES)
+		return &icon_menu_file_explorer;
+	if (((item > HOME_CONTINUE_BOOK && item <= HOME_ZVUK) || item == HOME_SPOTIFY) && streaming_home_entry(ids[item], &entry))
+		return entry.icon;
+	return item >= 0 && item <= HOME_CONTINUE_BOOK ? icons[item] : &icon_menu_more;
+}
+
+static void music_description(char *text, size_t size) {
+	if (!gui_card_available())
+		snprintf(text, size, "%s", tr("home_card_unavailable"));
+	else {
+		shufflecard_tracks_description(text, size);
+		char place[256] = "";
+		if (!switcher_browse_description("music", place, sizeof(place)))
+			playbackplace_description("music", place, sizeof(place));
+		// This names the tile's destination, not the currently playing source.
+		if (place[0])
+			snprintf(text, size, tr("home_return_to_place"), place);
 	}
-	if (code == LV_EVENT_PRESSED) {
-		lv_indev_get_point(indev, &mini_press);
-		mini_swipe = false;
-		mini_seek_active = false;
+}
+
+static void open_music_place(void) {
+	if (switcher_browse_open("music"))
 		return;
+	// Keep the ordinary Music section one visible Back away from its source.
+	switch_screen(music_screen);
+	if (!browser_open_playback_place())
+		medialist_open_playback_place();
+}
+static void books_description(char *text, size_t size) {
+	if (!gui_card_available())
+		snprintf(text, size, "%s", tr("home_card_unavailable"));
+	else if (audiobookdb_count() > 0)
+		snprintf(text, size, tr("home_books_n"), audiobookdb_count());
+}
+static int drawn_network_state = -1;
+static unsigned drawn_place_revision;
+static int network_state(void) {
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	return wifi.state == WIFI_STATE_CONNECTED ? 1 : bluetooth_connected_device(NULL) ? 2 : 0;
+}
+static void network_description(char *text, size_t size) {
+	static const char *const tags[] = {"home_no_connections", "home_wifi_connected", "home_bt_connected"};
+	drawn_network_state = network_state();
+	snprintf(text, size, "%s", tr(tags[drawn_network_state]));
+}
+// Called by the existing standby-paused radio poll; no work for hidden grids.
+void main_menu_poll_network(void) {
+	lv_obj_t *screen = lv_screen_active();
+	if (!screen || (screen != main_menu_screen && screen != morepage_screen))
+		return;
+	int current = network_state();
+	unsigned place_revision = playbackplace_revision();
+	if (current == drawn_network_state && place_revision == drawn_place_revision)
+		return;
+	// Update even if this particular grid does not contain the network tile.
+	drawn_network_state = current;
+	drawn_place_revision = place_revision;
+	lv_obj_send_event(screen, LV_EVENT_REFRESH, NULL);
+}
+static void yandex_description(char *text, size_t size) { snprintf(text, size, "%s", tr("yandex")); }
+bool main_menu_get_entry(home_item_t item, grid_entry_t *out) {
+	if (!valid(item) || !out)
+		return false;
+	if (item >= HOME_MUSIC_ALL && item <= HOME_MUSIC_BROWSE)
+		return music_home_entry((music_tile_t)(item - HOME_MUSIC_ALL), out);
+	if (item == HOME_SEARCH) {
+		*out = (grid_entry_t){"home_search", &icon_search, NULL, main_menu_open_search};
+		return true;
 	}
-	if (code == LV_EVENT_PRESSING) {
-		lv_point_t point;
-		lv_indev_get_point(indev, &point);
-		int dx = point.x - mini_press.x;
-		int dy = point.y - mini_press.y;
-		if (mini_seek_active) {
-			int width = lv_obj_get_width(mini_player);
-			mini_seek_target = mini_seek_start + (width > 0 ? (double)dx * mini_seek_total / width : 0.0);
-			if (mini_seek_target < 0.0) mini_seek_target = 0.0;
-			if (mini_seek_target > mini_seek_total) mini_seek_target = mini_seek_total;
-			int now = (int)mini_seek_target;
-			int end = (int)mini_seek_total;
-			char preview[48];
-			snprintf(preview, sizeof(preview), "%d:%02d / %d:%02d", now / 60, now % 60, end / 60, end % 60);
-			lv_label_set_text(mini_artist, preview);
-			lv_event_stop_bubbling(e);
+	if (item == HOME_FILES) {
+		*out = (grid_entry_t){"file_explorer", &icon_menu_file_explorer, NULL, filespage_open};
+		return true;
+	}
+	if (item == HOME_YANDEX_WAVE || item == HOME_YANDEX_LIKED) {
+		*out = (grid_entry_t){tags[item], main_menu_icon(item), NULL, item == HOME_YANDEX_WAVE ? yandexpage_wave_open : yandexpage_liked_open, yandex_description};
+		return true;
+	}
+	if (item > HOME_CONTINUE_BOOK)
+		return streaming_home_entry(ids[item], out);
+	*out = (grid_entry_t){tags[item], icons[item], NULL, NULL, NULL};
+	switch (item) {
+	case HOME_MUSIC:
+		out->action = open_music_place;
+		out->subtitle = music_description;
+		break;
+	case HOME_STREAMING:
+		out->target = &streaming_screen;
+		out->subtitle = streaming_description;
+		break;
+	case HOME_NETWORKS:
+		out->target = &wireless_screen;
+		out->subtitle = network_description;
+		break;
+	case HOME_AUDIOBOOKS:
+		out->target = &audiobooks_screen;
+		out->subtitle = books_description;
+		break;
+	case HOME_SETTINGS:
+		out->target = &settings_screen;
+		break;
+	case HOME_CONTINUE_BOOK:
+		out->action = bookresume_play;
+		out->subtitle = bookresume_description;
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+static void rebuild(void) {
+	load();
+	if (tile_grid) {
+		grid_entry_t entries[6] = {0};
+		for (int i = 0; i < order_n; i++)
+			main_menu_get_entry(order[i], &entries[i]);
+		entries[5] = (grid_entry_t){"more", &icon_menu_more, &morepage_screen};
+		gridpage_set_entries(tile_grid, page_cfg, entries, 6, 2, 3, false);
+		for (int i = 0; i < order_n; i++)
+			lv_obj_add_event_cb(lv_obj_get_child(tile_grid, i), main_menu_hold, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)order[i]);
+		lv_obj_add_event_cb(lv_obj_get_child(tile_grid, 5), main_menu_hold, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)HOME_ITEM_COUNT);
+	}
+	morepage_rebuild();
+}
+static void save(void) {
+	char value[128] = "";
+	size_t used = 0;
+	for (int i = 0; i < order_n; i++) {
+		int n = snprintf(value + used, sizeof(value) - used, "%s%s", i ? "," : "", ids[order[i]]);
+		if (n < 0 || (size_t)n >= sizeof(value) - used)
+			return;
+		used += (size_t)n;
+	}
+	config_set("home", "tiles", value);
+	config_save();
+	rebuild();
+}
+bool main_menu_move(home_item_t item, int pos) {
+	load();
+	if (!main_menu_available(item))
+		return false;
+	int old = -1;
+	for (int i = 0; i < order_n; i++)
+		if (order[i] == item)
+			old = i;
+	if (old < 0 && order_n == HOME_CUSTOM_SLOTS)
+		return false;
+	if (old >= 0) {
+		memmove(order + old, order + old + 1, (size_t)(order_n - old - 1) * sizeof(*order));
+		order_n--;
+	}
+	if (pos < 0)
+		pos = 0;
+	if (pos > order_n)
+		pos = order_n;
+	memmove(order + pos + 1, order + pos, (size_t)(order_n - pos) * sizeof(*order));
+	order[pos] = item;
+	order_n++;
+	save();
+	return true;
+}
+void main_menu_hide(home_item_t item) {
+	load();
+	for (int i = 0; i < order_n; i++)
+		if (order[i] == item) {
+			memmove(order + i, order + i + 1, (size_t)(order_n - i - 1) * sizeof(*order));
+			order_n--;
+			save();
 			return;
 		}
-		mini_swipe = LV_ABS(dx) > HOME_SWIPE_PX || dy < -HOME_SWIPE_PX;
-		if (mini_swipe) {
-			lv_event_stop_bubbling(e);
-		}
+}
+void main_menu_reset(void) {
+	loaded = true;
+	defaults();
+	save();
+}
+void main_menu_reload(void) {
+	loaded = false;
+	rebuild();
+}
+void main_menu_refresh(void) {
+	if (tile_grid)
+		lv_obj_send_event(main_menu_screen, LV_EVENT_REFRESH, NULL);
+	if (morepage_screen)
+		lv_obj_send_event(morepage_screen, LV_EVENT_REFRESH, NULL);
+}
+void main_menu_open_settings(void) {
+	gui_init_rest();
+	hometiles_open(page_cfg);
+}
+static void settings_action(void *unused) {
+	(void)unused;
+	main_menu_open_settings();
+}
+static void move_action(void *user) {
+	home_item_t item = (home_item_t)(intptr_t)user;
+	if (main_menu_contains(item))
+		main_menu_hide(item);
+	else if (!main_menu_move(item, main_menu_count()))
+		toast_error("home_full");
+}
+static void yandex_wave_action(void *unused) {
+	(void)unused;
+	yandexpage_wave_open();
+}
+static void yandex_liked_action(void *unused) {
+	(void)unused;
+	yandexpage_liked_open();
+}
+void main_menu_hold(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active() || coverflow_drag_active())
+		return;
+	lv_indev_t *input = lv_event_get_param(e);
+	if (!input)
+		input = lv_indev_active();
+	if (input)
+		lv_indev_wait_release(input);
+	home_item_t item = (home_item_t)(intptr_t)lv_event_get_user_data(e);
+	if (item == HOME_CONTINUE_BOOK) {
+		bookresume_menu();
 		return;
 	}
-	if (code != LV_EVENT_RELEASED) {
-		if (code == LV_EVENT_PRESS_LOST) {
-			mini_swipe = false;
-			mini_seek_active = false;
-		}
-		return;
+	sx_sheet_item_t items[4];
+	int n = 0;
+	if (item == HOME_YANDEX) {
+		items[n++] = (sx_sheet_item_t){.label = tr("yandex_my_wave"), .icon = &icon_menu_tidal, .action = yandex_wave_action};
+		items[n++] = (sx_sheet_item_t){.label = tr("yandex_liked"), .icon = &icon_menu_favourites, .action = yandex_liked_action};
 	}
-	lv_point_t point;
-	lv_indev_get_point(indev, &point);
-	int dx = point.x - mini_press.x;
-	int dy = point.y - mini_press.y;
-	if (mini_seek_active) {
-		device_state_seek(mini_seek_target);
-		mini_seek_active = false;
-		mini_swipe = true;
-	} else if (dy < -HOME_SWIPE_PX && LV_ABS(dy) > LV_ABS(dx)) {
-		mini_swipe = true;
-		player_sheet_open(true);
-	} else if (LV_ABS(dx) > HOME_SWIPE_PX && LV_ABS(dx) > LV_ABS(dy)) {
-		mini_swipe = true;
-		dx < 0 ? player_key_next() : player_key_prev();
-	}
-	lv_event_stop_bubbling(e);
+	if (valid(item))
+		items[n++] = (sx_sheet_item_t){.label = tr(main_menu_contains(item) ? (item <= HOME_CONTINUE_BOOK ? "home_to_more" : "hometiles_remove") : "home_to_main"), .icon = &icon_menu_more, .action = move_action, .user = (void *)(intptr_t)item};
+	items[n++] = (sx_sheet_item_t){.label = tr("home_settings"), .icon = &icon_menu_settings, .action = settings_action};
+	sx_sheet_menu(tr(main_menu_tag(item)), NULL, items, n);
 }
-
-static void mini_reveal_opa_cb(void *obj, int32_t value) {
-	lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
-}
-
-static void mini_reveal_y_cb(void *obj, int32_t value) {
-	lv_obj_set_style_translate_y((lv_obj_t *)obj, value, 0);
-}
-
-static void mini_reveal(void) {
-	lv_anim_delete(mini_player, mini_reveal_opa_cb);
-	lv_anim_delete(mini_player, mini_reveal_y_cb);
-	lv_obj_set_hidden(mini_player, false);
-	lv_obj_set_style_opa(mini_player, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_translate_y(mini_player, 8, 0);
-
-	lv_anim_t fade;
-	lv_anim_init(&fade);
-	lv_anim_set_var(&fade, mini_player);
-	lv_anim_set_exec_cb(&fade, mini_reveal_opa_cb);
-	lv_anim_set_values(&fade, LV_OPA_TRANSP, LV_OPA_COVER);
-	lv_anim_set_duration(&fade, HOME_PLAYER_REVEAL_MS);
-	lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
-	lv_anim_start(&fade);
-
-	lv_anim_t rise;
-	lv_anim_init(&rise);
-	lv_anim_set_var(&rise, mini_player);
-	lv_anim_set_exec_cb(&rise, mini_reveal_y_cb);
-	lv_anim_set_values(&rise, 8, 0);
-	lv_anim_set_duration(&rise, HOME_PLAYER_REVEAL_MS);
-	lv_anim_set_path_cb(&rise, lv_anim_path_ease_out);
-	lv_anim_start(&rise);
-}
-
-static void mini_player_update(lv_timer_t *timer) {
-	(void)timer;
-	device_state_t state;
-	device_state_get(&state);
-	bool loaded = state.current_file[0] || state.live;
-	bool visible = loaded && !player_sheet_is_open();
-	if (visible && !mini_was_visible) {
-		mini_reveal();
-	} else if (!visible) {
-		lv_anim_delete(mini_player, mini_reveal_opa_cb);
-		lv_anim_delete(mini_player, mini_reveal_y_cb);
-		lv_obj_set_style_opa(mini_player, LV_OPA_COVER, 0);
-		lv_obj_set_style_translate_y(mini_player, 0, 0);
-		lv_obj_set_hidden(mini_player, true);
-	}
-	mini_was_visible = visible;
-	if (!loaded) {
-		home_visual_refresh(false);
-		return;
-	}
-
-	const char *title = state.metadata.title;
-	if (!title[0] && state.current_file[0]) {
-		const char *base = strrchr(state.current_file, '/');
-		title = base ? base + 1 : state.current_file;
-	}
-	lv_label_set_text(mini_title, title[0] ? title : tr("quickpanel_no_track"));
-	lv_label_set_text(mini_artist, state.metadata.artist[0] ? state.metadata.artist : tr("music"));
-
-	char cover_key[sizeof(mini_cover_key)];
-	snprintf(cover_key, sizeof(cover_key), "%s\n%s\n%s\n%s", state.current_file, state.live_cover,
-			 state.metadata.title, state.metadata.artist);
-	if (strcmp(cover_key, mini_cover_key) != 0) {
-		lv_image_set_src(mini_cover, &icon_music_note);
-		cover_free(&mini_cover_copy);
-		snprintf(mini_cover_key, sizeof(mini_cover_key), "%s", cover_key);
-		mini_cover_ready = false;
-	}
-	if (!mini_cover_ready) {
-		uint64_t cover_id;
-		if (player_cover_copy(50, &mini_cover_copy, &cover_id)) {
-			(void)cover_id;
-			lv_image_set_src(mini_cover, &mini_cover_copy.dsc);
-			lv_obj_set_size(mini_cover, 50, 50);
-			lv_image_set_inner_align(mini_cover, LV_IMAGE_ALIGN_STRETCH);
-			mini_cover_ready = true;
-		}
-	}
-	if (state.status != mini_status) {
-		mini_status = state.status;
-		lv_image_set_src(mini_play_icon, mini_status == AUDIO_STATUS_PLAYING ? &icon_pause : &icon_play);
-	}
-	int percent = state.progress_total_secs > 0.0
-				  ? (int)(100.0 * state.progress_current_secs / state.progress_total_secs)
-				  : 0;
-	if (percent < 0) percent = 0;
-	if (percent > 100) percent = 100;
-	lv_bar_set_value(mini_progress, percent, LV_ANIM_OFF);
-	home_visual_refresh(false);
-}
-
-static void home_theme_refresh(void) {
-	if (mini_player) {
-		lv_obj_set_style_bg_color(mini_player, theme()->surface, 0);
-		lv_obj_set_style_bg_color(mini_nav, theme()->screen_bg, 0);
-		lv_obj_set_style_bg_color(mini_progress, theme()->text_secondary, LV_PART_MAIN);
-		home_visual_refresh(true);
-	}
-	if (home_brand) {
-		lv_obj_set_style_text_color(home_brand, theme()->accent, 0);
-	}
-	if (home_nav_icon) {
-		lv_obj_set_style_image_recolor(home_nav_icon, theme()->accent, 0);
-		lv_obj_set_style_image_recolor_opa(home_nav_icon, LV_OPA_COVER, 0);
-		lv_obj_set_style_text_color(home_nav_label, theme()->text_primary, 0);
-	}
-}
-
-static lv_obj_t *add_nav_item(lv_obj_t *bar, const char *label, const lv_image_dsc_t *icon, lv_obj_t *target) {
-	lv_obj_t *button = lv_btn_create(bar);
-	lv_obj_set_size(button, LV_PCT(33), HOME_NAV_HEIGHT);
-	lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_bg_opa(button, LV_OPA_10, LV_STATE_PRESSED);
-	lv_obj_set_style_border_width(button, 0, 0);
-	lv_obj_set_style_shadow_width(button, 0, 0);
-	lv_obj_set_style_pad_all(button, 2, 0);
-	lv_obj_set_flex_flow(button, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(button, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_add_event_cb(button, target ? nav_cb : search_nav_cb, LV_EVENT_CLICKED, target);
-	lv_obj_t *image = lv_image_create(button);
-	lv_image_set_src(image, icon);
-	lv_obj_add_style(image, &theme_style_icon, 0);
-	lv_obj_t *text = lv_label_create(button);
-	lv_label_set_text(text, tr(label));
-	lv_obj_add_style(text, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(text, &font_ui_14, 0);
-	if (target == main_menu_screen) {
-		home_nav_icon = image;
-		home_nav_label = text;
-	}
-	return button;
-}
-
-static void build_mini_player(gui_config_t *cfg) {
-	mini_player = lv_obj_create(main_menu_screen);
-	lv_obj_set_size(mini_player, cfg->screen_width - 16, HOME_PLAYER_HEIGHT);
-	lv_obj_align(mini_player, LV_ALIGN_BOTTOM_MID, 0, -HOME_PLAYER_BOTTOM);
-	lv_obj_set_style_bg_color(mini_player, theme()->surface, 0);
-	lv_obj_set_style_bg_opa(mini_player, LV_OPA_COVER, 0);
-	lv_obj_set_style_radius(mini_player, 14, 0);
-	lv_obj_set_style_border_width(mini_player, 1, 0);
-	lv_obj_set_style_border_opa(mini_player, LV_OPA_20, 0);
-	lv_obj_set_style_pad_all(mini_player, 8, 0);
-	lv_obj_set_style_pad_column(mini_player, 10, 0);
-	lv_obj_set_scrollable(mini_player, false);
-	lv_obj_set_clickable(mini_player, true);
-	lv_obj_set_flex_flow(mini_player, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(mini_player, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_add_event_cb(mini_player, mini_gesture_cb, LV_EVENT_PRESSED, NULL);
-	lv_obj_add_event_cb(mini_player, mini_gesture_cb, LV_EVENT_PRESSING, NULL);
-	lv_obj_add_event_cb(mini_player, mini_gesture_cb, LV_EVENT_LONG_PRESSED, NULL);
-	lv_obj_add_event_cb(mini_player, mini_gesture_cb, LV_EVENT_RELEASED, NULL);
-	lv_obj_add_event_cb(mini_player, mini_gesture_cb, LV_EVENT_PRESS_LOST, NULL);
-	lv_obj_add_event_cb(mini_player, mini_open_cb, LV_EVENT_CLICKED, NULL);
-
-	mini_cover = lv_image_create(mini_player);
-	lv_obj_set_size(mini_cover, 50, 50);
-	lv_image_set_src(mini_cover, &icon_music_note);
-	lv_obj_set_event_bubble(mini_cover, true);
-
-	lv_obj_t *labels = lv_obj_create(mini_player);
-	lv_obj_remove_style_all(labels);
-	// Let the flex row assign the space between the cover and play button.
-	// A content-sized width can otherwise grow to the full song title and push
-	// the play control off the card on long track names.
-	lv_obj_set_width(labels, 0);
-	lv_obj_set_height(labels, LV_PCT(100));
-	lv_obj_set_flex_grow(labels, 1);
-	lv_obj_set_flex_flow(labels, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(labels, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-	lv_obj_set_style_pad_row(labels, 2, 0);
-	lv_obj_set_scrollable(labels, false);
-	lv_obj_set_clickable(labels, false);
-	lv_obj_set_event_bubble(labels, true);
-	mini_title = lv_label_create(labels);
-	lv_obj_set_width(mini_title, LV_PCT(100));
-	// LV_LABEL_LONG_DOT wraps before truncating. Pin both labels to one line so
-	// a long title cannot shove the artist out of the mini-player.
-	lv_obj_set_height(mini_title, lv_font_get_line_height(&font_ui_20_bold));
-	lv_obj_set_event_bubble(mini_title, true);
-	lv_label_set_long_mode(mini_title, LV_LABEL_LONG_DOT);
-	lv_obj_add_style(mini_title, &theme_style_text, 0);
-	lv_obj_set_style_text_font(mini_title, &font_ui_20_bold, 0);
-	mini_artist = lv_label_create(labels);
-	lv_obj_set_width(mini_artist, LV_PCT(100));
-	lv_obj_set_height(mini_artist, lv_font_get_line_height(&font_ui_14));
-	lv_obj_set_event_bubble(mini_artist, true);
-	lv_label_set_long_mode(mini_artist, LV_LABEL_LONG_DOT);
-	lv_obj_add_style(mini_artist, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(mini_artist, &font_ui_14, 0);
-
-	lv_obj_t *play = lv_btn_create(mini_player);
-	lv_obj_set_size(play, 42, 48);
-	lv_obj_set_style_bg_opa(play, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_bg_color(play, theme()->accent, LV_STATE_PRESSED);
-	lv_obj_set_style_bg_opa(play, LV_OPA_20, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(play, LV_RADIUS_CIRCLE, 0);
-	lv_obj_set_style_border_width(play, 0, 0);
-	lv_obj_set_style_shadow_width(play, 0, 0);
-	lv_obj_set_style_pad_all(play, 0, 0);
-	lv_obj_set_event_bubble(play, false);
-	lv_obj_add_event_cb(play, mini_play_cb, LV_EVENT_CLICKED, NULL);
-	mini_play_icon = lv_image_create(play);
-	lv_image_set_src(mini_play_icon, &icon_play);
-	lv_obj_add_style(mini_play_icon, &theme_style_icon, 0);
-	lv_obj_center(mini_play_icon);
-
-	mini_progress = lv_bar_create(mini_player);
-	lv_obj_set_ignore_layout(mini_progress, true);
-	lv_obj_set_size(mini_progress, LV_PCT(100), 3);
-	lv_bar_set_range(mini_progress, 0, 100);
-	lv_obj_set_style_bg_color(mini_progress, theme()->text_secondary, LV_PART_MAIN);
-	lv_obj_set_style_bg_opa(mini_progress, LV_OPA_30, LV_PART_MAIN);
-	lv_obj_set_style_bg_color(mini_progress, theme()->accent, LV_PART_INDICATOR);
-	lv_obj_set_style_radius(mini_progress, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-	lv_obj_set_style_radius(mini_progress, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-	lv_obj_set_clickable(mini_progress, false);
-	lv_obj_set_event_bubble(mini_progress, true);
-	lv_obj_align(mini_progress, LV_ALIGN_BOTTOM_MID, 0, 0);
-	lv_obj_move_foreground(mini_progress);
-
-	mini_nav = lv_obj_create(main_menu_screen);
-	lv_obj_set_size(mini_nav, cfg->screen_width, HOME_NAV_HEIGHT);
-	lv_obj_align(mini_nav, LV_ALIGN_BOTTOM_MID, 0, 0);
-	lv_obj_set_style_bg_color(mini_nav, theme()->screen_bg, 0);
-	lv_obj_set_style_bg_opa(mini_nav, LV_OPA_COVER, 0);
-	lv_obj_set_style_border_width(mini_nav, 0, 0);
-	lv_obj_set_style_pad_all(mini_nav, 0, 0);
-	lv_obj_set_flex_flow(mini_nav, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(mini_nav, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_scrollable(mini_nav, false);
-	add_nav_item(mini_nav, "home", &icon_nav_home, main_menu_screen);
-	add_nav_item(mini_nav, "search_tab", &icon_search, NULL);
-	add_nav_item(mini_nav, "library_tab", &icon_nav_library, music_screen);
-
-	theme_register_refresh(home_theme_refresh);
-	home_theme_refresh();
-	lv_timer_create(mini_player_update, 500, NULL);
-	mini_player_update(NULL);
-}
-
 void main_menu_init(gui_config_t *cfg) {
-	lv_obj_add_style(main_menu_screen, &theme_style_screen, 0);
-	int top = cfg->top_bar_height + 4;
-	int height = cfg->screen_height - top - HOME_NAV_HEIGHT;
-	home_scroll = lv_obj_create(main_menu_screen);
-	lv_obj_set_size(home_scroll, cfg->screen_width, height);
-	lv_obj_align(home_scroll, LV_ALIGN_TOP_LEFT, 0, top);
-	lv_obj_set_style_bg_opa(home_scroll, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_border_width(home_scroll, 0, 0);
-	lv_obj_set_style_pad_hor(home_scroll, cfg->padding, 0);
-	lv_obj_set_style_pad_ver(home_scroll, 16, 0);
-	lv_obj_set_style_pad_bottom(home_scroll, HOME_PLAYER_HEIGHT + HOME_PLAYER_BOTTOM + 8, 0);
-	lv_obj_set_style_pad_row(home_scroll, 14, 0);
-	lv_obj_set_scroll_dir(home_scroll, LV_DIR_VER);
-	lv_obj_set_scrollbar_mode(home_scroll, LV_SCROLLBAR_MODE_OFF);
-	lv_obj_set_flex_flow(home_scroll, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(home_scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-
-	home_brand = lv_label_create(home_scroll);
-	lv_label_set_text(home_brand, "RAGE OS");
-	lv_obj_add_style(home_brand, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_color(home_brand, theme()->accent, 0);
-	lv_obj_set_style_text_font(home_brand, &font_ui_20_bold, 0);
-	lv_obj_t *greeting = lv_label_create(home_scroll);
-	lv_label_set_text(greeting, tr("home_greeting_evening"));
-	lv_obj_add_style(greeting, &theme_style_text, 0);
-	lv_obj_set_style_text_font(greeting, &font_ui_32, 0);
-
-	lv_obj_t *shortcuts = lv_obj_create(home_scroll);
-	lv_obj_remove_style_all(shortcuts);
-	lv_obj_set_width(shortcuts, LV_PCT(100));
-	lv_obj_set_height(shortcuts, LV_SIZE_CONTENT);
-	lv_obj_set_style_pad_row(shortcuts, HOME_GAP, 0);
-	lv_obj_set_style_pad_column(shortcuts, HOME_GAP, 0);
-	lv_obj_set_flex_flow(shortcuts, LV_FLEX_FLOW_ROW_WRAP);
-	lv_obj_set_flex_align(shortcuts, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-	add_shortcut(shortcuts, cfg, "favourites", &icon_menu_favourites, NULL, open_favourites);
-	add_shortcut(shortcuts, cfg, "music", &icon_menu_music, music_screen, NULL);
-	add_shortcut(shortcuts, cfg, "streaming", &icon_menu_streaming, streaming_screen, NULL);
-	add_shortcut(shortcuts, cfg, "audiobooks", &icon_menu_audiobooks, audiobooks_screen, NULL);
-	add_shortcut(shortcuts, cfg, "wireless", &icon_menu_wireless, wireless_screen, NULL);
-	add_shortcut(shortcuts, cfg, "more", &icon_menu_more, morepage_screen, NULL);
-
-	lv_obj_t *settings = lv_btn_create(home_scroll);
-	lv_obj_set_size(settings, LV_PCT(100), 52);
-	lv_obj_add_style(settings, &theme_style_card, 0);
-	lv_obj_add_style(settings, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(settings, 12, 0);
-	lv_obj_set_style_border_width(settings, 0, 0);
-	lv_obj_set_style_shadow_width(settings, 0, 0);
-	lv_obj_add_event_cb(settings, switch_screen_cb, LV_EVENT_CLICKED, settings_screen);
-	lv_obj_t *settings_icon = lv_image_create(settings);
-	lv_image_set_src(settings_icon, &icon_menu_settings);
-	lv_obj_align(settings_icon, LV_ALIGN_LEFT_MID, 12, 0);
-	lv_obj_t *settings_text = lv_label_create(settings);
-	lv_label_set_text(settings_text, tr("settings"));
-	lv_obj_add_style(settings_text, &theme_style_text, 0);
-	lv_obj_set_style_text_font(settings_text, &font_ui_20_bold, 0);
-	lv_obj_align(settings_text, LV_ALIGN_LEFT_MID, 48, 0);
-
-	player_sheet_attach_drag(home_scroll, true);
-	switcher_attach_back_gesture(home_scroll);
-	build_mini_player(cfg);
+	page_cfg = cfg;
+	tile_grid = gridpage_build(main_menu_screen, cfg, NULL, 0, 2, 3, false);
+	rebuild();
+	shufflecard_attach(main_menu_screen, cfg);
 }
+
+static void search_scope_register(lv_obj_t *screen, home_item_t source) {
+	for (int i = 0; i < search_input_count; i++) {
+		if (search_inputs[i].source == source) {
+			search_inputs[i].screen = screen;
+			return;
+		}
+	}
+	if (search_input_count < (int)(sizeof(search_inputs) / sizeof(search_inputs[0]))) {
+		search_inputs[search_input_count].source = source;
+		search_inputs[search_input_count++].screen = screen;
+	}
+}
+
+static lv_obj_t *search_scope_screen(home_item_t source) {
+	for (int i = 0; i < search_input_count; i++)
+		if (search_inputs[i].source == source)
+			return search_inputs[i].screen;
+	return NULL;
+}
+
+static bool search_scope_is_input(lv_obj_t *screen) {
+	for (int i = 0; i < search_input_count; i++)
+		if (search_inputs[i].screen == screen)
+			return true;
+	return false;
+}
+
+static void search_scope_action(void *user) {
+	home_item_t source = (home_item_t)(intptr_t)user;
+	const search_source_t *delegate = search_source_home(source);
+	if (source != HOME_SEARCH && source != HOME_MUSIC && (!delegate || !delegate->ready()))
+		return;
+	bool replace = search_scope_is_input(lv_screen_active());
+	last_search_scope = source;
+	if (source == HOME_MUSIC) {
+		lv_obj_t *target = search_scope_screen(source);
+		if (target && replace)
+			switch_screen_no_history(target);
+		else
+			search_open();
+	} else
+		searchall_open_source(page_cfg, source, replace);
+}
+static void search_scope_choose(void) {
+	gui_init_rest();
+	sx_sheet_item_t items[SEARCH_SOURCE_MAX + 2] = {{.label = tr("search_everywhere"), .icon = &icon_search, .action = search_scope_action, .user = (void *)(intptr_t)HOME_SEARCH}, {.label = tr("home_search_card"), .icon = &icon_menu_music, .action = search_scope_action, .user = (void *)(intptr_t)HOME_MUSIC}};
+	int n = 2;
+	for (int i = 0; i < search_source_count(); i++) {
+		const search_source_t *source = search_source_at(i);
+		if (source->ready())
+			items[n++] = (sx_sheet_item_t){.label = tr(source->name), .icon = main_menu_icon(source->home), .action = search_scope_action, .user = (void *)(intptr_t)source->home};
+	}
+	sx_sheet_menu(tr("home_search"), NULL, items, n);
+}
+
+void main_menu_open_search(void) {
+	gui_init_rest();
+	if (last_search_scope == HOME_SEARCH || last_search_scope == HOME_MUSIC || (search_source_home((home_item_t)last_search_scope) && search_source_home((home_item_t)last_search_scope)->ready())) {
+		search_scope_action((void *)(intptr_t)last_search_scope);
+		return;
+	}
+	search_scope_action((void *)(intptr_t)HOME_SEARCH);
+}
+
+static const char *search_scope_tag(home_item_t source) {
+	const search_source_t *delegate = search_source_home(source);
+	return source == HOME_SEARCH ? "search_everywhere" : delegate ? delegate->name : "home_search_card";
+}
+void main_menu_search_scope_set(lv_obj_t *screen, home_item_t source) {
+	for (int i = 0; i < search_input_count; i++)
+		if (search_inputs[i].screen == screen) {
+			search_inputs[i].source = source;
+			lv_obj_t *title = search_inputs[i].title;
+			if (title) {
+				lv_obj_set_user_data(title, (void *)(intptr_t)source);
+				lv_label_set_text(title, tr(search_scope_tag(source)));
+				lv_obj_send_event(title, LV_EVENT_SIZE_CHANGED, NULL);
+			}
+			last_search_scope = source;
+		}
+}
+
+static void search_scope_header_click(lv_event_t *e) {
+	(void)e;
+	if (!switcher_back_drag_active())
+		search_scope_choose();
+}
+
+static void search_scope_chevron_place(lv_event_t *e) {
+	lv_obj_t *title = lv_event_get_target(e);
+	lv_obj_t *arrow = lv_event_get_user_data(e);
+	lv_point_t text_size;
+	lv_text_get_size(&text_size, lv_label_get_text(title), lv_obj_get_style_text_font(title, 0), lv_obj_get_style_text_letter_space(title, 0), 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+	int max_x = lv_obj_get_width(title) - (int)icon_chevron_down.header.w;
+	int x = text_size.x + 8;
+	if (x > max_x)
+		x = max_x;
+	lv_obj_set_pos(arrow, x > 0 ? x : 0, (lv_obj_get_height(title) - (int)icon_chevron_down.header.h) / 2);
+}
+
+static void search_scope_loaded(lv_event_t *e) {
+	lv_obj_t *title = lv_event_get_user_data(e);
+	home_item_t source = (home_item_t)(intptr_t)lv_obj_get_user_data(title);
+	last_search_scope = source;
+	for (int i = 0; i < search_input_count; i++) {
+		if (search_inputs[i].source == source && search_inputs[i].field && strcmp(lv_textarea_get_text(search_inputs[i].field), shared_search_query))
+			lv_textarea_set_text(search_inputs[i].field, shared_search_query);
+	}
+	lv_label_set_text(title, tr(search_scope_tag(source)));
+	lv_obj_send_event(title, LV_EVENT_SIZE_CHANGED, NULL);
+}
+
+void main_menu_search_header(lv_obj_t *screen, gui_config_t *cfg, home_item_t source) {
+	search_scope_register(screen, source);
+	lv_obj_t *title = settingsrow_title(screen, cfg, search_scope_tag(source));
+	for (int i = 0; i < search_input_count; i++)
+		if (search_inputs[i].screen == screen)
+			search_inputs[i].title = title;
+	lv_obj_set_user_data(title, (void *)(intptr_t)source);
+	lv_obj_set_style_pad_right(title, 36, 0);
+	lv_obj_set_clickable(title, true);
+	// The full heading is a normal fingertip-sized control, not a hold action.
+	touch_pad(title, 0, 0, 20, 20);
+	lv_obj_add_event_cb(title, search_scope_header_click, LV_EVENT_SHORT_CLICKED, NULL);
+	lv_obj_t *arrow = lv_image_create(title);
+	lv_image_set_src(arrow, &icon_chevron_down);
+	lv_obj_add_style(arrow, &sx_style_icon2, 0);
+	lv_obj_add_event_cb(title, search_scope_chevron_place, LV_EVENT_SIZE_CHANGED, arrow);
+	lv_obj_add_event_cb(title, search_scope_chevron_place, LV_EVENT_STYLE_CHANGED, arrow);
+	lv_obj_add_event_cb(screen, search_scope_loaded, LV_EVENT_SCREEN_LOADED, title);
+}
+
+static void shared_query_changed(lv_event_t *e) {
+	lv_obj_t *field = lv_event_get_target(e);
+	const char *text = lv_textarea_get_text(field);
+	size_t n = strlen(text);
+	if (n >= sizeof(shared_search_query)) {
+		n = sizeof(shared_search_query) - 1;
+		while (n && ((unsigned char)text[n] & 0xc0) == 0x80)
+			n--;
+	}
+	memcpy(shared_search_query, text, n);
+	shared_search_query[n] = 0;
+}
+
+void main_menu_search_bind(lv_obj_t *screen, lv_obj_t *field) {
+	for (int i = 0; i < search_input_count; i++) {
+		if (search_inputs[i].screen == screen) {
+			search_inputs[i].field = field;
+			lv_obj_add_event_cb(field, shared_query_changed, LV_EVENT_VALUE_CHANGED, NULL);
+			return;
+		}
+	}
+}
+
+const char *main_menu_search_query(void) { return shared_search_query; }

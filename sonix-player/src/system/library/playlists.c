@@ -144,7 +144,8 @@ static bool is_marker_line(const char *line) {
 // it.
 #define MARKER_SEARCH_LINES 16
 
-static bool file_is_marked(const char *path) {
+static bool file_is_marked(const char *path, bool *read_ok) {
+	*read_ok = false;
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		return false;
@@ -166,7 +167,9 @@ static bool file_is_marked(const char *path) {
 		}
 	}
 
-	fclose(f);
+	*read_ok = !ferror(f);
+	if (fclose(f) != 0)
+		*read_ok = false;
 	return marked;
 }
 
@@ -194,16 +197,27 @@ static void migrate_folder_once(void) {
 		return;
 	}
 	migration_tried = true;
+	unsigned epoch = library_database_epoch();
+	if (!epoch)
+		return;
 
 	DIR *dir = opendir(dir_path);
 	if (!dir) {
-		library_playlists_set_migrated(); // no folder, nothing to move, never again
+		if (errno == ENOENT)
+			library_playlists_set_migrated_at(epoch);
 		return;
 	}
 
 	int moved = 0, tracks = 0;
 	struct dirent *de;
-	while ((de = readdir(dir)) != NULL) {
+	bool failed = false;
+	for (;;) {
+		errno = 0;
+		de = readdir(dir);
+		if (!de) {
+			failed = failed || errno != 0;
+			break;
+		}
 		size_t len = strlen(de->d_name);
 		if (len < 5 || strcasecmp(de->d_name + len - 4, ".m3u") != 0) {
 			continue;
@@ -214,9 +228,12 @@ static void migrate_folder_once(void) {
 		}
 		// Only the ones this player wrote. An unmarked file is somebody else's
 		// and stays where Import can find it, as it always did.
-		if (!file_is_marked(full)) {
+		bool header_read_ok;
+		bool marked = file_is_marked(full, &header_read_ok);
+		if (!header_read_ok)
+			failed = true;
+		if (!marked)
 			continue;
-		}
 
 		char name[NAME_MAX + 1];
 		size_t stem = len - 4 < sizeof(name) - 1 ? len - 4 : sizeof(name) - 1;
@@ -227,14 +244,19 @@ static void migrate_folder_once(void) {
 		}
 
 		int count = rows_from_file(name, full);
+		if (count < 0)
+			failed = true;
 		if (count > 0) {
 			moved++;
 			tracks += count;
 		}
 	}
-	closedir(dir);
-
-	library_playlists_set_migrated();
+	if (closedir(dir) != 0)
+		failed = true;
+	if (!failed && !library_playlists_set_migrated_at(epoch))
+		failed = true;
+	if (failed)
+		fprintf(stderr, "playlists: migration incomplete; original files remain for retry after remount\n");
 	if (moved > 0) {
 		fprintf(stderr, "playlists: %d playlist%s (%d tracks) moved from the card into the index; the files stay as "
 						"backups\n",
@@ -274,6 +296,8 @@ bool playlists_create(const char *name) {
 	}
 	return library_playlist_create(name);
 }
+
+bool playlists_name_valid(const char *name) { return name_is_usable(name); }
 
 // The seconds an #EXTINF line wants. -1 (the M3U "unknown") whenever the
 // length cannot be had cheaply -- a WAV, or a file whose decoder will not
@@ -331,12 +355,22 @@ bool playlists_add_track(const char *name, const char *track_path) {
 
 	// Title and artist are written down with the entry, so that drawing the
 	// playlist later is a read of one table and nothing else.
-	library_playlist_row_t row = {{0}, {0}, {0}, -1, true};
-	copy_capped(row.path, sizeof(row.path), track_path);
-	playlists_track_names(track_path, row.title, sizeof(row.title), row.artist, sizeof(row.artist));
-	row.seconds = track_seconds(track_path);
+	library_playlist_row_t row;
+	if (!playlists_track_row(track_path, &row))
+		return false;
 
 	return library_playlist_append(name, &row);
+}
+
+bool playlists_track_row(const char *track_path, library_playlist_row_t *row) {
+	if (!row || !track_path || !track_path[0] || strlen(track_path) >= sizeof(row->path))
+		return false;
+	memset(row, 0, sizeof(*row));
+	row->present = true;
+	copy_capped(row->path, sizeof(row->path), track_path);
+	playlists_track_names(track_path, row->title, sizeof(row->title), row->artist, sizeof(row->artist));
+	row->seconds = track_seconds(track_path);
+	return true;
 }
 
 bool playlists_remove_track(const char *name, const char *track_path) {
@@ -584,18 +618,67 @@ static void name_entry(const char *path, const char *extinf, char *title_out, si
 // Reads a .m3u straight into a playlist of its own: the path each line means,
 // the title and artist to show, whether the file is there. One row at a time,
 // so a long list costs a row rather than all of them. Returns how many went in,
-// 0 if nothing did. Used by the one-time move off the card; Import has its own
+// 0 for a valid empty file and -1 on I/O/database failure. Used by the one-time
+// move off the card; Import has its own
 // reader, because it also has to look up entries the card no longer has at the
 // path they name.
+// Both import readers feed one bounded heap buffer. Metadata lookup occurs
+// between short stage transactions, never inside another owner's long TX.
+typedef struct {
+	library_playlist_stage_t *stage;
+	library_playlist_row_t *rows;
+	int count, written;
+} import_rows_t;
+
+static bool import_rows_begin(import_rows_t *writer, unsigned epoch, unsigned revision) {
+	memset(writer, 0, sizeof(*writer));
+	writer->rows = calloc(LIBRARY_PLAYLIST_IMPORT_BATCH, sizeof(*writer->rows));
+	if (!writer->rows)
+		return false;
+	writer->stage = library_playlist_stage_begin_import(epoch, revision);
+	if (!writer->stage) {
+		free(writer->rows);
+		writer->rows = NULL;
+		return false;
+	}
+	return true;
+}
+
+static bool import_rows_flush(import_rows_t *writer) {
+	if (!writer->count)
+		return true;
+	if (!library_playlist_stage_import_rows(writer->stage, writer->rows, writer->count))
+		return false;
+	writer->written += writer->count;
+	writer->count = 0;
+	return true;
+}
+
+static bool import_rows_add(import_rows_t *writer, const library_playlist_row_t *row) {
+	writer->rows[writer->count++] = *row;
+	return writer->count < LIBRARY_PLAYLIST_IMPORT_BATCH || import_rows_flush(writer);
+}
+
+static bool import_rows_end(import_rows_t *writer, bool keep, const char *name, bool replacing) {
+	bool ok = keep && import_rows_flush(writer) && library_playlist_stage_publish(writer->stage, name, replacing ? LIBRARY_PLAYLIST_REPLACE : LIBRARY_PLAYLIST_CREATE, NULL);
+	library_playlist_stage_discard(writer->stage);
+	free(writer->rows);
+	return ok;
+}
+
 static int rows_from_file(const char *name, const char *file_path) {
+	unsigned epoch = library_database_epoch();
+	unsigned revision = library_revision(LIBRARY_LIST_PLAYLIST);
+	if (!epoch)
+		return -1;
 	FILE *f = fopen(file_path, "r");
 	if (!f) {
-		return 0;
+		return -1;
 	}
-	library_playlist_writer_t *writer = library_playlist_write_begin(name);
-	if (!writer) {
+	import_rows_t writer;
+	if (!import_rows_begin(&writer, epoch, revision)) {
 		fclose(f);
-		return 0;
+		return -1;
 	}
 
 	int count = 0;
@@ -633,16 +716,19 @@ static int rows_from_file(const char *name, const char *file_path) {
 		pending_title[0] = '\0';
 		pending_seconds = -1;
 
-		ok = library_playlist_write_row(writer, &row);
+		ok = import_rows_add(&writer, &row);
 		if (ok) {
 			count++;
 		}
 	}
-	fclose(f);
+	ok = ok && !ferror(f);
+	if (fclose(f) != 0)
+		ok = false;
 
-	if (!library_playlist_write_end(writer, ok && count > 0)) {
-		return 0;
-	}
+	ok = ok && library_database_epoch() == epoch;
+	bool published = import_rows_end(&writer, ok, name, false);
+	if (!ok || !published)
+		return -1;
 	return count;
 }
 
@@ -881,9 +967,9 @@ int playlists_importable(playlists_candidate_t *out, int max) {
 	return count;
 }
 
-// A playlist longer than this is not one somebody wrote. The cap is on what is
-// held while importing: a path, a title and a little per entry.
-#define IMPORT_MAX_ENTRIES 5000
+// Keep imports bounded on R1; allocate entries only as the file needs them.
+// An over-limit import fails before any playlist is replaced.
+#define IMPORT_MAX_ENTRIES 20000
 
 typedef struct {
 	char *path;	  // where the entry points, or where the track was found
@@ -922,12 +1008,12 @@ static void import_entries_free(import_entry_t *entries, int count) {
 // something that still exists gives a second list rather than overwriting the
 // first.
 static bool import_name(const char *stem, char *name_out, size_t name_size) {
-	for (int attempt = 1; attempt <= 99; attempt++) {
+	for (unsigned attempt = 1; attempt <= 99; attempt++) {
 		char name[201];
 		if (attempt == 1) {
 			copy_capped(name, sizeof(name), stem);
 		} else {
-			snprintf(name, sizeof(name), "%.190s (%d)", stem, attempt);
+			snprintf(name, sizeof(name), "%.190s (%u)", stem, attempt);
 		}
 		if (!name_is_usable(name)) {
 			return false;
@@ -945,18 +1031,24 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 		return false;
 	}
 	memset(out, 0, sizeof(*out));
+	unsigned epoch = library_database_epoch();
+	unsigned revision = library_revision(LIBRARY_LIST_PLAYLIST);
+	if (!epoch)
+		return false;
 
 	FILE *f = fopen(source_path, "r");
 	if (!f) {
 		return false;
 	}
 
-	import_entry_t *entries = calloc(IMPORT_MAX_ENTRIES, sizeof(*entries));
+	int room = 128;
+	import_entry_t *entries = calloc((size_t)room, sizeof(*entries));
 	if (!entries) {
 		fclose(f);
 		return false;
 	}
 	int count = 0;
+	bool read_ok = true;
 
 	// Relative entries are read against the folder the file is in.
 	char source_dir[512];
@@ -973,7 +1065,7 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 	char pending_title[512] = {0};
 	long pending_seconds = -1;
 
-	while (count < IMPORT_MAX_ENTRIES && read_line(f, line, sizeof(line))) {
+	while (read_line(f, line, sizeof(line))) {
 		char *text = line_body(line);
 		if (!text[0] || is_marker_line(text)) {
 			continue;
@@ -985,6 +1077,21 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 				snprintf(pending_title, sizeof(pending_title), "%s", comma ? comma + 1 : "");
 			}
 			continue;
+		}
+
+		if (count == IMPORT_MAX_ENTRIES) {
+			read_ok = false;
+			break;
+		}
+		if (count == room) {
+			int next = room * 2 < IMPORT_MAX_ENTRIES ? room * 2 : IMPORT_MAX_ENTRIES;
+			import_entry_t *grown = realloc(entries, (size_t)next * sizeof(*entries));
+			if (!grown) {
+				read_ok = false;
+				break;
+			}
+			entries = grown;
+			room = next;
 		}
 
 		char resolved[1024];
@@ -1005,21 +1112,27 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 		}
 
 		import_entry_t *entry = &entries[count];
+		*entry = (import_entry_t){0};
 		entry->path = strdup(resolved);
 		entry->found = found;
 		entry->title = pending_title[0] ? strdup(pending_title) : NULL;
 		entry->seconds = pending_seconds;
-		pending_title[0] = '\0';
-		pending_seconds = -1;
-		if (!entry->path) {
+		if (!entry->path || (pending_title[0] && !entry->title)) {
+			free(entry->path);
+			free(entry->title);
+			read_ok = false;
 			break;
 		}
+		pending_title[0] = '\0';
+		pending_seconds = -1;
 		count++;
 	}
-	fclose(f);
+	read_ok = read_ok && !ferror(f);
+	if (fclose(f) != 0)
+		read_ok = false;
 
 	out->total = count;
-	if (count == 0) {
+	if (!read_ok || count == 0) {
 		import_entries_free(entries, count);
 		return false;
 	}
@@ -1027,6 +1140,12 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 	// --- the rest, by file name, in one pass over the index -------------------
 	const char **names = calloc((size_t)count, sizeof(*names));
 	char **hits = calloc((size_t)count, sizeof(*hits));
+	if (!names || !hits) {
+		free(names);
+		free(hits);
+		import_entries_free(entries, count);
+		return false;
+	}
 	if (names && hits) {
 		int wanted = 0;
 		for (int i = 0; i < count; i++) {
@@ -1092,17 +1211,13 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 	const char *slash = strrchr(source_path, '/');
 	name_from_file(slash ? slash + 1 : source_path, stem, sizeof(stem));
 
-	// Replacing: the rows go into a playlist of their own beside the old one,
-	// which is only dropped once they are all in. A leftover from an import cut
-	// short is cleared first.
+	// Stage rows stay hidden. Publication validates the captured namespace and
+	// atomically replaces the target; never drop a public "(import)" playlist.
 	char name[201];
 	bool replacing = overwrite && name_is_usable(stem) && library_playlist_exists(stem);
-	if (replacing) {
-		snprintf(name, sizeof(name), "%.180s (import)", stem);
-		if (library_playlist_exists(name)) {
-			library_playlist_drop(name);
-		}
-	} else if (!import_name(stem, name, sizeof(name))) {
+	if (replacing)
+		copy_capped(name, sizeof(name), stem);
+	else if (!import_name(stem, name, sizeof(name))) {
 		import_entries_free(entries, count);
 		return false;
 	}
@@ -1114,10 +1229,9 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 	// which matters here: a list of hundreds the index has never seen would
 	// otherwise be hundreds of files opened off the card.
 	//
-	// Straight into the playlist, a row at a time. Held in an array first, a
-	// five-thousand-entry import would be nine megabytes of fixed-width rows.
-	library_playlist_writer_t *writer = library_playlist_write_begin(name);
-	if (!writer) {
+	// One bounded import-only heap batch, not an array of the whole playlist.
+	import_rows_t writer;
+	if (!import_rows_begin(&writer, epoch, revision)) {
 		import_entries_free(entries, count);
 		return false;
 	}
@@ -1136,29 +1250,17 @@ bool playlists_import(const char *source_path, bool overwrite, playlists_import_
 		copy_capped(row.path, sizeof(row.path), entries[i].path);
 		row.seconds = entries[i].seconds;
 		row.present = true; // only the entries found on the card are written
-		name_entry(entries[i].path, entries[i].title, row.title, sizeof(row.title), row.artist, sizeof(row.artist),
-				   &tags_started_ms, &tags_budget_spent);
-		ok = library_playlist_write_row(writer, &row);
+		name_entry(entries[i].path, entries[i].title, row.title, sizeof(row.title), row.artist, sizeof(row.artist), &tags_started_ms, &tags_budget_spent);
+		ok = import_rows_add(&writer, &row);
 		if (ok) {
 			written++;
 		}
 	}
 
-	ok = library_playlist_write_end(writer, ok && written > 0);
+	ok = import_rows_end(&writer, ok && written > 0, name, replacing);
 	import_entries_free(entries, count);
-	if (!ok) {
-		if (replacing) {
-			library_playlist_drop(name); // the old playlist stays as it was
-		}
+	if (!ok)
 		return false;
-	}
-
-	// The new rows are complete: they take the old playlist's place. Should
-	// that fail, they stay under the name they were written to rather than
-	// being lost.
-	if (replacing && library_playlist_drop(stem) && library_playlist_rename(name, stem)) {
-		copy_capped(name, sizeof(name), stem);
-	}
 
 	copy_capped(out->name, sizeof(out->name), name);
 	return true;

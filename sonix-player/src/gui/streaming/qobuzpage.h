@@ -1,6 +1,7 @@
 #ifndef QOBUZPAGE_H
 #define QOBUZPAGE_H
 
+#include "src/gui/library/searchsource.h"
 #include <stdbool.h>
 
 #include "src/gui/shell/gui.h"
@@ -21,5 +22,9 @@ bool qobuzpage_open_album(const char *album_id, const char *title);
 
 // The list page, for callers that need to know where back leads.
 extern lv_obj_t *qobuz_list_screen;
+
+void qobuzpage_search_results_kind(const char *query, int kind);
+bool qobuzpage_search_path(const search_hit_t *hit, char *out, size_t size);
+void qobuzpage_search_open_hit(const search_result_t *result, int index, const char *query);
 
 #endif /* QOBUZPAGE_H */

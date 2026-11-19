@@ -1,12 +1,13 @@
 #include "cover.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,6 +22,15 @@
 #include "src/system/image/png_scaled.h"
 #include "src/system/image/stb_image_decl.h"
 #include "src/system/core/utils.h"
+
+static atomic_uint display_generation;
+uint32_t cover_new_display_generation(void) {
+	unsigned value;
+	do {
+		value = atomic_fetch_add_explicit(&display_generation, 1, memory_order_relaxed) + 1;
+	} while (!value);
+	return value;
+}
 
 // The backdrop is blurred at half resolution and stretched back up. Blurring
 // the small copy (rather than relying on the stretch alone) is what keeps it
@@ -109,7 +119,10 @@ static void raw_free(raw_image_t *img) {
 #define DECODE_BUDGET_RESERVE_BYTES 0
 #endif
 
-static size_t read_mem_available(void) {
+// What is free right now, without the page cache: MemFree, not MemAvailable
+// (see above). Which is the point -- a decode that fits in it takes nothing the
+// kernel has to evict.
+static size_t read_mem_free(void) {
 	FILE *f = fopen("/proc/meminfo", "r");
 	if (!f) {
 		return 0;
@@ -118,7 +131,7 @@ static size_t read_mem_available(void) {
 	char line[256];
 	size_t kb = 0;
 	while (fgets(line, sizeof(line), f)) {
-		if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+		if (sscanf(line, "MemFree: %zu kB", &kb) == 1) {
 			break;
 		}
 	}
@@ -131,7 +144,7 @@ static size_t decode_budget_bytes(void) {
 	// Recomputed on every call: what was free at boot says nothing about what is
 	// free after an hour of playing. /proc/meminfo costs a few microseconds and
 	// this only runs on the worker thread.
-	size_t available = read_mem_available();
+	size_t available = read_mem_free();
 	size_t budget = available / DECODE_BUDGET_DIVISOR;
 
 	if (budget > DECODE_BUDGET_RESERVE_BYTES) {
@@ -645,6 +658,7 @@ static bool pack_rgb565_dithered(const uint8_t *rgb, int w, int h, cover_image_t
 	out->dsc.header.stride = (uint32_t)w * 2;
 	out->dsc.data_size = (uint32_t)w * h * 2;
 	out->dsc.data = out->pixels;
+	out->display_generation = cover_new_display_generation();
 	return true;
 }
 
@@ -668,6 +682,7 @@ static bool pack_rgb565(const uint8_t *rgb, int w, int h, cover_image_t *out) {
 	out->dsc.header.stride = (uint32_t)w * 2;
 	out->dsc.data_size = (uint32_t)w * h * 2;
 	out->dsc.data = out->pixels;
+	out->display_generation = cover_new_display_generation();
 	return true;
 }
 
@@ -1366,21 +1381,9 @@ typedef enum {
 	COVER_BUILD_FAILED, // a picture was found, none of them would decode
 } cover_build_t;
 
-// A caller's say over each candidate's bytes: the thumbnails' picture cache
-// (thumb_build_track) answers for a picture it has already made, and keeps the
-// one just built.
-typedef struct {
-	// True when `outs` were filled without decoding `art`.
-	bool (*lookup)(void *ctx, const albumart_t *art, cover_image_t *outs);
-	// The images just built from the bytes last passed to lookup.
-	void (*store)(void *ctx, const cover_image_t *outs);
-	void *ctx;
-} cover_source_hook_t;
-
 // `used`, when given, is set to the candidate index the images came from.
-// `hook` may be NULL.
 static cover_build_t build_from_sources_at(const char *path, bool is_dir, const image_request_t *reqs, int n,
-										   cover_image_t *outs, int *used, const cover_source_hook_t *hook) {
+										   cover_image_t *outs, int *used) {
 	bool had_bytes = false;
 
 	// Noted for the crash handler and cleared on the way out, so a log that
@@ -1404,14 +1407,8 @@ static cover_build_t build_from_sources_at(const char *path, bool is_dir, const 
 		}
 
 		had_bytes = true;
-		bool ok = hook && hook->lookup(hook->ctx, &art, outs);
-		if (!ok) {
-			// A card pulled out under the decode: an image made of zeros, not kept.
-			ok = build_images_safely(art.data, art.size, reqs, n, outs) && !albumart_faulted(&art);
-			if (ok && hook) {
-				hook->store(hook->ctx, outs);
-			}
-		}
+		// A card pulled out under the decode: an image made of zeros, not kept.
+		bool ok = build_images_safely(art.data, art.size, reqs, n, outs) && !albumart_faulted(&art);
 		albumart_free(&art);
 		if (ok) {
 			crumb_set_artwork(NULL);
@@ -1435,7 +1432,7 @@ static cover_build_t build_from_sources_at(const char *path, bool is_dir, const 
 
 static cover_build_t build_from_sources(const char *path, bool is_dir, const image_request_t *reqs, int n,
 										cover_image_t *outs) {
-	return build_from_sources_at(path, is_dir, reqs, n, outs, NULL, NULL);
+	return build_from_sources_at(path, is_dir, reqs, n, outs, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,7 +1671,7 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 	}
 
 	int used = -1;
-	cover_build_t built = build_from_sources_at(filepath, false, reqs, n, results, &used, NULL);
+	cover_build_t built = build_from_sources_at(filepath, false, reqs, n, results, &used);
 	if (built == COVER_BUILD_NONE) {
 		// A podcast episode with no cover file beside it: fetch it now, on the
 		// loader thread, which can afford to wait on a network request, then
@@ -1683,7 +1680,7 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 		if (!podcastcache_ensure_cover(filepath)) {
 			return false;
 		}
-		built = build_from_sources_at(filepath, false, reqs, n, results, &used, NULL);
+		built = build_from_sources_at(filepath, false, reqs, n, results, &used);
 	}
 	bool ok = (built == COVER_BUILD_OK);
 
@@ -1738,7 +1735,7 @@ bool cover_load_shared(const char *filepath, int player_w, int player_h, int siz
 	if (!have) {
 		image_request_t req = {.w = player_w, .h = player_h, .fit = COVER_FIT_COVER, .backdrop = false};
 		int used = -1;
-		if (build_from_sources_at(filepath, false, &req, 1, &big, &used, NULL) != COVER_BUILD_OK) {
+		if (build_from_sources_at(filepath, false, &req, 1, &big, &used) != COVER_BUILD_OK) {
 			return false;
 		}
 		keyed = id && used == source_index;
@@ -2018,7 +2015,7 @@ void cover_set_cache_dir(const char *sd_root) {
 	if (!ok) {
 		printf("cover: thumbnail cache disabled\n");
 	}
-	fprintf(stderr, "cover: %zu KB free, decode budget %zu KB\n", read_mem_available() / 1024,
+	fprintf(stderr, "cover: %zu KB free, decode budget %zu KB\n", read_mem_free() / 1024,
 			decode_budget_bytes() / 1024);
 }
 
@@ -2086,6 +2083,7 @@ static bool image_from_column(sqlite3_stmt *stmt, int col, int w, int h, cover_i
 	out->dsc.header.stride = (uint32_t)w * 2;
 	out->dsc.data_size = (uint32_t)bytes;
 	out->dsc.data = pixels;
+	out->display_generation = cover_new_display_generation();
 	return true;
 }
 
@@ -2159,109 +2157,7 @@ static void thumb_db_store(const char *key, const cover_image_t *img, bool has_i
 // browser thumbnails
 // ---------------------------------------------------------------------------
 
-// A key for a picture rather than a file: the bytes' id (bytes_id) and the box.
-// The two kinds never meet: a file's key is sixteen hex digits, and this one
-// starts with a letter that is not one.
-static void thumb_picture_key(char *out, size_t out_size, uint64_t id, int box) { snprintf(out, out_size, "p%016llx|%d", (unsigned long long)id, box); }
-
-// The same picture already made at a larger size -- for Cover Flow, say --
-// shrunk to `size`. The smallest one that is still big enough is taken. A few
-// milliseconds against a decode, which for a large progressive JPEG is over a
-// second on this processor.
-static bool thumb_shrink_cached(uint64_t id, int size, cover_image_t *out) {
-	char from[40], to[40];
-	snprintf(from, sizeof(from), "p%016llx|", (unsigned long long)id);
-	snprintf(to, sizeof(to), "p%016llx}", (unsigned long long)id);
-
-	cover_image_t big;
-	memset(&big, 0, sizeof(big));
-	bool found = false;
-	pthread_mutex_lock(&thumb_db_lock);
-	sqlite3_stmt *stmt = NULL;
-	if (thumb_db && sqlite3_prepare_v2(thumb_db,
-									   "SELECT w, h, pixels FROM thumbs WHERE key >= ?1 AND key < ?2 AND w > 0"
-									   " AND (w >= ?3 OR h >= ?3) ORDER BY w * h LIMIT 1",
-									   -1, &stmt, NULL) == SQLITE_OK) {
-		sqlite3_bind_text(stmt, 1, from, -1, SQLITE_STATIC);
-		sqlite3_bind_text(stmt, 2, to, -1, SQLITE_STATIC);
-		sqlite3_bind_int(stmt, 3, size);
-		if (sqlite3_step(stmt) == SQLITE_ROW) {
-			found = image_from_column(stmt, 2, sqlite3_column_int(stmt, 0), sqlite3_column_int(stmt, 1), &big);
-		}
-		sqlite3_finalize(stmt);
-	}
-	pthread_mutex_unlock(&thumb_db_lock);
-	if (!found) {
-		return false;
-	}
-
-	raw_image_t raw;
-	bool ok = raw_from_cover(&big, &raw) && make_scaled(&raw, size, size, COVER_FIT_CONTAIN, out);
-	raw_free(&raw);
-	cover_free(&big);
-	return ok;
-}
-
-typedef struct {
-	int box;
-	char key[40]; // empty when the bytes last looked up have no id
-} thumb_picture_t;
-
-static bool thumb_picture_lookup(void *ctx, const albumart_t *art, cover_image_t *outs) {
-	thumb_picture_t *pic = ctx;
-	pic->key[0] = '\0';
-	if (!art->size) {
-		return false;
-	}
-	uint64_t id = bytes_id(art->data, art->size);
-	// Asked after the hash, not before: a card pulled during it leaves an id
-	// computed over zeroed pages, which names nothing.
-	if (albumart_faulted(art)) {
-		return false;
-	}
-	thumb_picture_key(pic->key, sizeof(pic->key), id, pic->box);
-	bool has_image = false;
-	if (thumb_db_load(pic->key, outs, &has_image) && has_image) {
-		return true;
-	}
-	if (thumb_shrink_cached(id, pic->box, outs)) {
-		thumb_db_store(pic->key, outs, true);
-		return true;
-	}
-	return false;
-}
-
-static void thumb_picture_store(void *ctx, const cover_image_t *outs) {
-	thumb_picture_t *pic = ctx;
-	if (pic->key[0]) {
-		thumb_db_store(pic->key, outs, true);
-	}
-}
-
-// A track's thumbnail, decoded at most once per picture.
-//
-// The file keys are per path, so the dozen tracks of an album that all carry
-// the same embedded cover would otherwise be a dozen decodes the first time
-// the album is opened -- seconds each for a large progressive JPEG, which
-// TJpgDec cannot scale and stb_image decodes whole. So each candidate's bytes
-// are identified before they are decoded, and a thumbnail already made from
-// the same picture at the same size is taken instead. A picture key is only
-// written for the bytes an image was actually built from, so the answer is
-// the one the decode would have given.
-static cover_build_t thumb_build_track(const char *path, int size, cover_image_t *out) {
-	image_request_t req = {.w = size, .h = size, .fit = COVER_FIT_CONTAIN, .backdrop = false};
-	if (size > THUMB_DISK_MAX_SIZE) {
-		return build_from_sources(path, false, &req, 1, out);
-	}
-	thumb_picture_t pic = {.box = size};
-	cover_source_hook_t hook = {.lookup = thumb_picture_lookup, .store = thumb_picture_store, .ctx = &pic};
-	return build_from_sources_at(path, false, &req, 1, out, NULL, &hook);
-}
-
 static cover_build_t thumb_load_uncached(const char *path, bool is_dir, int size, cover_image_t *out) {
-	if (!is_dir) {
-		return thumb_build_track(path, size, out);
-	}
 	image_request_t req = {.w = size, .h = size, .fit = COVER_FIT_CONTAIN, .backdrop = false};
 	return build_from_sources(path, is_dir, &req, 1, out);
 }
@@ -2288,8 +2184,7 @@ bool cover_thumb_load(const char *path, bool is_dir, int size, cover_image_t *ou
 	// Asking the folder first -- the "an album shares one picture" shortcut --
 	// breaks as soon as a folder holds tracks from different albums, since every
 	// row below the first would show the first track's cover. The per-file disk
-	// cache keeps the cost at one decode per file, ever, and tracks that carry
-	// the same picture share one decode (thumb_build_track).
+	// cache keeps the cost at one decode per file, ever.
 
 	char key[32];
 	bool cacheable = thumb_key(key, sizeof(key), path, size, is_dir);
@@ -2660,6 +2555,7 @@ static bool player_cover_load(uint64_t id, int w, int h, cover_image_t *out) {
 		out->dsc.header.stride = (uint32_t)w * 2;
 		out->dsc.data_size = (uint32_t)blob_len;
 		out->dsc.data = blob;
+		out->display_generation = cover_new_display_generation();
 		player_cover_store(id, w, h, out);
 	} else {
 		hit = blob_len > 2 && blob[0] == 0xFF && blob[1] == 0xD8 && image_from_jpeg(blob, blob_len, w, h, out);

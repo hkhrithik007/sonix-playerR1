@@ -1,56 +1,64 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "system.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <linux/input.h>
 #include <linux/netlink.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/statvfs.h>
-#include <sys/wait.h>
-#include <poll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/settings/screensaver.h"
 #include "src/gui/shell/gui.h"
-#include "src/system/device/sysinfo.h"
+#include "src/system/audio/alsa-controls.h"
+#include "src/system/audio/audio.h"
+#include "src/system/audio/eq.h"
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/bluetooth/btlog.h"
 #include "src/system/bluetooth/btplayer.h"
-#include "src/system/audio/audio.h"
-#include "src/system/audio/alsa-controls.h"
-#include "src/system/playback/device_state.h"
-#include "src/system/library/audiobookdb.h"
-#include "src/system/audio/eq.h"
-#include "src/system/remote/dlna.h"
+#include "src/system/core/config.h"
+#include "src/system/core/logging.h"
+#include "src/system/core/panel.h"
+#include "src/system/core/utils.h"
+#include "src/system/device/power.h"
+#include "src/system/device/screenshot.h"
+#include "src/system/device/sysinfo.h"
+#include "src/system/device/sysserver.h"
+#include "src/system/device/usb.h"
 #include "src/system/gearboy/gbdb.h"
 #include "src/system/input/hookclicks.h"
 #include "src/system/input/keymap.h"
-#include "src/system/core/panel.h"
-#include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/podcastsubs.h"
-#include "src/system/streaming/podcaststate.h"
-#include "src/system/streaming/radio.h"
-#include "src/system/streaming/tidalcache.h"
+#include "src/system/library/audiobookdb.h"
 #include "src/system/library/library.h"
-#include "src/system/core/logging.h"
 #include "src/system/library/playlists.h"
-#include "src/system/device/usb.h"
-#include "src/system/device/power.h"
-#include "src/system/device/screenshot.h"
-#include "src/system/device/sysserver.h"
-#include "src/system/core/utils.h"
-#include "src/system/core/utils.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/playback/playhistory.h"
+#include "src/system/remote/dlna.h"
+#include "src/system/streaming/cardimport.h"
+#include "src/system/streaming/podcastcache.h"
+#include "src/system/streaming/podcastdl.h"
+#include "src/system/streaming/podcaststate.h"
+#include "src/system/streaming/podcastsubs.h"
+#include "src/system/streaming/provider.h"
+#include "src/system/streaming/radio.h"
+#include "src/system/streaming/streamturn.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -297,8 +305,7 @@ int read_battery_millivolts(void) {
 		return -1;
 	}
 	char text[24];
-	if (!battery_source[0] || !read_sysfs_line(POWER_SUPPLY_DIR, battery_source, "voltage_now", text, sizeof(text)) ||
-		text[0] < '0' || text[0] > '9') {
+	if (!battery_source[0] || !read_sysfs_line(POWER_SUPPLY_DIR, battery_source, "voltage_now", text, sizeof(text)) || text[0] < '0' || text[0] > '9') {
 		return -1;
 	}
 	long microvolts = atol(text);
@@ -342,12 +349,14 @@ static const char *const SD_DEVICE_CANDIDATES[] = {
 // Resolved once at startup and handed to the file browser, see storage_sd_root().
 static char sd_root[PATH_MAX] = "";
 static char sd_device_used[64] = "";
+static _Atomic bool sd_requires_mount;
+static bool is_mounted(const char *mount_point);
 
 const char *storage_sd_device(void) { return sd_device_used[0] ? sd_device_used : NULL; }
 
-const char *storage_sd_root(void) {
-	return sd_root[0] ? sd_root : NULL;
-}
+const char *storage_sd_mount_point(void) { return sd_root[0] ? sd_root : NULL; }
+
+const char *storage_sd_root(void) { return sd_root[0] && (!sd_requires_mount || (is_mounted(sd_root) && !usb_storage_active())) ? sd_root : NULL; }
 
 // True if something is already mounted on `mount_point`.
 //
@@ -472,6 +481,10 @@ static const char *pick_sd_device(const storage_config_t *storage_cfg) {
 // if need be).
 static const char *pick_sd_root(const storage_config_t *storage_cfg) {
 	size_t count = sizeof(SD_ROOT_CANDIDATES) / sizeof(SD_ROOT_CANDIDATES[0]);
+	// An unmanaged, explicit root belongs to the caller (including the SDL
+	// simulator). A different mounted device must not override that choice.
+	if (storage_cfg->mount_point && storage_cfg->mount_point[0] && !storage_cfg->manage_mount)
+		return storage_cfg->mount_point;
 
 	if (storage_cfg->mount_point && is_mounted(storage_cfg->mount_point)) {
 		return storage_cfg->mount_point;
@@ -543,7 +556,7 @@ static void list_block_devices(void) {
 // works" is the shape that gets reported.
 static bool mount_is_writable(const char *mount_point) {
 	struct statvfs st;
-	if (statvfs(mount_point, &st) == 0 && (st.f_flag & ST_RDONLY)) {
+	if (statvfs(mount_point, &st) != 0 || (st.f_flag & ST_RDONLY)) {
 		return false;
 	}
 
@@ -647,11 +660,20 @@ static int mount_sd_directly(const char *device, const char *mount_point) {
 // Whether the card can be written to, decided once when it is mounted. Read by
 // storage_sd_writable(); everything that keeps state on the card can ask instead
 // of failing silently.
-static bool sd_writable = true;
+static _Atomic bool sd_writable;
+
+// Lock-held lifecycle helpers; startup holds card_lock before card threads run.
+static void storage_card_revoke_locked(void);
+static void storage_card_publish_locked(void);
 
 // Records the writability of a mount that has just been established, and says
 // so in the log. Returns 0 so it can stand in for the `return 0` it replaces.
 static int mount_settled(const char *mount_point) {
+	if (sd_requires_mount && !is_mounted(mount_point)) {
+		sd_writable = false;
+		storage_card_revoke_locked();
+		return -1;
+	}
 	sd_writable = mount_is_writable(mount_point);
 	if (!sd_writable) {
 		fprintf(stderr,
@@ -660,15 +682,33 @@ static int mount_settled(const char *mount_point) {
 				"device; a card in an adapter may have its write-protect notch closed.\n",
 				mount_point);
 	}
+	// Read-only is still valid for reads; an absent unmanaged folder is not.
+	if (mount_is_alive(mount_point))
+		storage_card_publish_locked();
+	else
+		storage_card_revoke_locked();
 	return 0;
 }
 
-bool storage_sd_writable(void) { return sd_writable; }
+bool storage_sd_writable(void) {
+	if (!sd_writable || !sd_root[0] || usb_storage_active()) {
+		return false;
+	}
+	struct statvfs st;
+	return (!sd_requires_mount || is_mounted(sd_root)) && statvfs(sd_root, &st) == 0 && !(st.f_flag & ST_RDONLY);
+}
 
-static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runtime) {
+static void card_databases_detach(void);
+
+static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runtime, bool runtime_recovery) {
 	(void)runtime;
-
 	const char *mount_point = pick_sd_root(storage_cfg);
+	// Revoke before replacing the authoritative path. Preserve existing
+	// callback order; duplicate observations of a healthy mount keep its token.
+	if (strcmp(sd_root, mount_point) != 0 || sd_requires_mount != storage_cfg->manage_mount)
+		storage_card_revoke_locked();
+	sd_requires_mount = storage_cfg->manage_mount;
+	sd_writable = false;
 	snprintf(sd_root, sizeof(sd_root), "%s", mount_point);
 
 	if (!storage_cfg->manage_mount || getenv("SONIX_NO_MOUNT")) {
@@ -680,6 +720,9 @@ static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runti
 	// below would otherwise read it as "already there, leave it alone".
 	if (is_mounted(mount_point) && !mount_is_alive(mount_point)) {
 		fprintf(stderr, "storage: %s is mounted but dead; clearing it first\n", mount_point);
+		storage_card_revoke_locked();
+		if (runtime_recovery)
+			card_databases_detach();
 		force_unmount(mount_point);
 	}
 
@@ -704,6 +747,8 @@ static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runti
 		return mount_settled(mount_point);
 	}
 
+	// An absent/dead observed mount revokes even before a block node exists.
+	storage_card_revoke_locked();
 	const char *device = pick_sd_device(storage_cfg);
 	if (device) {
 		snprintf(sd_device_used, sizeof(sd_device_used), "%s", device);
@@ -714,6 +759,10 @@ static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runti
 		return -1;
 	}
 
+	// A lost remove event must not carry old jobs into a new FAT volume.
+	// At runtime the caller holds card_lock; startup has no card services yet.
+	if (runtime_recovery)
+		card_databases_detach();
 	mkdir(mount_point, 0755); // in case the mount point doesn't exist
 
 	printf("storage: mounting %s on %s\n", device, mount_point);
@@ -754,7 +803,7 @@ static void unmount_sd(storage_config_t *storage_cfg) {
 }
 
 static void check_and_mount_existing_sd(storage_config_t *storage_cfg, const system_runtime_t *runtime) {
-	mount_sd(storage_cfg, runtime);
+	mount_sd(storage_cfg, runtime, false);
 
 	if (!storage_cfg->manage_mount) {
 		return; // host build: the browser reads an ordinary folder
@@ -788,15 +837,17 @@ static void check_and_mount_existing_sd(storage_config_t *storage_cfg, const sys
 // bare "mmcblk" prefix, so one card produces TWO events (the disk and its
 // partition) and each half would otherwise run twice, the second call recording
 // the state the first had already cleared.
-static bool card_attached = true; // the card is mounted before this thread starts
+static _Atomic bool card_attached = true; // the card is mounted before this thread starts
 
 bool storage_card_attached(void) { return card_attached; }
 
 static void card_databases_detach(void) {
+	storage_card_revoke_locked();
 	if (!card_attached) {
 		return;
 	}
 	card_attached = false;
+	sd_writable = false;
 
 	// Playback first. The playback thread keeps the track's descriptor open for
 	// the whole track -- and with "remember track" a track is loaded and paused
@@ -808,19 +859,36 @@ static void card_databases_detach(void) {
 	// of play would otherwise read as "the track ended, start it again".
 	device_state_note_storage_gone();
 	audio_stop();
+	// Nonblocking: no card lock is held across downloader network waits.
+	podcastdl_cancel();
 	podcaststate_set_root(NULL);
 
 	logging_suspend_for_usb(); // closes the on-card log file
 	btlog_card_release();
+	library_prepare_close();
+	playhistory_flush();
 	library_close();
 	audiobookdb_close();
+	radio_store_close();
+	cover_set_cache_dir(NULL);
+	playlists_init(NULL);
+	streamturn_abandon_all();
+	stream_provider_set_root_all(NULL);
+	cardimport_set_root(NULL);
+	podcastcache_set_root(NULL);
+	podcastsubs_set_root(NULL);
+	dlna_set_root(NULL);
+	eq_presets_set_dir(NULL);
+	peq_presets_set_dir(NULL);
+	mseb_presets_set_dir(NULL);
 	printf("storage: card databases closed for removal\n");
 }
 
 static void card_databases_attach(const char *root) {
-	if (card_attached) {
+	if (card_attached || !root || !root[0] || (sd_requires_mount && (!is_mounted(root) || !mount_is_alive(root)))) {
 		return;
 	}
+	storage_card_publish_locked();
 	card_attached = true;
 
 	// PATH_MAX, because the card root comes from a mount point and a mount point
@@ -830,10 +898,15 @@ static void card_databases_attach(const char *root) {
 	// long to hold both is rejected rather than silently cut in half and opened
 	// somewhere else.
 	const int room = (int)sizeof(path) - 32;
-	snprintf(path, sizeof(path), "%.*s/.local/library.db", room, root);
+	const char *db_root = sd_writable ? root : "/tmp";
+	if (!sd_writable) {
+		mkdir("/tmp/.local", 0755);
+	}
+	snprintf(path, sizeof(path), "%.*s/.local/library.db", room, db_root);
 	library_open(path);
-	snprintf(path, sizeof(path), "%.*s/.local/audiobooks.db", room, root);
+	snprintf(path, sizeof(path), "%.*s/.local/audiobooks.db", room, db_root);
 	audiobookdb_open(path);
+	radio_store_open(db_root);
 
 	// The card may have been written somewhere else while it was out: looked
 	// over in the background, as soon as the index is open.
@@ -849,8 +922,8 @@ static void card_databases_attach(const char *root) {
 	eq_presets_set_dir(root);
 	peq_presets_set_dir(root);
 	mseb_presets_set_dir(root);
-	qobuzcache_set_root(root);
-	tidalcache_set_root(root);
+	stream_provider_set_root_all(root);
+	cardimport_set_root(root); // a token or a server file brought on this card
 	podcastcache_set_root(root);
 	podcastsubs_set_root(root);
 	podcaststate_set_root(root);
@@ -893,6 +966,175 @@ static pthread_mutex_t card_lock = PTHREAD_MUTEX_INITIALIZER;
 static storage_config_t *g_storage_cfg;
 static system_runtime_t *g_runtime;
 static bool card_released; // under card_lock: set for the power-off, never cleared
+static bool card_update_claimed; // only an aborted update may undo its own release
+static bool card_usb_claimed; // under card_lock: supervisor/hotplug must not mount
+
+// Managed ownership only, protected by card_lock; no 64-bit atomic dependency.
+static uint64_t card_epoch;
+static bool card_epoch_valid;
+static bool card_epoch_initialized;
+
+static void storage_card_revoke_locked(void) { card_epoch_valid = false; }
+
+static void storage_card_publish_locked(void) {
+	if (card_released || card_usb_claimed || usb_storage_active() || !sd_root[0]) {
+		storage_card_revoke_locked();
+		return;
+	}
+	if (card_epoch_valid || card_epoch == UINT64_MAX)
+		return; // After exhaustion/revoke, never wrap or reuse an old token.
+	card_epoch++;
+	card_epoch_valid = true;
+}
+
+static bool storage_card_owned_locked(void) {
+	return card_epoch_initialized && card_epoch_valid && card_attached && sd_root[0] &&
+		   !card_released && !card_usb_claimed && !usb_storage_active();
+}
+
+bool storage_card_try_admit(storage_card_token_t *out, char *root, size_t size) {
+	if (out)
+		out->epoch = 0;
+	if (root && size)
+		root[0] = '\0';
+	if (!out || !root || !size) {
+		errno = EINVAL;
+		return false;
+	}
+	if (pthread_mutex_trylock(&card_lock) != 0) {
+		errno = EAGAIN; // Unknown/busy is not proof of stale ownership.
+		return false;
+	}
+	int error = 0;
+	if (!storage_card_owned_locked())
+		error = card_released || card_usb_claimed || usb_storage_active() ? EBUSY :
+				card_epoch_initialized && card_epoch == UINT64_MAX ? EOVERFLOW : ENODEV;
+	else if (strlen(sd_root) >= size)
+		error = ENAMETOOLONG;
+	else {
+		out->epoch = card_epoch;
+		snprintf(root, size, "%s", sd_root);
+	}
+	pthread_mutex_unlock(&card_lock);
+	if (error)
+		errno = error;
+	return !error;
+}
+
+int storage_card_try_check(const storage_card_token_t *expected) {
+	if (!expected || !expected->epoch) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (pthread_mutex_trylock(&card_lock) != 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+	bool current = storage_card_owned_locked() && expected->epoch == card_epoch;
+	pthread_mutex_unlock(&card_lock);
+	if (!current)
+		errno = ESTALE;
+	return current ? 0 : -1;
+}
+
+// Share the existing current-card admission without recursive locking. Legacy
+// callers deliberately acquire no epoch/initialization requirement here.
+static int storage_open_card_locked(bool writable) {
+	if (card_released || card_usb_claimed || usb_storage_active()) {
+		errno = EBUSY;
+		return -1;
+	}
+	if (!card_attached || !sd_root[0]) {
+		errno = ENODEV;
+		return -1;
+	}
+	if (writable && !sd_writable) {
+		errno = EROFS;
+		return -1;
+	}
+	if (sd_requires_mount && !is_mounted(sd_root)) {
+		errno = ENODEV;
+		return -1;
+	}
+	struct statvfs st;
+	if (statvfs(sd_root, &st) != 0)
+		return -1;
+	if (writable && (st.f_flag & ST_RDONLY)) {
+		errno = EROFS;
+		return -1;
+	}
+	return open(sd_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+static int storage_pin_card_locked(void) { return storage_open_card_locked(true); }
+
+static int storage_pin_card_expected(const storage_card_token_t *expected, bool writable) {
+	if (!expected || !expected->epoch) {
+		errno = EINVAL;
+		return -1;
+	}
+	pthread_mutex_lock(&card_lock);
+	int fd;
+	if (!card_epoch_initialized) {
+		errno = ENODEV;
+		fd = -1;
+	} else if (!card_epoch_valid || expected->epoch != card_epoch) {
+		errno = ESTALE;
+		fd = -1;
+	} else
+		fd = writable ? storage_pin_card_locked() : storage_open_card_locked(false);
+	int error = errno;
+	pthread_mutex_unlock(&card_lock);
+	if (fd < 0)
+		errno = error;
+	return fd;
+}
+
+int storage_pin_card_if(const storage_card_token_t *expected) { return storage_pin_card_expected(expected, true); }
+
+int storage_pin_card_read_if(const storage_card_token_t *expected) { return storage_pin_card_expected(expected, false); }
+
+
+bool storage_release_for_usb(void) {
+	pthread_mutex_lock(&card_lock);
+	storage_card_revoke_locked();
+	if (card_released) {
+		pthread_mutex_unlock(&card_lock);
+		return false;
+	}
+	card_usb_claimed = true;
+	card_databases_detach();
+	pthread_mutex_unlock(&card_lock);
+	return true;
+}
+
+void storage_resume_after_usb(void) {
+	pthread_mutex_lock(&card_lock);
+	card_usb_claimed = false;
+	if (!card_released && sd_root[0] && is_mounted(sd_root) && mount_is_alive(sd_root)) {
+		mount_settled(sd_root);
+		card_databases_attach(sd_root);
+	} else
+		storage_card_revoke_locked();
+	pthread_mutex_unlock(&card_lock);
+}
+
+int storage_pin_card(char *out, size_t size) {
+	int fd = -1;
+	if (!out || !size) {
+		return -1;
+	}
+	out[0] = '\0';
+	pthread_mutex_lock(&card_lock);
+	if (strlen(sd_root) < size) {
+		fd = storage_pin_card_locked();
+		if (fd >= 0) {
+			snprintf(out, size, "%s", sd_root);
+		}
+	}
+	pthread_mutex_unlock(&card_lock);
+	return fd;
+}
 
 void storage_recheck_card(void) {
 	if (!g_storage_cfg || !g_storage_cfg->manage_mount || getenv("SONIX_NO_MOUNT")) {
@@ -906,8 +1148,19 @@ void storage_recheck_card(void) {
 
 	pthread_mutex_lock(&card_lock);
 
-	if (card_released || (sd_root[0] && is_mounted(sd_root) && mount_is_alive(sd_root))) {
-		pthread_mutex_unlock(&card_lock); // nothing to do, the common case
+	if (card_released || card_usb_claimed || usb_storage_active()) {
+		storage_card_revoke_locked();
+		pthread_mutex_unlock(&card_lock);
+		return;
+	}
+	if (sd_root[0] && is_mounted(sd_root) && mount_is_alive(sd_root)) {
+		struct statvfs st;
+		if (statvfs(sd_root, &st) != 0 || (st.f_flag & ST_RDONLY)) {
+			sd_writable = false;
+		}
+		storage_card_publish_locked();
+		card_databases_attach(sd_root);
+		pthread_mutex_unlock(&card_lock);
 		return;
 	}
 
@@ -925,7 +1178,7 @@ void storage_recheck_card(void) {
 		force_unmount(sd_root);
 	}
 
-	if (mount_sd(g_storage_cfg, g_runtime) == 0 && mount_is_alive(sd_root)) {
+	if (mount_sd(g_storage_cfg, g_runtime, true) == 0 && mount_is_alive(sd_root)) {
 		card_databases_attach(sd_root);
 		fprintf(stderr, "storage: the card is back on %s\n", sd_root);
 	}
@@ -1028,14 +1281,73 @@ static void log_open_on_card(void) {
 	closedir(proc);
 }
 
-void storage_release_for_shutdown(void) {
-	if (!g_storage_cfg || !g_storage_cfg->manage_mount) {
-		return;
+void storage_cancel_update(void) {
+	pthread_mutex_lock(&card_lock);
+	bool ours = card_update_claimed;
+	if (ours) {
+		card_update_claimed = false;
+		card_released = false;
+		if (sd_root[0] && is_mounted(sd_root) && mount_is_alive(sd_root)) {
+			mount_settled(sd_root);
+			card_databases_attach(sd_root);
+		}
 	}
+	pthread_mutex_unlock(&card_lock);
+	if (ours)
+		storage_recheck_card();
+}
 
+bool storage_prepare_for_update(void) {
+	pthread_mutex_lock(&card_lock);
+	if (!g_storage_cfg || !g_storage_cfg->manage_mount || card_released || card_usb_claimed || usb_storage_active() || !sd_root[0] || !is_mounted(sd_root) || !mount_is_alive(sd_root)) {
+		pthread_mutex_unlock(&card_lock);
+		errno = EBUSY;
+		return false;
+	}
+	storage_card_revoke_locked();
+	card_released = true;
+	card_update_claimed = true;
+	card_databases_detach();
+
+	// sync() has no error result. Check this filesystem before relinquishing
+	// it, then close our own directory reference before ordinary unmount.
+	int error = 0;
+	int fd = open(sd_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0)
+		error = errno;
+	else {
+		int rc;
+		do {
+			rc = syncfs(fd);
+		} while (rc < 0 && errno == EINTR);
+		if (rc < 0)
+			error = errno;
+		if (close(fd) != 0 && !error)
+			error = errno;
+	}
+	if (!error && umount(sd_root) != 0)
+		error = errno;
+	pthread_mutex_unlock(&card_lock);
+	if (error) {
+		storage_cancel_update();
+		fprintf(stderr, "storage: update refused: card release failed: %s\n", strerror(error));
+		errno = error;
+		return false;
+	}
+	printf("storage: card synced and unmounted for the update\n");
+	return true;
+}
+
+void storage_release_for_shutdown(void) {
 	pthread_mutex_lock(&card_lock);
 	bool already = card_released;
 	card_released = true;
+	card_update_claimed = false; // Late update cancel must not undo shutdown.
+	storage_card_revoke_locked();
+	if (!g_storage_cfg || !g_storage_cfg->manage_mount) {
+		pthread_mutex_unlock(&card_lock);
+		return;
+	}
 
 	// A card handed to a computer is already off this device's hands.
 	if (already || !sd_root[0] || !is_mounted(sd_root) || usb_storage_active()) {
@@ -1104,7 +1416,7 @@ void *sd_hotplug_thread(void *arg) {
 	char buf[4096 + 1]; // +1 is for null terminator
 
 	while (1) {
-		int len = recv(sock, buf, sizeof(buf), 0);
+		int len = recv(sock, buf, sizeof(buf) - 1, 0);
 		if (len <= 0) {
 			continue;
 		}
@@ -1115,7 +1427,8 @@ void *sd_hotplug_thread(void *arg) {
 			if (strstr(buf, "add@")) {
 				printf("SD Card Inserted\n");
 				pthread_mutex_lock(&card_lock);
-				if (card_released) {
+				if (card_released || card_usb_claimed || usb_storage_active()) {
+					storage_card_revoke_locked();
 					pthread_mutex_unlock(&card_lock);
 					continue;
 				}
@@ -1131,7 +1444,7 @@ void *sd_hotplug_thread(void *arg) {
 					if (attempt) {
 						usleep(300 * 1000);
 					}
-					mounted = mount_sd(storage_cfg, runtime) == 0 && mount_is_alive(sd_root);
+					mounted = mount_sd(storage_cfg, runtime, true) == 0 && mount_is_alive(sd_root);
 				}
 
 				if (mounted) {
@@ -1148,7 +1461,9 @@ void *sd_hotplug_thread(void *arg) {
 				pthread_mutex_lock(&card_lock);
 				bool was_attached = card_attached;
 				card_databases_detach();
-				unmount_sd(storage_cfg);
+				if (!card_usb_claimed && !usb_storage_active()) {
+					unmount_sd(storage_cfg);
+				}
 				pthread_mutex_unlock(&card_lock);
 				if (was_attached) {
 					send_notification(runtime, "sd_card_removed");
@@ -1560,6 +1875,16 @@ static void run_mapped_action(keymap_button_t button) {
 	case KEYMAP_ACTION_VOLUME_DOWN:
 		apply_volume_step(KEY_VOLUMEDOWN);
 		break;
+	case KEYMAP_ACTION_FAVOURITE:
+		gui_notify_key(GUI_KEY_FAVOURITE);
+		break;
+	case KEYMAP_ACTION_NEXT_ALBUM:
+		gui_notify_key(GUI_KEY_NEXT_ALBUM);
+		break;
+	case KEYMAP_ACTION_CYCLE_MODE:
+		gui_notify_key(GUI_KEY_CYCLE_MODE);
+		break;
+	case KEYMAP_ACTION_COUNT:
 	case KEYMAP_ACTION_NONE:
 	default:
 		break;
@@ -1946,6 +2271,11 @@ static void *input_thread_func(void *arg) {
 	return NULL;
 }
 
+// The nodes given a thread at start-up, for the line that says how the
+// buttons are read (log_button_reading). Written before that line, by the
+// thread that starts the services, and read by it.
+static char button_nodes[192];
+
 static void start_input_thread_fd(const char *node, bool headset, int fd) {
 	input_node_t *info = calloc(1, sizeof(*info));
 	if (!info) {
@@ -1958,8 +2288,78 @@ static void start_input_thread_fd(const char *node, bool headset, int fd) {
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, input_thread_func, info) == 0) {
 		pthread_detach(thread);
+		size_t used = strlen(button_nodes);
+		const char *base = strrchr(node, '/');
+		snprintf(button_nodes + used, sizeof(button_nodes) - used, "%s%s", used ? ", " : "", base ? base + 1 : node);
 	} else {
 		free(info);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// How the buttons are read, said once at start-up
+//
+// Nothing in this player polls a button. Each node has a thread asleep in
+// poll() on it (input_thread_func above), woken by the kernel when a key goes
+// down or up, and by a deadline only while a key is held -- the volume repeat,
+// the power key's long press, the seek -- or a double click is being waited
+// for. With nothing held it does not wake at all, screen on or off.
+//
+// Underneath, in the kernel, there are two kinds of button:
+//   - power and next are GPIO keys (keyboard_gpio_add): an interrupt per edge,
+//     and they can wake the device from suspend;
+//   - play, volume up and volume down share a resistor ladder on the ADC
+//     (keyboard_adc_multifunc, "jz adc keyboard", on the R1; keyboard_adc on
+//     the R3 Pro II). The ADC has no interrupt for a key, so the driver reads
+//     it in a loop -- a kernel worker converts the ladder, looks the voltage up
+//     in its key table and sleeps adc_key_detectime ms -- for as long as the
+//     node is open: every 30 ms on the R1 (keyboard_adc_multifunc.sh), some 33
+//     readings a second, screen on or off. Only suspend stops it, through the
+//     driver's own suspend hook.
+//
+// That period is deliberately left alone with the screen off. A press is seen
+// only if a reading falls inside it -- the driver has no debounce to stretch
+// one -- so every millisecond added to the period is a millisecond of quick
+// taps that go unseen: at the stock 100 ms the second click of a double click
+// went missing, which is why it is 30. And the driver takes the period once,
+// when its worker starts, so changing it means closing the node and opening it
+// again: an event nobody read in between is gone, and a release the old worker
+// never reported leaves the kernel believing the key is still down, so its
+// next press is dropped as a repeat. All of that to spare an estimated few
+// hundred microseconds of CPU a second, while music plays -- the only time the
+// screen is off and the device awake for long (paused, it suspends after a
+// minute).
+//
+// The line names the nodes watched and the ladder's period as the kernel has
+// it, so a device log answers "is anything polling the buttons" by itself.
+static int adc_ladder_period_ms(void) {
+	static const char *const PARAMS[] = {
+		"/sys/module/keyboard_adc_multifunc/parameters/adc_key_detectime", // R1
+		"/sys/module/keyboard_adc/parameters/adc_key_detectime",		   // R3 Pro II
+	};
+	for (size_t i = 0; i < sizeof(PARAMS) / sizeof(PARAMS[0]); i++) {
+		FILE *f = fopen(PARAMS[i], "r");
+		if (!f) {
+			continue;
+		}
+		int ms = -1;
+		if (fscanf(f, "%d", &ms) != 1) {
+			ms = -1;
+		}
+		fclose(f);
+		if (ms > 0) {
+			return ms;
+		}
+	}
+	return -1;
+}
+
+static void log_button_reading(void) {
+	printf("input: buttons: a thread waits on each of %s (evdev events, nothing polled here)\n",
+		   button_nodes[0] ? button_nodes : "no node");
+	int ladder = adc_ladder_period_ms();
+	if (ladder > 0) {
+		printf("input: the kernel reads the play/volume key ladder every %d ms, screen on or off\n", ladder);
 	}
 }
 
@@ -2129,9 +2529,8 @@ static void start_headset_input_thread(void) {
 //
 // USB-C headphones and dongles with buttons are the same shape: usbhid builds a
 // BUS_USB node when they are plugged in and removes it when they come out. They
-// are read by the same thread, and with Bluetooth off the scan still runs, at
-// USB_INPUT_SCAN_MS. A kernel without usbhid builds no node and the scan finds
-// nothing.
+// are read by the same thread, and with Bluetooth off the scan still looks for
+// them. A kernel without usbhid builds no node and the scan finds nothing.
 // ---------------------------------------------------------------------------
 
 #define BT_INPUT_SCAN_MS 2000
@@ -2197,8 +2596,8 @@ static int bt_input_is_remote(const char *node, bool usb_only) {
 // do nothing, the log then says whether bluez built a node at all, what it
 // called it and what bus it put it on. Cheaper than a line per node per scan,
 // and it is the one dump that answers the question.
-static int bt_input_node_count(void) {
-	DIR *d = opendir("/dev/input");
+static int bt_input_node_count(const char *dir) {
+	DIR *d = opendir(dir);
 	if (!d) {
 		return -1;
 	}
@@ -2484,55 +2883,170 @@ static void *bt_input_thread_func(void *arg) {
 	return NULL;
 }
 
-static void *bt_input_scan_thread(void *arg) {
-	(void)arg;
-	int last_node_count = bt_input_node_count();
-	for (;;) {
-		// With Bluetooth off only a USB remote can appear.
-		bool usb_only = !bluetooth_get_enabled();
-		usleep((usb_only ? USB_INPUT_SCAN_MS : BT_INPUT_SCAN_MS) * 1000);
+// One look at the event nodes: a remote not yet claimed gets its thread.
+static void bt_input_scan(const char *dir, int *last_node_count) {
+	// With Bluetooth off only a USB remote can appear.
+	bool usb_only = !bluetooth_get_enabled();
 
-		int count = bt_input_node_count();
-		if (count >= 0 && count != last_node_count) {
-			// The one line, not the whole of /proc/bus/input/devices. The dump
-			// was what found the AVRCP node in the first place; now that the
-			// node announces itself below, a headset going in and out of its
-			// case would be fifty lines onto the card every couple of seconds.
-			printf("input: /dev/input changed (%d nodes -> %d)\n", last_node_count, count);
-			last_node_count = count;
-		}
+	int count = bt_input_node_count(dir);
+	if (count >= 0 && count != *last_node_count) {
+		// The one line, not the whole of /proc/bus/input/devices. The dump
+		// was what found the AVRCP node in the first place; now that the
+		// node announces itself below, a headset going in and out of its
+		// case would be fifty lines onto the card every couple of seconds.
+		printf("input: %s changed (%d nodes -> %d)\n", dir, *last_node_count, count);
+		*last_node_count = count;
+	}
 
-		DIR *d = opendir("/dev/input");
-		if (!d) {
+	DIR *d = opendir(dir);
+	if (!d) {
+		return;
+	}
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (strncmp(e->d_name, "event", 5) != 0) {
 			continue;
 		}
-		struct dirent *e;
-		while ((e = readdir(d)) != NULL) {
-			if (strncmp(e->d_name, "event", 5) != 0) {
-				continue;
-			}
-			char node[32];
-			if ((size_t)snprintf(node, sizeof(node), "/dev/input/%s", e->d_name) >= sizeof(node)) {
-				continue;
-			}
-			int bus = bt_input_is_remote(node, usb_only);
-			if (!bus || !bt_input_claim(node)) {
-				continue;
-			}
-			remote_node_t *info = calloc(1, sizeof(*info));
-			if (info) {
-				snprintf(info->node, sizeof(info->node), "%s", node);
-				info->usb = bus == BUS_USB;
-			}
-			pthread_t thread;
-			if (info && pthread_create(&thread, NULL, bt_input_thread_func, info) == 0) {
-				pthread_detach(thread);
-			} else {
-				bt_input_release(node);
-				free(info);
-			}
+		char node[32];
+		if ((size_t)snprintf(node, sizeof(node), "%s/%s", dir, e->d_name) >= sizeof(node)) {
+			continue;
 		}
-		closedir(d);
+		int bus = bt_input_is_remote(node, usb_only);
+		if (!bus || !bt_input_claim(node)) {
+			continue;
+		}
+		remote_node_t *info = calloc(1, sizeof(*info));
+		if (info) {
+			snprintf(info->node, sizeof(info->node), "%s", node);
+			info->usb = bus == BUS_USB;
+		}
+		pthread_t thread;
+		if (info && pthread_create(&thread, NULL, bt_input_thread_func, info) == 0) {
+			pthread_detach(thread);
+		} else {
+			bt_input_release(node);
+			free(info);
+		}
+	}
+	closedir(d);
+}
+
+// ---------------------------------------------------------------------------
+// Noticing a remote arrive
+//
+// The scan above used to run on a clock for as long as the player ran, every
+// two seconds with Bluetooth on and three with it off: the thread woken, the
+// directory listed and every event node opened, asked two ioctls and closed --
+// screen on or off, remote or none, for something that happens a few times a
+// day.
+//
+// /dev/input is watched instead (inotify). The node a remote brings is made
+// there -- by devtmpfs in the kernel, or by mdev -- and the making wakes this
+// thread, which looks at once and once more two seconds later: mdev may still
+// be setting the node up, and bluez can build it a moment before the
+// Bluetooth switch reads as on. A node going away wakes it too, for the log
+// line. Otherwise it sleeps, a minute at a time; the look then is only a net
+// for a node made in some way that tells nobody.
+//
+// A remote is therefore found as soon as its node exists instead of up to
+// three seconds later, and with no remote coming nothing wakes.
+//
+// [power] input_hotplug_watch = 0 goes back to the clock, and so does a kernel
+// that refuses the watch. The start-up line says which ("input: remotes ...").
+// ---------------------------------------------------------------------------
+#define INPUT_WATCH_FOLLOW_UP_MS 2000
+#define INPUT_WATCH_NET_MS 60000
+
+// Where the event nodes are. An emulator test can point it at a directory of
+// its own (SONIX_TEST_INPUT_DIR) to see the watch work on a host without one.
+static const char *remote_input_dir(void) {
+#ifdef HOST_BUILD
+	const char *dir = getenv("SONIX_TEST_INPUT_DIR");
+	if (dir && dir[0]) {
+		return dir;
+	}
+#endif
+	return "/dev/input";
+}
+
+// The watch descriptor, or -1 when the directory is to be looked at on the
+// clock instead.
+static int remote_watch_open(const char *dir) {
+	if (!config_get_int("power", "input_hotplug_watch", 1)) {
+		return -1;
+	}
+	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "input: no inotify (%s)\n", strerror(errno));
+		return -1;
+	}
+	if (inotify_add_watch(fd, dir, IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_ATTRIB) < 0) {
+		fprintf(stderr, "input: cannot watch %s (%s)\n", dir, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+// Empties the watch's queue. What the events say does not matter -- any of
+// them is a reason to look -- so they are only read away. False when the
+// descriptor has failed.
+static bool remote_watch_drain(int fd) {
+	char buf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
+	for (;;) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n > 0) {
+			continue;
+		}
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+	}
+}
+
+static void *bt_input_scan_thread(void *arg) {
+	(void)arg;
+	const char *dir = remote_input_dir();
+	int last_node_count = bt_input_node_count(dir);
+
+	int watch = remote_watch_open(dir);
+	if (watch >= 0) {
+		printf("input: remotes: %s is watched for new nodes (inotify)\n", dir);
+	} else {
+		printf("input: remotes: %s is looked at every %d s (%d s with Bluetooth off)\n", dir, BT_INPUT_SCAN_MS / 1000,
+			   USB_INPUT_SCAN_MS / 1000);
+	}
+
+	// The first look a moment after start-up either way, as it always was: a
+	// remote connected before the player started has its node already.
+	uint32_t next_look = now_ms() + BT_INPUT_SCAN_MS;
+	for (;;) {
+		if (watch < 0) {
+			bool usb_only = !bluetooth_get_enabled();
+			usleep((usb_only ? USB_INPUT_SCAN_MS : BT_INPUT_SCAN_MS) * 1000);
+			bt_input_scan(dir, &last_node_count);
+			continue;
+		}
+
+		uint32_t now = now_ms();
+		int timeout = (int32_t)(next_look - now) > 0 ? (int)(next_look - now) : 0;
+		struct pollfd pfd = {.fd = watch, .events = POLLIN};
+		int ready = poll(&pfd, 1, timeout);
+		if (ready < 0 && errno == EINTR) {
+			continue;
+		}
+		if (ready < 0 || (ready > 0 && !((pfd.revents & POLLIN) && remote_watch_drain(watch)))) {
+			// Never seen, but a watch that fails must not leave the remotes
+			// unnoticed for good, nor spin: back to the clock.
+			fprintf(stderr, "input: the watch on %s failed; looking every few seconds instead\n", dir);
+			close(watch);
+			watch = -1;
+			continue;
+		}
+
+		bt_input_scan(dir, &last_node_count);
+		next_look = now_ms() + (ready > 0 ? INPUT_WATCH_FOLLOW_UP_MS : INPUT_WATCH_NET_MS);
 	}
 	return NULL;
 }
@@ -2571,7 +3085,10 @@ void system_start_services(system_config_t *cfg, system_notification_cb_t notifi
 	g_storage_cfg = cfg->storage_cfg;
 	g_runtime = &runtime;
 
+	pthread_mutex_lock(&card_lock);
 	check_and_mount_existing_sd(cfg->storage_cfg, &runtime); // mount sd on startup, if it's present
+	card_epoch_initialized = true;
+	pthread_mutex_unlock(&card_lock);
 
 	pthread_t supervisor;
 	if (pthread_create(&supervisor, NULL, card_supervisor_thread, NULL) == 0) {
@@ -2595,6 +3112,7 @@ void system_start_services(system_config_t *cfg, system_notification_cb_t notifi
 	start_builtin_input_threads();
 	start_headset_input_thread();
 #endif
+	log_button_reading();
 	start_bt_input_scanner();
 
 	// --- Audio ---

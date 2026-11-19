@@ -538,6 +538,12 @@ typedef struct {
 	long done;
 	long total;
 	unsigned generation;
+
+	// Where it came from, for picking it up after a dropped connection
+	// (streamturn_resume); empty when the URL was too long to keep.
+	char url[2600];
+	int resumes;
+	long resumed_at;
 } download_t;
 
 // Changing track bumps this counter; threads downloading something else notice
@@ -680,6 +686,31 @@ static void download_end(download_t *d, bool ok) {
 	free(d);
 }
 
+// The connection dropped mid-download: pick it up where it stopped, in the
+// same file. See streamturn_resume() for the care taken with the stream an
+// abandon may be waking at the same moment.
+static bool download_resume(download_t *d) {
+	char who[64];
+	snprintf(who, sizeof(who), "qobuzcache: %ld", d->track_id);
+	streamturn_resume_t r = {
+		.stream = &d->stream,
+		.active_lock = &active_lock,
+		.active_stream = &active_stream,
+		.generation = current_generation,
+		.started_generation = d->generation,
+		.url = d->url,
+		.have = d->done,
+		.total = d->total,
+		.timeout_secs = FETCH_TIMEOUT_SECS,
+		.who = who,
+	};
+	if (!streamturn_resume(&r, &d->resumes)) {
+		return false;
+	}
+	d->resumed_at = d->done;
+	return true;
+}
+
 // Writes until `until` bytes are on disk (or, with until == 0, to the end of
 // the stream). Returns false when it went wrong.
 static bool download_pump(download_t *d, long until, bool *finished) {
@@ -692,7 +723,12 @@ static bool download_pump(download_t *d, long until, bool *finished) {
 		}
 
 		int n = http_stream_read(&d->stream, buf, (int)sizeof(buf));
-		if (n < 0) {
+		// An error, or an end before the promised length: the connection
+		// dropped. Reconnect for the rest rather than lose what is here.
+		if (n < 0 || (n == 0 && d->total > 0 && d->done < d->total)) {
+			if (download_resume(d)) {
+				continue;
+			}
 			return false;
 		}
 		if (n == 0) {
@@ -706,9 +742,15 @@ static bool download_pump(download_t *d, long until, bool *finished) {
 
 		// Flush before announcing the progress: without it a reader would go
 		// looking on disk for bytes still sitting in the stdio buffer.
-		fflush(d->f);
+		if (fflush(d->f) != 0) {
+			fprintf(stderr, "qobuzcache: flush failed (card full?)\n");
+			return false;
+		}
 		d->done += n;
 		growfile_progress(d->path, d->done);
+		if (d->resumes && d->done - d->resumed_at >= STREAM_RESUME_GOOD_BYTES) {
+			d->resumes = 0;
+		}
 
 		if (until == 0 && *finished) {
 			break;
@@ -719,10 +761,14 @@ static bool download_pump(download_t *d, long until, bool *finished) {
 
 // The rest of the download, after playback has started.
 static void *download_thread(void *arg) {
-	// Background priority, like every other worker: there is one core, and a
-	// thread writing to the card at full priority takes it away from the UI.
-	// That was half the reason the UI stuttered.
-	thread_be_background("qobuz download");
+	// Below the interface and the audio threads, so the TLS and the card
+	// writes give way to them on this single core -- a thread writing to the
+	// card at full priority was half the reason the interface stuttered. But
+	// not idle class: playback reads this file as it grows, and with Bluetooth
+	// encoding and a decoder busy an idle-class thread gets well under one
+	// percent of the core, so the music caught up with the download and
+	// stopped to refill. As yandexcache.c's download since 1.2.4.
+	thread_be_low_priority("qobuz download");
 
 	download_t *d = arg;
 	bool finished = false;
@@ -764,6 +810,9 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 		return false;
 	}
 	d->track_id = track_id;
+	if (url && strlen(url) < sizeof(d->url)) {
+		snprintf(d->url, sizeof(d->url), "%s", url);
+	}
 	qobuzcache_path(track_id, mime, d->path, sizeof(d->path));
 	marker_path(d->path, d->marker, sizeof(d->marker));
 
@@ -820,6 +869,9 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 		return false;
 	}
 
+	// Reads from here on time out sooner than the open: see
+	// STREAM_READ_TIMEOUT_SECS.
+	http_stream_set_read_timeout(&d->stream, STREAM_READ_TIMEOUT_SECS);
 	d->total = d->stream.content_length;
 	prune(d->total > 0 ? d->total : 0);
 

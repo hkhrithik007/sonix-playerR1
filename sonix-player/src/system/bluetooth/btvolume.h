@@ -11,9 +11,9 @@
 //     /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsrc/sink
 //
 // with two writable properties on org.bluealsa.PCM1 that decide everything
-// here. Volume is a 16-bit word -- the left channel in the upper byte, the
-// right in the lower, the top bit of each a mute switch and the remaining seven
-// a level from 0 to 127. SoftVolume says who applies it:
+// here. BlueALSA 4 packs stereo Volume into a 16-bit word; BlueALSA 5 uses one
+// byte per channel. In both formats the high bit mutes and the remaining seven
+// bits hold a level from 0 to 127. SoftVolume says who applies it:
 //
 //   SoftVolume = false  bluealsa passes the level on as an AVRCP absolute
 //                       volume, so it lands on the headphones themselves and
@@ -33,6 +33,15 @@
 // says so itself, through PropertiesChanged, the moment it happens. The command
 // line stays as the fallback for writing (see bluetooth.c) in case this path is
 // not there at all.
+//
+// When the stream goes and comes back. A restart of bluealsa (a change of the
+// LDAC quality, the AAC mode or the link rate) is heard as NameOwnerChanged,
+// and the new daemon is on the bus seconds before the headphones have
+// reconnected to it; a codec or rate change builds a new stream object behind
+// the same path. The arrival of the object itself is heard as InterfacesAdded,
+// and that is what binds it again -- SoftVolume written, the headphones' level
+// taken again after a restart -- exactly as on a new connection. Until it
+// arrives the stream is waited for, not written off.
 //
 // Threading: one worker owns every call, so no other thread ever blocks on the
 // bus. Signals arrive on the dbuslite reader thread and are only recorded.

@@ -22,4 +22,7 @@ void audiobooks_init(gui_config_t *cfg);
 // caller decides whether it comes up.
 void audiobooks_play_at(const char *book, const char *file, double seconds);
 
+void audiobooks_resume_book(const char *book);
+void audiobooks_open_continue(void);
+
 #endif /* AUDIOBOOKS_H */

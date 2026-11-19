@@ -47,6 +47,8 @@ extern lv_obj_t *podcastcard_feed_screen;
 // The podcasts on the card, alphabetically, the loose files last. Reads the
 // card: call when a list is about to be drawn, not on every frame.
 int podcastcard_shows(podcastcard_show_t *out, int max);
+// GUI-thread-only snapshot of pending publication found by the last shows scan.
+bool podcastcard_scan_pending(void);
 
 // The name a show is listed under: its folder's, or "Other episodes".
 const char *podcastcard_show_name(const podcastcard_show_t *show);

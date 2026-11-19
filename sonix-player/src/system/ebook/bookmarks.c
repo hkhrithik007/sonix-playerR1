@@ -66,7 +66,7 @@ bool bookmark_get(const char *book_path, int index, bookmark_t *out) {
 
 	char key[48];
 	entry_key(book_path, index, key, sizeof(key));
-	const char *value = config_store_get(config_ebook_store(), SECTION, key, "");
+	const char *value = config_store_get_copy(config_ebook_store(), SECTION, key, "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if (!value || !value[0]) {
 		return false;
 	}

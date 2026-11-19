@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -49,9 +50,9 @@ static int marks_count;
 static int marks_head; // next slot to write
 
 static pthread_t thread;
-static bool live;			// a thread exists and has not been joined
-static volatile bool done;	// it has returned
-static volatile bool stop_flag;
+static bool live;		 // a thread exists and has not been joined
+static atomic_bool done; // it has returned
+static atomic_bool stop_flag;
 
 static int16_t click_strong[CLICK_FRAMES];
 static int16_t click_weak[CLICK_FRAMES];
@@ -190,8 +191,7 @@ static void *clicker_main(void *unused) {
 		// The write returned with the buffer full again, so the last frame of
 		// the chunk is heard one buffer from now, and the others before it.
 		for (int i = 0; i < found_count; i++) {
-			found[i].heard_us =
-				written_at + (uint64_t)BUFFER_MS * 1000u - (uint64_t)(CHUNK - offsets[i]) * 1000000u / RATE;
+			found[i].heard_us = written_at + (uint64_t)BUFFER_MS * 1000u - (uint64_t)(CHUNK - offsets[i]) * 1000000u / RATE;
 			publish(&found[i]);
 		}
 	}

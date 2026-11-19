@@ -10,8 +10,10 @@
 #include "src/system/net/http.h"
 #include "src/system/core/json.h"
 #include "src/system/core/md5.h"
+#include "src/system/streaming/qobuzsync.h"
 #include "src/system/streaming/streamkeys.h"
 #include "src/system/core/lang.h"
+#include "src/system/streaming/streamerr.h"
 
 // Base address. Configurable for one reason only: pointing it at a fake server
 // exercises the whole flow without a subscription (see tools/fake_qobuz.py).
@@ -55,7 +57,12 @@ static void clear_error(void) { last_error[0] = '\0'; }
 // ---------------------------------------------------------------------------
 
 void qobuz_init(void) {
-	snprintf(base_url, sizeof(base_url), "%s", config_get("qobuz", "base_url", QOBUZ_BASE_DEFAULT));
+	// Into the provider registry first, whatever the keys say: the cache is
+	// the service's as soon as there is a card, and the exit paths must clear
+	// it even when Qobuz is not configured.
+	qobuzsync_register_provider();
+
+	snprintf(base_url, sizeof(base_url), "%s", config_get_copy("qobuz", "base_url", QOBUZ_BASE_DEFAULT, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 
 	const char *id = streamkeys_qobuz_app_id();
 	const char *secret = streamkeys_qobuz_app_secret();
@@ -64,8 +71,8 @@ void qobuz_init(void) {
 
 	// The token only, never the password: when it expires it is asked for once,
 	// and meanwhile nothing on disk is worth an account login.
-	snprintf(auth_token, sizeof(auth_token), "%s", config_get("qobuz", "token", ""));
-	snprintf(display_name, sizeof(display_name), "%s", config_get("qobuz", "user", ""));
+	snprintf(auth_token, sizeof(auth_token), "%s", config_get_copy("qobuz", "token", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
+	snprintf(display_name, sizeof(display_name), "%s", config_get_copy("qobuz", "user", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 
 	format_id = (int)config_get_int("qobuz", "format", QOBUZ_FORMAT_HIRES192);
 	if (format_id != QOBUZ_FORMAT_MP3 && format_id != QOBUZ_FORMAT_CD && format_id != QOBUZ_FORMAT_HIRES96 &&
@@ -119,12 +126,34 @@ static void build_headers(char *out, size_t size, const char *extra) {
 	}
 }
 
+// True when `text` contains `word`, ignoring case (ASCII).
+static bool mentions(const char *text, const char *word) {
+	size_t n = strlen(word);
+	for (; *text; text++) {
+		size_t i = 0;
+		while (i < n && text[i] && (text[i] | 0x20) == (word[i] | 0x20)) {
+			i++;
+		}
+		if (i == n) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Qobuz reports an error as {"status":"error","message":"...","code":401}. The
 // message is written for a human and beats anything invented here.
 static bool note_api_error(const json_doc_t *doc, int status) {
 	int root = json_root(doc);
 	char message[200] = "";
 	if (json_obj_str(doc, root, "message", message, sizeof(message)) && message[0]) {
+		// "Invalid or missing app_id parameter", "Invalid Request Signature":
+		// the application keys in the firmware, not the user's account, which
+		// a status code alone (400, 401) would blame. See streamerr.h.
+		if (mentions(message, "app_id") || mentions(message, "app id") || mentions(message, "signature") ||
+			mentions(message, "app secret")) {
+			streamerr_hint(STREAM_ERR_KEYS);
+		}
 		set_error("%s", message);
 		return true;
 	}
@@ -140,6 +169,7 @@ static bool api_call(const char *url, const char *extra_headers, char **body, js
 
 	if (!qobuz_configured()) {
 		set_error("%s", tr("api_keys_unavailable"));
+		streamerr_hint(STREAM_ERR_KEYS);
 		return false;
 	}
 

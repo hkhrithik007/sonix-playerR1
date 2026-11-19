@@ -29,7 +29,7 @@ static const keymap_action_t DEFAULTS[KEYMAP_BTN_COUNT] = {
 // The config stores the name, not the number: a readable file is half the
 // reason this player writes .ini instead of bytes.
 static const char *const ACTION_KEYS[KEYMAP_ACTION_COUNT] = {
-	"none", "play_pause", "prev", "next", "volume_up", "volume_down",
+	"none", "play_pause", "prev", "next", "volume_up", "volume_down", "favourite", "next_album", "cycle_mode",
 };
 
 static keymap_action_t action_from_key(const char *name, keymap_action_t fallback) {
@@ -61,11 +61,11 @@ static keymap_button_t button_from_key(const char *name) {
 
 void keymap_init(void) {
 	for (int i = 0; i < KEYMAP_BTN_COUNT; i++) {
-		const char *saved = config_get("keys", KEYS[i], NULL);
+		const char *saved = config_get_copy("keys", KEYS[i], NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 		actions[i] = action_from_key(saved, DEFAULTS[i]);
 	}
-	double_button = button_from_key(config_get("keys", "double_button", NULL));
-	double_action = action_from_key(config_get("keys", "double_action", NULL), KEYMAP_ACTION_NONE);
+	double_button = button_from_key(config_get_copy("keys", "double_button", NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
+	double_action = action_from_key(config_get_copy("keys", "double_action", NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), KEYMAP_ACTION_NONE);
 }
 
 keymap_button_t keymap_double_button(void) { return double_button; }
@@ -111,7 +111,8 @@ void keymap_set(keymap_button_t button, keymap_action_t action) {
 // entry that never reaches the language files stays untranslated in every
 // language, and nobody notices until a user of that language sees it.
 static const char *const KEYMAP_ACTION_NAMES[KEYMAP_ACTION_COUNT] = {
-	"keymap_nothing", "keymap_play_pause", "keymap_previous_track", "keymap_next_track", "keymap_volume_up", "keymap_volume_down",
+	"keymap_nothing",	 "keymap_play_pause",		 "keymap_previous_track", "keymap_next_track", "keymap_volume_up",
+	"keymap_volume_down", "keymap_add_to_favourites", "keymap_next_album",		 "keymap_cycle_mode",
 };
 
 const char *keymap_action_name(keymap_action_t action) {

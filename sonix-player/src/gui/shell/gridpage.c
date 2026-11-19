@@ -8,14 +8,20 @@
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
+#include "src/gui/shell/sx_card.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/usb.h"
 
-#define GRID_GAP 14
-#define TILE_RADIUS 12 // Adwaita card radius
+// 2.0 tiles (sx_tokens.h): 12 px apart, 20 px corners, and a height worked
+// out from the room there is, the mini player's slot included, kept between
+// SX_TILE_H_MIN and the page's maximum.
+#define GRID_GAP SX_TILE_GAP
+#define TILE_RADIUS SX_TILE_R
 
 static void unavailable_cb(lv_event_t *e) {
 	if (player_sheet_drag_active() || switcher_back_drag_active() || coverflow_drag_active()) {
@@ -40,9 +46,37 @@ static void action_cb(lv_event_t *e) {
 	action();
 }
 
+static void target_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active() || coverflow_drag_active())
+		return;
+	// Provider pages are created lazily, after Home has already been drawn.
+	// Resolve the screen after construction rather than capturing a null root.
+	gui_init_rest();
+	lv_obj_t **target = lv_event_get_user_data(e);
+	if (target && *target)
+		switch_screen(*target);
+}
+
 // The two children add_tile() puts on every tile, in the order it makes them.
 #define TILE_ICON_CHILD 0
 #define TILE_LABEL_CHILD 1
+#define TILE_SUBTITLE_CHILD 2
+
+static void refresh_subtitles(lv_obj_t *grid) {
+	for (uint32_t i = 0; i < lv_obj_get_child_count(grid); i++) {
+		lv_obj_t *tile = lv_obj_get_child(grid, i);
+		if (lv_obj_get_child_count(tile) <= TILE_SUBTITLE_CHILD)
+			continue;
+		lv_obj_t *sub = lv_obj_get_child(tile, TILE_SUBTITLE_CHILD);
+		void (*fill)(char *, size_t) = (void (*)(char *, size_t))lv_obj_get_user_data(sub);
+		char text[96] = "";
+		if (fill)
+			fill(text, sizeof(text));
+		sx_set_text(sub, text);
+	}
+}
+
+static void grid_load_cb(lv_event_t *e) { refresh_subtitles(lv_event_get_user_data(e)); }
 
 void gridpage_set_tile(lv_obj_t *grid, int index, const lv_image_dsc_t *icon, const char *label) {
 	if (!grid || index < 0 || index >= (int)lv_obj_get_child_count(grid)) {
@@ -61,20 +95,31 @@ void gridpage_set_tile(lv_obj_t *grid, int index, const lv_image_dsc_t *icon, co
 }
 
 static void add_tile(lv_obj_t *grid, const grid_entry_t *entry, int width, int height) {
+	if (!entry->label) {
+		lv_obj_t *spacer = lv_obj_create(grid);
+		lv_obj_remove_style_all(spacer);
+		lv_obj_set_size(spacer, width, height);
+		lv_obj_set_clickable(spacer, false);
+		lv_obj_set_scrollable(spacer, false);
+		lv_obj_set_event_bubble(spacer, true);
+		return;
+	}
 	lv_obj_t *tile = lv_btn_create(grid);
 	lv_obj_set_size(tile, width, height);
-	lv_obj_add_style(tile, &theme_style_card, 0);
-	lv_obj_add_style(tile, &theme_style_card_pressed, LV_STATE_PRESSED);
+	lv_obj_add_style(tile, &sx_style_panel, 0);
+	sx_card_frame(tile);
+	lv_obj_add_style(tile, &sx_style_panel_press, LV_STATE_PRESSED);
+	lv_obj_add_style(tile, &sx_style_panel_press, LV_STATE_PRESSED);
 	lv_obj_set_style_radius(tile, TILE_RADIUS, 0);
 	lv_obj_set_style_shadow_width(tile, 0, 0);
-	lv_obj_set_style_pad_all(tile, 8, 0);
+	lv_obj_set_style_pad_all(tile, SX_TILE_PAD, 0);
 
 	// Presses bubble up to the grid so a swipe can start on a tile: the whole
 	// page has to be draggable, not just the gaps between the tiles.
 	lv_obj_set_event_bubble(tile, true);
 
 	lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 	lv_obj_set_style_pad_gap(tile, 8, 0);
 	lv_obj_set_scrollable(tile, false);
 
@@ -83,24 +128,36 @@ static void add_tile(lv_obj_t *grid, const grid_entry_t *entry, int width, int h
 	lv_obj_t *icon = lv_image_create(tile);
 	lv_image_set_src(icon, entry->icon);
 
-	// The caption wraps rather than running out of the tile: a translated label
-	// such as "Album-Interpreten" does not fit on one line. Centred, because a
-	// tile is read as a block under its picture.
+	lv_obj_add_style(icon, &sx_style_panel_icon_action, 0);
+	lv_obj_set_ignore_layout(icon, true);
+	lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 0, 1);
+
 	lv_obj_t *label = lv_label_create(tile);
-	lv_label_set_text(label, tr(entry->label));
-	lv_obj_add_style(label, &theme_style_text, 0);
+	lv_obj_add_style(label, &sx_style_panel_text, 0);
 	lv_obj_set_style_text_font(label, &font_ui_24_bold, 0);
-	lv_obj_set_width(label, lv_pct(100));
-	lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_set_width(label, width - 2 * SX_TILE_PAD);
+	lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+	lv_obj_set_ignore_layout(label, true);
+	lv_obj_set_style_max_height(label, 2 * lv_font_get_line_height(&font_ui_24_bold), 0);
+	lv_obj_align(label, LV_ALIGN_BOTTOM_LEFT, 0, -SX_TILE_SUB_H - 4);
+	lv_label_set_text(label, tr(entry->label));
+	// Keep the approved subtitle slot, even on tiles without metadata.
+	lv_obj_t *subtitle = sx_label(tile, &font_ui_20, &sx_style_panel_text2);
+	lv_obj_set_size(subtitle, width - 2 * SX_TILE_PAD, SX_TILE_SUB_H);
+	lv_obj_set_ignore_layout(subtitle, true);
+	lv_obj_align(subtitle, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+	lv_label_set_long_mode(subtitle, LV_LABEL_LONG_DOT);
+	lv_obj_set_user_data(subtitle, (void *)entry->subtitle);
 
 	if (entry->target) {
-		lv_obj_add_event_cb(tile, switch_screen_cb, LV_EVENT_CLICKED, *entry->target);
+		lv_obj_add_event_cb(tile, target_cb, LV_EVENT_CLICKED, entry->target);
 	} else if (entry->action) {
 		lv_obj_add_event_cb(tile, action_cb, LV_EVENT_CLICKED, (void *)entry->action);
 	} else {
 		lv_obj_add_event_cb(tile, unavailable_cb, LV_EVENT_CLICKED, (void *)entry->label);
 		lv_obj_set_style_opa(icon, LV_OPA_40, 0);
-		lv_obj_add_style(label, &theme_style_text_dim, 0);
+		lv_obj_add_style(label, &sx_style_panel_text2, 0);
 	}
 }
 
@@ -111,16 +168,16 @@ void gridpage_set_entries(lv_obj_t *grid, gui_config_t *cfg, const grid_entry_t 
 	}
 	lv_obj_clean(grid);
 
-	int top = clear_corner_buttons ? settingsrow_content_top(cfg) : cfg->top_bar_height;
-	int usable_w = cfg->screen_width - (2 * cfg->padding);
-	int usable_h = (cfg->screen_height - top) - (2 * cfg->padding);
-
+	(void)rows;
+	(void)clear_corner_buttons;
+	int usable_w = cfg->screen_width - SX_BODY_PAD_L - SX_BODY_PAD_R;
 	int tile_w = (usable_w - (columns - 1) * GRID_GAP) / columns;
-	int tile_h = (usable_h - (rows - 1) * GRID_GAP) / rows;
+	int tile_h = cfg->screen_height >= 800 ? SX_TILE_H_R1 : SX_TILE_H_R3;
 
 	for (int i = 0; i < count; i++) {
 		add_tile(grid, &entries[i], tile_w, tile_h);
 	}
+	refresh_subtitles(grid);
 }
 
 lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t *entries, int count, int columns,
@@ -135,9 +192,14 @@ lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t
 	lv_obj_set_style_bg_opa(grid, 0, 0);
 	lv_obj_set_style_border_width(grid, 0, 0);
 	lv_obj_set_style_radius(grid, 0, 0);
-	lv_obj_set_style_pad_all(grid, cfg->padding, 0);
+	lv_obj_set_style_pad_all(grid, SX_BODY_PAD_L, 0);
+	// Under a 2.0 header the body starts at SX_BODY_TOP itself, with no margin
+	// of its own above the first row.
+	if (clear_corner_buttons) {
+		lv_obj_set_style_pad_top(grid, 0, 0);
+	}
 	lv_obj_set_style_pad_gap(grid, GRID_GAP, 0);
-	lv_obj_set_scrollable(grid, false);
+	gridpage_set_scrolling(grid);
 
 	lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
 	// START on the main axis, not CENTER: the tile size is computed for a full
@@ -147,6 +209,8 @@ lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t
 	lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
 	gridpage_set_entries(grid, cfg, entries, count, columns, rows, clear_corner_buttons);
+	lv_obj_add_event_cb(screen, grid_load_cb, LV_EVENT_SCREEN_LOAD_START, grid);
+	lv_obj_add_event_cb(screen, grid_load_cb, LV_EVENT_REFRESH, grid);
 
 	// The player can be pulled in from any tiled page.
 	player_sheet_attach_drag(grid, true);
@@ -249,22 +313,23 @@ lv_obj_t *gridpage_empty_panel(lv_obj_t *screen, gui_config_t *cfg, const lv_ima
 	lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
 	lv_obj_set_width(label, lv_pct(100));
 	lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-	lv_obj_add_style(label, &theme_style_text_dim, 0);
+	lv_obj_add_style(label, &sx_style_panel_text2, 0);
 	lv_obj_set_style_text_font(label, &font_ui_24, 0);
 
 	lv_obj_t *button = lv_btn_create(panel);
 	lv_obj_set_size(button, 240, 68);
-	lv_obj_add_style(button, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_bg_color(button, theme()->accent, 0);
+	// The accent with its own ink (sx_style_accent): white on the 2.0 dark
+	// theme's light accent was barely readable.
+	lv_obj_add_style(button, &sx_style_accent, 0);
+	lv_obj_add_style(button, &sx_style_panel_press, LV_STATE_PRESSED);
 	lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
-	lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_radius(button, SX_CARD_R, 0);
 	lv_obj_set_style_shadow_width(button, 0, 0);
 	lv_obj_add_event_cb(button, scan_cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *button_label = lv_label_create(button);
 	lv_label_set_text(button_label, tr("scan"));
 	lv_obj_set_style_text_font(button_label, &font_ui_24, 0);
-	lv_obj_set_style_text_color(button_label, lv_color_white(), 0);
 	lv_obj_center(button_label);
 
 	empty_panel_t *state = calloc(1, sizeof(*state));
@@ -344,8 +409,6 @@ void gridpage_show_empty(lv_obj_t *grid, lv_obj_t *panel, bool empty) {
 			empty_panel_say(panel, state->icon, state->text, true);
 		}
 		if (empty) {
-			// The accent may have changed since the panel was built.
-			lv_obj_set_style_bg_color(lv_obj_get_child(panel, 2), theme()->accent, 0);
 			lv_obj_set_hidden(panel, false);
 		} else {
 			lv_obj_set_hidden(panel, true);

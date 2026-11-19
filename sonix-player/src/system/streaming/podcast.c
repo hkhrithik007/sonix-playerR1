@@ -7,10 +7,10 @@
 #include <time.h>
 
 #include "src/system/core/config.h"
-#include "src/system/net/http.h"
 #include "src/system/core/json.h"
 #include "src/system/core/lang.h"
 #include "src/system/core/sha1.h"
+#include "src/system/net/http.h"
 #include "src/system/streaming/podcastrss.h"
 #include "src/system/streaming/podcastsubs.h"
 #include "src/system/streaming/streamkeys.h"
@@ -42,8 +42,6 @@ bool podcast_configured(void) { return streamkeys_podcast_key() && streamkeys_po
 // since the directory has no offset, so the right limit here is the API's and
 // not that of a single on-screen page.
 #define PODCAST_API_MAX 1000
-
-static const char *api_base(void) { return config_get("podcast", "api_base", PODCAST_API_DEFAULT); }
 
 // The ISO code of the interface language, so a user running the player in
 // Italian does not get an all-English chart. The directory takes a
@@ -116,7 +114,7 @@ static char *api_get(const char *path) {
 			 key, now, signature);
 
 	char url[PODCAST_URL_MAX + 256];
-	snprintf(url, sizeof(url), "%s%s", api_base(), path);
+	snprintf(url, sizeof(url), "%s%s", config_get_copy("podcast", "api_base", PODCAST_API_DEFAULT, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), path);
 
 	char *body = NULL;
 	size_t len = 0;
@@ -284,9 +282,7 @@ static int fetch_list(const char *path, const char *array_key, void *out, int ma
 // ---------------------------------------------------------------------------
 
 // Whether a query is the address of a feed rather than words to search for.
-static bool looks_like_address(const char *query) {
-	return strncasecmp(query, "http://", 7) == 0 || strncasecmp(query, "https://", 8) == 0;
-}
+static bool looks_like_address(const char *query) { return strncasecmp(query, "http://", 7) == 0 || strncasecmp(query, "https://", 8) == 0; }
 
 int podcast_search(const char *query, podcast_feed_t *out, int max) {
 	if (!query || !query[0] || !out || max <= 0) {

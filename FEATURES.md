@@ -185,8 +185,6 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Brightness** down to 1%, **screen-off time**, **double tap to wake**, and **rotate the screen** by 180°.
 - **Screensaver** - shows the cover of what is playing, or pictures from the `Screensaver` folder.
   > Pictures must be JPEG (not progressive), portrait, and no larger than 480x720 on the R3 Pro II or 480x800 on the R1.
-- **Boot logo** - the default one follows your theme and accent colour, or pick your own picture.
-  > Put JPEG or PNG pictures in the `Bootlogo` folder. They are cropped to fill the screen.
 
 ## Power and battery
 

@@ -1,4 +1,6 @@
 #include "ebookpage.h"
+#include "src/gui/shell/artview.h"
+#include "src/gui/shell/sx_palette.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -100,13 +102,16 @@ static bool cover_ready(int index, const char *title, const cover_image_t *cover
 			lv_label_set_text(entry->label, entry->name);
 		}
 	}
+	if (entry->glyph)
+		lv_obj_set_style_bg_color(lv_obj_get_parent(entry->glyph), sx_placeholder_name(entry->name), 0);
 	if (!cover || !entry->image) {
 		return false;
 	}
 	// Kept: freed by shelf_free() with everything else.
 	entry->cover = *cover;
 	entry->has_cover = true;
-	lv_image_set_src(entry->image, &entry->cover.dsc);
+	lv_obj_set_hidden(entry->image, false);
+	sx_artview_bind(entry->image, &entry->cover.dsc, entry->cover.display_generation);
 	lv_obj_set_hidden(entry->image, false);
 	return true;
 }
@@ -163,7 +168,9 @@ static void worker_begin(void) {
 static void shelf_theme_refresh(void) {
 	for (int i = 0; i < shelf_count; i++) {
 		if (shelf[i].glyph) {
-			lv_obj_set_style_image_recolor(shelf[i].glyph, theme()->text_secondary, 0);
+			lv_color_t tone = sx_placeholder_name(shelf[i].name);
+			lv_obj_set_style_bg_color(lv_obj_get_parent(shelf[i].glyph), tone, 0);
+			lv_obj_set_style_image_recolor(shelf[i].glyph, sx_placeholder_ink(tone), 0);
 		}
 	}
 }
@@ -177,7 +184,7 @@ static void shelf_free(void) {
 	}
 	for (int i = 0; i < shelf_count; i++) {
 		if (shelf[i].has_cover) {
-			cover_free(&shelf[i].cover);
+			sx_artview_release_cover(&shelf[i].cover);
 		}
 	}
 	shelf_count = 0;
@@ -234,7 +241,7 @@ static void build_tiles(void) {
 
 		lv_obj_t *tile = lv_obj_create(grid);
 		lv_obj_remove_style_all(tile);
-		lv_obj_set_size(tile, cover_w, cover_h + 46);
+		lv_obj_set_size(tile, cover_w, cover_h + 8 + 2 * lv_font_get_line_height(&font_ui_22_bold));
 		lv_obj_set_scrollable(tile, false);
 		lv_obj_set_clickable(tile, true);
 		// The press has to reach the page under the tile as well as the tile:
@@ -243,7 +250,7 @@ static void build_tiles(void) {
 		// the end of a drag, so the two do not fight.
 		lv_obj_set_event_bubble(tile, true);
 		lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
-		lv_obj_set_style_pad_row(tile, 6, 0);
+		lv_obj_set_style_pad_row(tile, 8, 0);
 		lv_obj_add_event_cb(tile, open_book_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
 		// What is there before the cover arrives, and what stays when the book
@@ -253,7 +260,9 @@ static void build_tiles(void) {
 		lv_obj_remove_style_all(plate);
 		lv_obj_set_size(plate, cover_w, cover_h);
 		lv_obj_add_style(plate, &theme_style_card, 0);
-		lv_obj_set_style_radius(plate, 8, 0);
+		lv_obj_set_style_radius(plate, 12, 0);
+		lv_obj_set_style_clip_corner(plate, true, 0);
+		lv_obj_set_style_bg_color(plate, sx_placeholder_name(entry->name), 0);
 		lv_obj_set_style_border_width(plate, 0, 0);
 		lv_obj_set_style_shadow_width(plate, 0, 0);
 		lv_obj_set_scrollable(plate, false);
@@ -265,9 +274,9 @@ static void build_tiles(void) {
 		// Stored white, like every glyph drawn from an SVG, so it has to be
 		// recoloured or it is a white shape on a white card. Faint on purpose:
 		// it is what is there instead of a cover, not something to look at.
-		lv_obj_set_style_image_recolor(glyph, theme()->text_secondary, 0);
+		lv_obj_set_style_image_recolor(glyph, sx_placeholder_ink(sx_placeholder_name(entry->name)), 0);
 		lv_obj_set_style_image_recolor_opa(glyph, LV_OPA_COVER, 0);
-		lv_obj_set_style_image_opa(glyph, LV_OPA_50, 0);
+		lv_obj_set_style_image_opa(glyph, LV_OPA_90, 0);
 		entry->glyph = glyph;
 
 		entry->image = lv_image_create(plate);
@@ -280,7 +289,8 @@ static void build_tiles(void) {
 		lv_obj_set_width(entry->label, cover_w);
 		lv_label_set_text(entry->label, entry->name);
 		lv_obj_add_style(entry->label, &theme_style_text, 0);
-		lv_obj_set_style_text_font(entry->label, &font_ui_18, 0);
+		lv_obj_set_style_text_font(entry->label, &font_ui_22_bold, 0);
+		lv_obj_set_height(entry->label, 2 * lv_font_get_line_height(&font_ui_22_bold));
 		lv_obj_set_style_text_align(entry->label, LV_TEXT_ALIGN_CENTER, 0);
 		lv_obj_set_event_bubble(entry->label, true);
 

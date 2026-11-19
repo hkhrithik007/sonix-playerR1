@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <linux/rtc.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,9 +105,13 @@ static char zone_rule[ZONE_TEXT_MAX];
 // Automatic or manual, [clock] automatic. On unless switched off: before there
 // was a choice the network was always asked, and a device updated from then
 // keeps doing so.
-static bool auto_on = true;
+static atomic_bool auto_on = true;
 
-static bool zone_active(void) { return auto_on && zone_rule[0]; }
+static atomic_bool zone_enabled;
+
+bool clock_zone_lookup_enabled(void) { return zone_enabled; }
+
+static bool zone_active(void) { return auto_on && zone_enabled && zone_rule[0]; }
 
 // Daylight saving, kept apart from the offset. See clock.h: the list says
 // where, this says when, and the system gets the sum.
@@ -365,29 +370,43 @@ void clock_set_auto(bool on) {
 		config_set_int("clock", "utc_offset_minutes", tz_offset_minutes);
 		config_set_int("clock", "dst", tz_dst ? 1 : 0);
 	}
+	pthread_mutex_lock(&ntp_lock);
 	auto_on = on;
+	pthread_mutex_unlock(&ntp_lock);
 	config_set_bool("clock", "automatic", on);
 	config_save();
 	tz_refresh();
 }
 
-static void (*change_hook)(void);
+void clock_set_zone_lookup(bool on) {
+	if (on == zone_enabled)
+		return;
+	if (!on && zone_active()) {
+		tz_offset_minutes = zone_standard_minutes();
+		tz_dst = offset_at(time(NULL)) > tz_offset_minutes;
+		config_set_int("clock", "utc_offset_minutes", tz_offset_minutes);
+		config_set_int("clock", "dst", tz_dst ? 1 : 0);
+	}
+	zone_enabled = on;
+	config_set_bool("clock", "zone_automatic", on);
+	config_save();
+	tz_refresh();
+}
+
+static _Atomic(void (*)(void)) change_hook;
 
 void clock_set_change_hook(void (*hook)(void)) { change_hook = hook; }
 
 static void notify_change(void) {
-	if (change_hook) {
-		change_hook();
+	void (*hook)(void) = atomic_load(&change_hook);
+	if (hook) {
+		hook();
 	}
 }
 
-// The IANA name of the zone the device is in, from its public address. Two
-// services, the second only when the first does not answer: neither needs a
-// key, and both name the zone the way the tz database does. Plain HTTP first,
-// which answers in a fraction of the time a TLS handshake takes on this CPU.
+// Optional IANA zone lookup from the public address, using HTTPS only.
 static bool zone_locate(char *out, size_t size) {
 	static const char *const SOURCES[] = {
-		"http://ip-api.com/json/?fields=status,timezone",
 		"https://get.geojs.io/v1/ip/geo.json",
 	};
 	for (size_t i = 0; i < sizeof(SOURCES) / sizeof(SOURCES[0]); i++) {
@@ -437,7 +456,7 @@ static void *ntp_worker(void *unused) {
 	(void)unused;
 
 	pthread_t zone_thread;
-	bool zone_started = auto_on && pthread_create(&zone_thread, NULL, zone_worker, NULL) == 0;
+	bool zone_started = auto_on && zone_enabled && pthread_create(&zone_thread, NULL, zone_worker, NULL) == 0;
 
 	time_t before = time(NULL);
 
@@ -483,15 +502,19 @@ static void *ntp_worker(void *unused) {
 // Starts an attempt unless one is running, or, without `force`, one was made
 // in the last half hour. True when one is running now.
 static bool network_sync_start(bool force) {
+#ifdef HOST_BUILD
+	// The simulator must never invoke ntpdate to change the workstation clock.
+	return false;
+#endif
 	if (access(NTPDATE_BIN, X_OK) != 0) {
 		return false; // not this firmware
 	}
 
-	time_t now = time(NULL);
+	time_t now = boottime_now();
 
 	pthread_mutex_lock(&ntp_lock);
 	bool running = ntp_running;
-	bool skip = running || (!force && ntp_last_attempt != 0 && now - ntp_last_attempt < NTP_MIN_INTERVAL_SECONDS);
+	bool skip = running || (!force && (!auto_on || (ntp_last_attempt != 0 && now - ntp_last_attempt < NTP_MIN_INTERVAL_SECONDS)));
 	if (!skip) {
 		ntp_running = true;
 		ntp_last_attempt = now;
@@ -613,12 +636,13 @@ void clock_init(void) {
 		tz_dst = config_get_bool("clock", "dst", false);
 	}
 	auto_on = config_get_bool("clock", "automatic", true);
+	zone_enabled = config_get_bool("clock", "zone_automatic", false);
 
 	// The located zone's rule as this build knows it, which may be newer than
 	// the one written down; the written one when the name is not in the table.
-	snprintf(zone_name, sizeof(zone_name), "%s", config_get("clock", "zone", ""));
+	snprintf(zone_name, sizeof(zone_name), "%s", config_get_copy("clock", "zone", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 	const char *rule = tzrules_lookup(zone_name);
-	snprintf(zone_rule, sizeof(zone_rule), "%s", rule ? rule : (zone_name[0] ? config_get("clock", "zone_rule", "") : ""));
+	snprintf(zone_rule, sizeof(zone_rule), "%s", rule ? rule : (zone_name[0] ? config_get_copy("clock", "zone_rule", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE) : ""));
 
 	if (clock_utc_offset_known()) {
 		tz_refresh();
@@ -702,8 +726,14 @@ bool clock_set(int year, int month, int day, int hour, int minute) {
 	}
 
 	struct timeval tv = {.tv_sec = when, .tv_usec = 0};
+	pthread_mutex_lock(&ntp_lock);
+	if (ntp_running) {
+		pthread_mutex_unlock(&ntp_lock);
+		return false;
+	}
 	if (settimeofday(&tv, NULL) != 0) {
 		perror("clock: settimeofday");
+		pthread_mutex_unlock(&ntp_lock);
 		return false;
 	}
 
@@ -716,6 +746,7 @@ bool clock_set(int year, int month, int day, int hour, int minute) {
 	config_save();
 
 	printf("clock: set to %04d-%02d-%02d %02d:%02d\n", year, month, day, hour, minute);
+	pthread_mutex_unlock(&ntp_lock);
 	return true;
 }
 

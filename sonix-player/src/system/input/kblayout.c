@@ -32,31 +32,14 @@ typedef struct {
 #define T9_LATIN_UPPER ".,?!\'", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"
 
 static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
-	[KB_LAYOUT_ENGLISH] = {"English",
-						   {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
-						   {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"},
-						   {T9_LATIN_LOWER},
-						   {T9_LATIN_UPPER},
-						   "English"},
+	[KB_LAYOUT_ENGLISH] = {"English", {"qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"}, {T9_LATIN_LOWER}, {T9_LATIN_UPPER}, "English"},
 	// The same letters as English, which is what an Italian phone keyboard
 	// has: the accented vowels are not on the letter rows there either.
-	[KB_LAYOUT_ITALIAN] = {"Italiano",
-						   {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
-						   {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"},
-						   {T9_LATIN_LOWER},
-						   {T9_LATIN_UPPER},
-						   "Italiano"},
+	[KB_LAYOUT_ITALIAN] = {"Italiano", {"qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"}, {T9_LATIN_LOWER}, {T9_LATIN_UPPER}, "Italiano"},
 	// QWERTZ, with the umlauts on the rows where a German keyboard has them and
 	// on the keys of the letters they are: a phone keypad shares them out that
 	// way rather than giving them keys of their own.
-	[KB_LAYOUT_GERMAN] = {"Deutsch",
-						  {"qwertzuiop\xc3\xbc", "asdfghjkl\xc3\xb6\xc3\xa4", "yxcvbnm"},
-						  {"QWERTZUIOP\xc3\x9c", "ASDFGHJKL\xc3\x96\xc3\x84", "YXCVBNM"},
-						  {".,?!\'", "abc\xc3\xa4", "def", "ghi", "jkl", "mno\xc3\xb6", "pqrs\xc3\x9f", "tuv\xc3\xbc",
-						   "wxyz"},
-						  {".,?!\'", "ABC\xc3\x84", "DEF", "GHI", "JKL", "MNO\xc3\x96", "PQRS\xc3\x9f", "TUV\xc3\x9c",
-						   "WXYZ"},
-						  "Deutsch"},
+	[KB_LAYOUT_GERMAN] = {"Deutsch", {"qwertzuiop\xc3\xbc", "asdfghjkl\xc3\xb6\xc3\xa4", "yxcvbnm"}, {"QWERTZUIOP\xc3\x9c", "ASDFGHJKL\xc3\x96\xc3\x84", "YXCVBNM"}, {".,?!\'", "abc\xc3\xa4", "def", "ghi", "jkl", "mno\xc3\xb6", "pqrs\xc3\x9f", "tuv\xc3\xbc", "wxyz"}, {".,?!\'", "ABC\xc3\x84", "DEF", "GHI", "JKL", "MNO\xc3\x96", "PQRS\xc3\x9f", "TUV\xc3\x9c", "WXYZ"}, "Deutsch"},
 	[KB_LAYOUT_SPANISH] = {"Espa\xc3\xb1ol",
 						   {"qwertyuiop", "asdfghjkl\xc3\xb1", "zxcvbnm"},
 						   {"QWERTYUIOP", "ASDFGHJKL\xc3\x91", "ZXCVBNM"},
@@ -64,12 +47,7 @@ static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 						   {".,?!\'", "abc", "def", "ghi", "jkl", "mno\xc3\xb1", "pqrs", "tuv", "wxyz"},
 						   {".,?!\'", "ABC", "DEF", "GHI", "JKL", "MNO\xc3\x91", "PQRS", "TUV", "WXYZ"},
 						   "Espa\xc3\xb1ol"},
-	[KB_LAYOUT_FRENCH] = {"Fran\xc3\xa7\x61is",
-						  {"azertyuiop", "qsdfghjklm", "wxcvbn"},
-						  {"AZERTYUIOP", "QSDFGHJKLM", "WXCVBN"},
-						  {T9_LATIN_LOWER},
-						  {T9_LATIN_UPPER},
-						  "Fran\xc3\xa7\x61is"},
+	[KB_LAYOUT_FRENCH] = {"Fran\xc3\xa7\x61is", {"azertyuiop", "qsdfghjklm", "wxcvbn"}, {"AZERTYUIOP", "QSDFGHJKLM", "WXCVBN"}, {T9_LATIN_LOWER}, {T9_LATIN_UPPER}, "Fran\xc3\xa7\x61is"},
 	[KB_LAYOUT_RUSSIAN] = {"\xd0\xa0\xd1\x83\xd1\x81\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9",
 						   {"\xd0\xb9\xd1\x86\xd1\x83\xd0\xba\xd0\xb5\xd0\xbd\xd0\xb3\xd1\x88\xd1\x89\xd0\xb7"
 							"\xd1\x85\xd1\x8a",
@@ -84,42 +62,17 @@ static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 						   // The Cyrillic keypad: thirty-two letters four to a key,
 						   // in alphabetical order, which is how a Russian phone
 						   // shares them out.
-						   {".,?!\'",
-							"\xd0\xb0\xd0\xb1\xd0\xb2\xd0\xb3", "\xd0\xb4\xd0\xb5\xd0\xb6\xd0\xb7",
-							"\xd0\xb8\xd0\xb9\xd0\xba\xd0\xbb", "\xd0\xbc\xd0\xbd\xd0\xbe\xd0\xbf",
-							"\xd1\x80\xd1\x81\xd1\x82\xd1\x83", "\xd1\x84\xd1\x85\xd1\x86\xd1\x87",
-							"\xd1\x88\xd1\x89\xd1\x8a\xd1\x8b", "\xd1\x8c\xd1\x8d\xd1\x8e\xd1\x8f"},
-						   {".,?!\'",
-							"\xd0\x90\xd0\x91\xd0\x92\xd0\x93", "\xd0\x94\xd0\x95\xd0\x96\xd0\x97",
-							"\xd0\x98\xd0\x99\xd0\x9a\xd0\x9b", "\xd0\x9c\xd0\x9d\xd0\x9e\xd0\x9f",
-							"\xd0\xa0\xd0\xa1\xd0\xa2\xd0\xa3", "\xd0\xa4\xd0\xa5\xd0\xa6\xd0\xa7",
-							"\xd0\xa8\xd0\xa9\xd0\xaa\xd0\xab", "\xd0\xac\xd0\xad\xd0\xae\xd0\xaf"},
+						   {".,?!\'", "\xd0\xb0\xd0\xb1\xd0\xb2\xd0\xb3", "\xd0\xb4\xd0\xb5\xd0\xb6\xd0\xb7", "\xd0\xb8\xd0\xb9\xd0\xba\xd0\xbb", "\xd0\xbc\xd0\xbd\xd0\xbe\xd0\xbf", "\xd1\x80\xd1\x81\xd1\x82\xd1\x83", "\xd1\x84\xd1\x85\xd1\x86\xd1\x87", "\xd1\x88\xd1\x89\xd1\x8a\xd1\x8b", "\xd1\x8c\xd1\x8d\xd1\x8e\xd1\x8f"},
+						   {".,?!\'", "\xd0\x90\xd0\x91\xd0\x92\xd0\x93", "\xd0\x94\xd0\x95\xd0\x96\xd0\x97", "\xd0\x98\xd0\x99\xd0\x9a\xd0\x9b", "\xd0\x9c\xd0\x9d\xd0\x9e\xd0\x9f", "\xd0\xa0\xd0\xa1\xd0\xa2\xd0\xa3", "\xd0\xa4\xd0\xa5\xd0\xa6\xd0\xa7", "\xd0\xa8\xd0\xa9\xd0\xaa\xd0\xab", "\xd0\xac\xd0\xad\xd0\xae\xd0\xaf"},
 						   "Russian"},
-	[KB_LAYOUT_DUTCH] = {"Nederlands",
-						 {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
-						 {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"},
-						 {T9_LATIN_LOWER},
-						 {T9_LATIN_UPPER},
-						 "Nederlands"},
+	[KB_LAYOUT_DUTCH] = {"Nederlands", {"qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"}, {T9_LATIN_LOWER}, {T9_LATIN_UPPER}, "Nederlands"},
 	// The letter rows of a Polish keyboard, which is QWERTY with the
 	// diacritics behind AltGr; here they come from holding the base letter. A
 	// Polish phone keypad puts each of them on the key of its base letter.
-	[KB_LAYOUT_POLISH] = {"Polski",
-						  {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
-						  {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"},
-						  {".,?!\'", "abc\xc4\x85\xc4\x87", "def\xc4\x99", "ghi", "jkl\xc5\x82", "mno\xc5\x84\xc3\xb3",
-						   "pqrs\xc5\x9b", "tuv", "wxyz\xc5\xba\xc5\xbc"},
-						  {".,?!\'", "ABC\xc4\x84\xc4\x86", "DEF\xc4\x98", "GHI", "JKL\xc5\x81", "MNO\xc5\x83\xc3\x93",
-						   "PQRS\xc5\x9a", "TUV", "WXYZ\xc5\xb9\xc5\xbb"},
-						  "Polski"},
+	[KB_LAYOUT_POLISH] = {"Polski", {"qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"}, {".,?!\'", "abc\xc4\x85\xc4\x87", "def\xc4\x99", "ghi", "jkl\xc5\x82", "mno\xc5\x84\xc3\xb3", "pqrs\xc5\x9b", "tuv", "wxyz\xc5\xba\xc5\xbc"}, {".,?!\'", "ABC\xc4\x84\xc4\x86", "DEF\xc4\x98", "GHI", "JKL\xc5\x81", "MNO\xc5\x83\xc3\x93", "PQRS\xc5\x9a", "TUV", "WXYZ\xc5\xb9\xc5\xbb"}, "Polski"},
 	// ABNT2, the Brazilian keyboard: the c-cedilla has its own key after L, and
 	// the accented vowels, dead keys there, come from holding the vowel.
-	[KB_LAYOUT_PORTUGUESE] = {"Portugu\xc3\xaas",
-							  {"qwertyuiop", "asdfghjkl\xc3\xa7", "zxcvbnm"},
-							  {"QWERTYUIOP", "ASDFGHJKL\xc3\x87", "ZXCVBNM"},
-							  {".,?!\'", "abc\xc3\xa7", "def", "ghi", "jkl", "mno", "pqrs", "tuv", "wxyz"},
-							  {".,?!\'", "ABC\xc3\x87", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"},
-							  "Portugu\xc3\xaas BR"},
+	[KB_LAYOUT_PORTUGUESE] = {"Portugu\xc3\xaas", {"qwertyuiop", "asdfghjkl\xc3\xa7", "zxcvbnm"}, {"QWERTYUIOP", "ASDFGHJKL\xc3\x87", "ZXCVBNM"}, {".,?!\'", "abc\xc3\xa7", "def", "ghi", "jkl", "mno", "pqrs", "tuv", "wxyz"}, {".,?!\'", "ABC\xc3\x87", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"}, "Portugu\xc3\xaas BR"},
 	// QWERTZ, as Czech keyboards are. The diacritics come from holding the base
 	// letter, and a Czech phone keypad puts each of them on its base letter's
 	// key.
@@ -127,28 +80,10 @@ static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 						 "e\xc5\xa1tina",
 						 {"qwertzuiop", "asdfghjkl", "yxcvbnm"},
 						 {"QWERTZUIOP", "ASDFGHJKL", "YXCVBNM"},
-						 {".,?!\'", "abc\xc3\xa1\xc4\x8d", "def\xc4\x8f\xc3\xa9\xc4\x9b", "ghi\xc3\xad", "jkl",
-						  "mno\xc5\x88\xc3\xb3", "pqrs\xc5\x99\xc5\xa1", "tuv\xc5\xa5\xc3\xba\xc5\xaf",
-						  "wxyz\xc3\xbd\xc5\xbe"},
-						 {".,?!\'", "ABC\xc3\x81\xc4\x8c", "DEF\xc4\x8e\xc3\x89\xc4\x9a", "GHI\xc3\x8d", "JKL",
-						  "MNO\xc5\x87\xc3\x93", "PQRS\xc5\x98\xc5\xa0", "TUV\xc5\xa4\xc3\x9a\xc5\xae",
-						  "WXYZ\xc3\x9d\xc5\xbd"},
+						 {".,?!\'", "abc\xc3\xa1\xc4\x8d", "def\xc4\x8f\xc3\xa9\xc4\x9b", "ghi\xc3\xad", "jkl", "mno\xc5\x88\xc3\xb3", "pqrs\xc5\x99\xc5\xa1", "tuv\xc5\xa5\xc3\xba\xc5\xaf", "wxyz\xc3\xbd\xc5\xbe"},
+						 {".,?!\'", "ABC\xc3\x81\xc4\x8c", "DEF\xc4\x8e\xc3\x89\xc4\x9a", "GHI\xc3\x8d", "JKL", "MNO\xc5\x87\xc3\x93", "PQRS\xc5\x98\xc5\xa0", "TUV\xc5\xa4\xc3\x9a\xc5\xae", "WXYZ\xc3\x9d\xc5\xbd"},
 						 "\xc4\x8c"
 						 "e\xc5\xa1tina"},
-	// Japanese has no letters of its own here: the kana are typed through the
-	// Latin rows as romaji, and through the ten-key keypad of kana.c. Both are
-	// switched on by the layout in keyboard.c, and what is below is what they
-	// fall back to: the Latin letters, for the mode that types them as they are
-	// (the "A" of the key beside "123"). The "-" at the end of the third row is
-	// the long-vowel mark while romaji is being turned into kana ("ra-men" is the
-	// word for ramen), a hyphen in Latin mode; with shift it is "_". The name is the
-	// layout's name in its own language.
-	[KB_LAYOUT_JAPANESE] = {"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e",
-						   {"qwertyuiop", "asdfghjkl", "zxcvbnm-"},
-						   {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM_"},
-						   {T9_LATIN_LOWER},
-						   {T9_LATIN_UPPER},
-						   "Japanese"},
 };
 
 // The letters a held key offers, the way a phone keyboard does: one entry per
@@ -192,8 +127,7 @@ static const struct {
 };
 
 // The config file keeps names, not indices.
-static const char *const layout_keys[KB_LAYOUT_COUNT] = {"english", "italian", "german", "spanish",	 "french", "russian",
-														 "dutch",   "polish",  "portuguese", "czech", "japanese"};
+static const char *const layout_keys[KB_LAYOUT_COUNT] = {"english", "italian", "german", "spanish", "french", "russian", "dutch", "polish", "portuguese", "czech"};
 
 static uint8_t in_use[KB_LAYOUT_COUNT];
 static uint8_t in_use_n;
@@ -394,8 +328,8 @@ static void load(void) {
 	loaded = true;
 
 	bool placed[KB_LAYOUT_COUNT] = {false};
-	in_use_n = parse_list(config_get("keyboard", "layouts", ""), in_use, placed);
-	others_n = parse_list(config_get("keyboard", "layouts_off", ""), others, placed);
+	in_use_n = parse_list(config_get_copy("keyboard", "layouts", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), in_use, placed);
+	others_n = parse_list(config_get_copy("keyboard", "layouts_off", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), others, placed);
 
 	// Nothing saved, or a layout that did not exist when it was saved. The
 	// interface language's own goes in front of the ones in use; everything
@@ -473,8 +407,8 @@ kblayout_t kblayout_default(void) {
 }
 
 void kblayout_language_changed(void) {
-	const char *on = config_get("keyboard", "layouts", "");
-	const char *off = config_get("keyboard", "layouts_off", "");
+	const char *on = config_get_copy("keyboard", "layouts", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
+	const char *off = config_get_copy("keyboard", "layouts_off", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if ((on && on[0]) || (off && off[0])) {
 		return;
 	}

@@ -23,6 +23,8 @@ void playlistpage_add_track(const char *track_path);
 // Pick for a set of local tracks: the chosen playlist gets all of them, in this
 // order, written in the background. The page keeps its own copy of the paths.
 void playlistpage_add_tracks(const char *const *paths, int count);
+// Same picker, bounded GUI-owned queue capture and background atomic append.
+void playlistpage_add_queue(void);
 
 // Stars a set of local tracks, in this order, in the background: not a picker,
 // only a card while it works and one that says how it went. A track already
@@ -34,5 +36,9 @@ void playlistpage_add_favourites(const char *const *paths, int count);
 // already knows which (SonixLink). In the background, with the same cards.
 // False when the playlist could not be made or the work not started.
 bool playlistpage_add_tracks_to(const char *name, const char *const *paths, int count);
+
+// Bounded terminal delivery; called by the existing GUI loop and exit hook.
+void playlistpage_service_completion(void);
+void playlistpage_shutdown_completions(void);
 
 #endif /* PLAYLISTPAGE_H */

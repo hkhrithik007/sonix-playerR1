@@ -2,6 +2,7 @@
 #define GRIDPAGE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "src/gui/shell/gui.h"
 
@@ -24,6 +25,7 @@ typedef struct {
 	// Checked only when `target` is NULL; entries that set neither are the
 	// dimmed not-yet-available tiles.
 	void (*action)(void);
+	void (*subtitle)(char *text, size_t size);
 } grid_entry_t;
 
 // Fills `screen` with a `columns` x `rows` grid of tiles sized from the config.

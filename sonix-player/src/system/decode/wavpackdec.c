@@ -110,6 +110,8 @@ uint64_t wavpackdec_total_frames(const wavpackdec_t *w) { return w ? w->frames :
 static int32_t float_word_to_q24(int32_t word) {
 	float f;
 	memcpy(&f, &word, sizeof(f));
+	if (f != f)
+		return 0;
 	float scaled = f * 8388608.0f; // 2^23
 	if (scaled > 8388607.0f) {
 		scaled = 8388607.0f;
@@ -125,7 +127,7 @@ static int32_t float_word_to_q24(int32_t word) {
 static void widen_in_place(int32_t *buf, uint64_t count, int bits, bool is_float) {
 	if (is_float) {
 		for (uint64_t i = 0; i < count; i++) {
-			buf[i] = float_word_to_q24(buf[i]) << 8;
+			buf[i] = float_word_to_q24(buf[i]) * 256;
 		}
 		return;
 	}
@@ -196,7 +198,7 @@ uint64_t wavpackdec_read_s16(wavpackdec_t *w, uint64_t frames, short *out) {
 	} else {
 		int shift = 16 - w->bits;
 		for (uint64_t i = 0; i < count; i++) {
-			out[i] = (short)(w->scratch[i] << shift);
+			out[i] = (short)(w->scratch[i] * (1 << shift));
 		}
 	}
 	return got;

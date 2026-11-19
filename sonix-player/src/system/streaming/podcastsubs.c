@@ -161,8 +161,7 @@ static void load(void) {
 		return;
 	}
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db, "SELECT id,title,author,image,url,episodes FROM PODCAST_SUBS ORDER BY followed_at DESC",
-						   -1, &stmt, NULL) == SQLITE_OK) {
+	if (sqlite3_prepare_v2(db, "SELECT id,title,author,image,url,episodes FROM PODCAST_SUBS ORDER BY followed_at DESC", -1, &stmt, NULL) == SQLITE_OK) {
 		while (subs_count < PODCASTSUBS_MAX && sqlite3_step(stmt) == SQLITE_ROW) {
 			podcast_feed_t feed = {0};
 			feed.id = (long long)sqlite3_column_int64(stmt, 0);
@@ -497,8 +496,7 @@ void podcastsubs_keep_address(long long feed_id, const char *url) {
 	}
 	sqlite3_busy_timeout(db, 1000);
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO PODCAST_RSS(id,url) VALUES(?,?)", -1, &stmt, NULL) ==
-		SQLITE_OK) {
+	if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO PODCAST_RSS(id,url) VALUES(?,?)", -1, &stmt, NULL) == SQLITE_OK) {
 		sqlite3_bind_int64(stmt, 1, (sqlite3_int64)feed_id);
 		sqlite3_bind_text(stmt, 2, url, -1, SQLITE_STATIC);
 		if (sqlite3_step(stmt) != SQLITE_DONE) {

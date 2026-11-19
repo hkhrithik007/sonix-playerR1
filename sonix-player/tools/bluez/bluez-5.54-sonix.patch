@@ -1,0 +1,194 @@
+--- a/profiles/audio/a2dp.c
++++ b/profiles/audio/a2dp.c
+@@ -117,6 +117,7 @@
+ 	gboolean start;
+ 	GSList *cb;
+ 	GIOChannel *io;
++	guint id;
+ 	int ref;
+ };
+ 
+@@ -218,6 +219,9 @@
+ 		g_io_channel_shutdown(s->io, TRUE, NULL);
+ 		g_io_channel_unref(s->io);
+ 	}
++
++	if (s->id)
++		g_source_remove(s->id);
+ 
+ 	queue_destroy(s->eps, NULL);
+ 
+@@ -1179,13 +1183,32 @@
+ 	struct avdtp_media_codec_capability *rsep_codec;
+ 	struct avdtp_service_capability *cap;
+ 
++	setup->id = 0;
++	if (!sep || !sep->lsep) {
++		posix_err = -EINVAL;
++		goto failed;
++	}
++
+ 	if (setup->rsep) {
++		if (!setup->rsep->sep) {
++			posix_err = -EINVAL;
++			goto failed;
++		}
+ 		cap = avdtp_get_codec(setup->rsep->sep);
++		if (!cap) {
++			posix_err = -EINVAL;
++			goto failed;
++		}
+ 		rsep_codec = (struct avdtp_media_codec_capability *) cap->data;
+ 	}
+ 
+ 	if (!setup->rsep || sep->codec != rsep_codec->media_codec_type)
+ 		setup->rsep = find_remote_sep(setup->chan, sep);
++
++	if (!setup->rsep || !setup->rsep->sep) {
++		posix_err = -EINVAL;
++		goto failed;
++	}
+ 
+ 	posix_err = avdtp_set_configuration(setup->session, setup->rsep->sep,
+ 						sep->lsep,
+@@ -1203,6 +1226,20 @@
+ 	return FALSE;
+ }
+ 
++static bool setup_reconfigure(struct a2dp_setup *setup)
++{
++	if (!setup->reconfigure || setup->id)
++		return false;
++
++	DBG("%p", setup);
++
++	setup->id = g_timeout_add(RECONFIGURE_TIMEOUT, a2dp_reconfigure, setup);
++
++	setup->reconfigure = FALSE;
++
++	return true;
++}
++
+ static struct a2dp_remote_sep *get_remote_sep(struct a2dp_channel *chan,
+ 						struct avdtp_stream *stream)
+ {
+@@ -1239,8 +1276,7 @@
+ 	if (!setup->rsep)
+ 		setup->rsep = get_remote_sep(setup->chan, stream);
+ 
+-	if (setup->reconfigure)
+-		g_timeout_add(RECONFIGURE_TIMEOUT, a2dp_reconfigure, setup);
++	setup_reconfigure(setup);
+ }
+ 
+ static void abort_ind(struct avdtp *session, struct avdtp_local_sep *sep,
+@@ -1284,10 +1320,8 @@
+ 	if (!setup)
+ 		return;
+ 
+-	if (setup->reconfigure) {
+-		g_timeout_add(RECONFIGURE_TIMEOUT, a2dp_reconfigure, setup);
+-		return;
+-	}
++	if (setup_reconfigure(setup))
++		return;
+ 
+ 	setup_unref(setup);
+ }
+@@ -1673,8 +1707,10 @@
+ 		if (tmp->stream) {
+ 			/* Only allow switching sep from the same sender */
+ 			if (strcmp(sender, tmp->endpoint->get_name(tmp,
+-							tmp->user_data)))
+-				return -EPERM;
++							tmp->user_data))) {
++				err = -EPERM;
++				goto fail;
++			}
+ 
+ 			/* Check if stream is for the channel */
+ 			if (!avdtp_has_stream(chan->session, tmp->stream))
+@@ -1708,7 +1744,7 @@
+ 	return 0;
+ 
+ fail:
+-	setup_unref(setup);
++	setup_cb_free(cb_data);
+ 	return err;
+ }
+ 
+--- a/src/device.c
++++ b/src/device.c
+@@ -39,7 +39,10 @@
+ #include <glib.h>
+ #include <dbus/dbus.h>
+ 
++#include <sys/ioctl.h>
++#include <sys/socket.h>
+ #include "lib/bluetooth.h"
++#include "lib/hci.h"
+ #include "lib/sdp.h"
+ #include "lib/sdp_lib.h"
+ #include "lib/uuid.h"
+@@ -6536,6 +6539,39 @@
+ 	store_device_info(device);
+ }
+ 
++
++/* Preserve HiBy's A2DP-sink ACL priority command (stock 2.0, opcode 0xfd1a).
++ * This is sent once at profile connection, never polled while audio plays.
++ * The kernel validates the exact connected peer before its handle is used. */
++static void sonix_vendor_priority(struct btd_device *device)
++{
++	struct {
++		struct hci_conn_info_req req;
++		struct hci_conn_info info;
++	} request = { 0 };
++	struct sockaddr_hci addr = {
++		.hci_family = AF_BLUETOOTH,
++		.hci_dev = btd_adapter_get_index(device->adapter),
++		.hci_channel = HCI_CHANNEL_RAW,
++	};
++	uint8_t command[] = { 0x01, 0x1a, 0xfd, 0x04, 0, 0, 0x01, 0x00 };
++	int fd = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
++							BTPROTO_HCI);
++	if (fd < 0)
++		return;
++	bacpy(&request.req.bdaddr, &device->bdaddr);
++	request.req.type = ACL_LINK;
++	if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
++			ioctl(fd, HCIGETCONNINFO, &request) < 0)
++		goto done;
++	command[4] = request.info.handle & 0xff;
++	command[5] = request.info.handle >> 8;
++	if (write(fd, command, sizeof(command)) != sizeof(command))
++		DBG("HiBy ACL priority command unavailable: %s", strerror(errno));
++done:
++	close(fd);
++}
++
+ static void service_state_changed(struct btd_service *service,
+ 						btd_service_state_t old_state,
+ 						btd_service_state_t new_state,
+@@ -6553,6 +6589,10 @@
+ 		device_profile_connected(device, profile, err);
+ 	else if (old_state == BTD_SERVICE_STATE_DISCONNECTING)
+ 		device_profile_disconnected(device, profile, err);
++
++	if (new_state == BTD_SERVICE_STATE_CONNECTED &&
++			!strcmp(profile->name, "a2dp-sink"))
++		sonix_vendor_priority(device);
+ }
+ 
+ struct btd_service *btd_device_get_service(struct btd_device *dev,
+--- a/src/shared/att.c
++++ b/src/shared/att.c
+@@ -1386,7 +1386,7 @@
+ 
+ 	chan = queue_peek_tail(att->chans);
+ 	if (!chan)
+-		return -ENOTCONN;
++		return (uint8_t) -ENOTCONN;
+ 
+ 	return chan->type;
+ }

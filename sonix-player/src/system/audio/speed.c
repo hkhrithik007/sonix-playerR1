@@ -44,6 +44,7 @@ struct speed {
 	short *output; // finished frames waiting to be handed out
 	int output_frames;
 	int output_read;
+	int output_input_frames; // source advance represented by this output window
 	int output_capacity;
 
 	bool primed; // `mid` holds something real
@@ -117,6 +118,7 @@ void speed_reset(speed_t *s) {
 	s->input_frames = 0;
 	s->output_frames = 0;
 	s->output_read = 0;
+	s->output_input_frames = 0;
 	s->skip_fraction = 0;
 	s->primed = false;
 	memset(s->mid, 0, (size_t)s->overlap * s->channels * sizeof(short));
@@ -301,13 +303,20 @@ int speed_pull(speed_t *s, short *out, int want, int (*fill)(void *user, short *
 			}
 			memcpy(out + (size_t)written * s->channels, s->output + (size_t)s->output_read * s->channels,
 				   (size_t)take * s->channels * sizeof(short));
+			// The unread output tail has not reached the caller yet. Attribute
+			// only this slice of the window's input advance, carrying integer
+			// rounding across partial pulls rather than charging a whole window.
+			uint64_t before = (uint64_t)s->output_read * (uint64_t)s->output_input_frames / (uint64_t)s->output_frames;
 			s->output_read += take;
+			uint64_t after = (uint64_t)s->output_read * (uint64_t)s->output_input_frames / (uint64_t)s->output_frames;
+			consumed += after - before;
 			written += take;
 			continue;
 		}
 
 		s->output_frames = 0;
 		s->output_read = 0;
+		s->output_input_frames = 0;
 
 		// Top the input up to a full window plus its search room.
 		int needed = s->sequence + s->seek;
@@ -356,7 +365,7 @@ int speed_pull(speed_t *s, short *out, int want, int (*fill)(void *user, short *
 			break;
 		}
 
-		consumed += (uint64_t)iterate(s);
+		s->output_input_frames = iterate(s);
 	}
 
 	if (input_frames) {

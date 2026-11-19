@@ -1,6 +1,7 @@
 #include "podcaststate.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "src/system/library/metadata.h"
 #include "src/system/streaming/podcastcache.h"
 #include "src/system/streaming/podcastdl.h"
+#include "src/system/streaming/podcastimport.h"
 
 // The table lives in podcast.db with the followed podcasts (podcastsubs.c). The
 // connection is kept open between pieces of work and opened again when the file
@@ -40,9 +42,12 @@ static char card_root[512];
 // Bumped at every change worth redrawing a page for. Read from the GUI thread,
 // written from there and from the writer: a torn read only means one redraw
 // more or less.
-static volatile unsigned revision;
+static _Atomic unsigned revision;
+static _Atomic unsigned card_epoch;
+static _Atomic bool writer_accepting;
 
 unsigned podcaststate_revision(void) { return revision; }
+unsigned podcaststate_card_epoch(void) { return card_epoch; }
 static char db_path[600];
 
 static uint32_t now_ms(void) {
@@ -137,9 +142,9 @@ static void absolute(const char *stored, char *out, size_t size) {
 	}
 }
 
-// "e:<id>" for an episode of the catalogue, "f:<path under the card>" for a
-// file of the Podcast folder that is not one. False for anything else.
-static bool key_for(const char *path, long long episode_id, char *out, size_t size) {
+// "e:<id>" for Podcast Index, "s:<service>:<id>" for imported provider
+// episodes, otherwise "f:<path under the card>". False outside Podcasts.
+static bool key_for_locked(const char *path, long long episode_id, char *out, size_t size) {
 	if (episode_id > 0) {
 		snprintf(out, size, "e:%lld", episode_id);
 		return true;
@@ -147,8 +152,21 @@ static bool key_for(const char *path, long long episode_id, char *out, size_t si
 	if (!path || !path[0] || !podcastdl_owns(path)) {
 		return false;
 	}
+	const char *name = strrchr(path, '/');
+	if (!name || name[1] == '.') {
+		return false; // Downloader staging files never acquire listening state.
+	}
+	if (podcastimport_key(path, out, size)) {
+		return true;
+	}
 	snprintf(out, size, "f:%s", relative(path));
 	return true;
+}
+static bool key_for(const char *path, long long id, char *out, size_t size) {
+	pthread_mutex_lock(&db_lock);
+	bool ok = key_for_locked(path, id, out, size);
+	pthread_mutex_unlock(&db_lock);
+	return ok;
 }
 
 static const char *const COLUMNS = "path,title,show,image,feed_id,episode_id,position,duration,played,touched";
@@ -231,12 +249,12 @@ static void keep_download(sqlite3 *db, const char *key, podcaststate_t *s) {
 	}
 }
 
-static void write_now(const char *key, const podcaststate_t *s) {
-	revision++;
+static void write_now(const char *key, const podcaststate_t *s, unsigned epoch) {
 	podcaststate_t record = *s;
 	pthread_mutex_lock(&db_lock);
-	sqlite3 *db = open_db();
+	sqlite3 *db = epoch == card_epoch ? open_db() : NULL;
 	if (db) {
+		revision++;
 		keep_download(db, key, &record);
 		upsert(db, key, &record);
 	}
@@ -256,6 +274,8 @@ static pthread_mutex_t writer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t writer_wake = PTHREAD_COND_INITIALIZER;
 static bool writer_started;
 static bool writer_has;
+static bool writer_busy;
+static unsigned writer_epoch;
 static char writer_key[600];
 static podcaststate_t writer_record;
 
@@ -270,15 +290,26 @@ static void *writer_main(void *arg) {
 		char key[sizeof(writer_key)];
 		podcaststate_t record = writer_record;
 		snprintf(key, sizeof(key), "%s", writer_key);
+		unsigned epoch = writer_epoch;
 		writer_has = false;
+		writer_busy = true;
+		pthread_cond_broadcast(&writer_wake);
 		pthread_mutex_unlock(&writer_lock);
-		write_now(key, &record);
+		write_now(key, &record, epoch);
+		pthread_mutex_lock(&writer_lock);
+		writer_busy = false;
+		pthread_cond_broadcast(&writer_wake);
+		pthread_mutex_unlock(&writer_lock);
 	}
 	return NULL;
 }
 
-static void writer_post(const char *key, const podcaststate_t *s) {
+static void writer_post(const char *key, const podcaststate_t *s, unsigned epoch) {
 	pthread_mutex_lock(&writer_lock);
+	if (!writer_accepting || epoch != card_epoch) {
+		pthread_mutex_unlock(&writer_lock);
+		return;
+	}
 	if (!writer_started) {
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, writer_main, NULL) == 0) {
@@ -287,10 +318,14 @@ static void writer_post(const char *key, const podcaststate_t *s) {
 		}
 	}
 	if (!writer_started) {
+		write_now(key, s, epoch);
 		pthread_mutex_unlock(&writer_lock);
-		write_now(key, s);
 		return;
 	}
+	// Coalesce one episode only; do not lose a pending different episode.
+	while (writer_has && strcmp(writer_key, key))
+		pthread_cond_wait(&writer_wake, &writer_lock);
+	writer_epoch = epoch;
 	snprintf(writer_key, sizeof(writer_key), "%s", key);
 	writer_record = *s;
 	writer_has = true;
@@ -298,18 +333,14 @@ static void writer_post(const char *key, const podcaststate_t *s) {
 	pthread_mutex_unlock(&writer_lock);
 }
 
-// Whatever is waiting, written on this thread.
+// Wait for both pending and already dequeued records. The writer takes db_lock
+// but never current_lock: callers must not hold db_lock while draining.
 static void writer_drain(void) {
 	pthread_mutex_lock(&writer_lock);
-	bool has = writer_has;
-	char key[sizeof(writer_key)];
-	podcaststate_t record = writer_record;
-	snprintf(key, sizeof(key), "%s", writer_key);
-	writer_has = false;
+	pthread_cond_signal(&writer_wake);
+	while (writer_has || writer_busy)
+		pthread_cond_wait(&writer_wake, &writer_lock);
 	pthread_mutex_unlock(&writer_lock);
-	if (has) {
-		write_now(key, &record);
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +354,7 @@ static pthread_mutex_t current_lock = PTHREAD_MUTEX_INITIALIZER;
 static podcaststate_t current;
 static char current_key[600];
 static bool current_valid;
+static unsigned current_epoch;
 static bool current_dirty;
 static uint32_t current_written_ms;
 
@@ -367,7 +399,8 @@ static void file_title(const char *path, char *out, size_t size) {
 // The parent folder's name: the podcast, for a file of the Podcast folder.
 static void folder_name(const char *path, char *out, size_t size) {
 	out[0] = '\0';
-	const char *root = podcastdl_root();
+	char root[512];
+	podcastdl_root(root, sizeof(root));
 	size_t n = strlen(root);
 	if (!n || strncmp(path, root, n) != 0 || path[n] != '/') {
 		return;
@@ -423,16 +456,18 @@ static void current_write(bool through) {
 	podcaststate_t record = current;
 	char key[sizeof(current_key)];
 	snprintf(key, sizeof(key), "%s", current_key);
-	pthread_mutex_unlock(&current_lock);
+	unsigned epoch = current_epoch;
 	if (through) {
 		writer_drain();
-		write_now(key, &record);
+		write_now(key, &record, epoch);
 	} else {
-		writer_post(key, &record);
+		writer_post(key, &record, epoch);
 	}
+	pthread_mutex_unlock(&current_lock);
 }
 
 static bool current_load(const char *path) {
+	unsigned epoch = card_epoch;
 	podcaststate_t s;
 	memset(&s, 0, sizeof(s));
 	describe(path, &s);
@@ -455,6 +490,11 @@ static bool current_load(const char *path) {
 		}
 	}
 	pthread_mutex_lock(&current_lock);
+	if (!writer_accepting || epoch != card_epoch) {
+		pthread_mutex_unlock(&current_lock);
+		return false;
+	}
+	current_epoch = epoch;
 	current = s;
 	snprintf(current_key, sizeof(current_key), "%s", key);
 	current_valid = true;
@@ -465,7 +505,7 @@ static bool current_load(const char *path) {
 }
 
 void podcaststate_note(const char *path, double seconds, double total, bool force) {
-	if (!path || !path[0] || !db_path[0]) {
+	if (!path || !path[0] || !writer_accepting) {
 		return;
 	}
 	pthread_mutex_lock(&current_lock);
@@ -483,6 +523,10 @@ void podcaststate_note(const char *path, double seconds, double total, bool forc
 	}
 
 	pthread_mutex_lock(&current_lock);
+	if (!current_valid || !writer_accepting || current_epoch != card_epoch || strcmp(current.path, path)) {
+		pthread_mutex_unlock(&current_lock);
+		return;
+	}
 	// Before the resume has landed the engine reports the start of the file.
 	if (expect_path[0] && strcmp(expect_path, path) == 0) {
 		if (seconds < expect_seconds - 10.0 && now_ms() - expect_since_ms < 8000) {
@@ -560,7 +604,7 @@ static bool get_by_key(const char *key, podcaststate_t *out) {
 }
 
 bool podcaststate_get(const char *path, podcaststate_t *out) {
-	if (!path || !out || !db_path[0]) {
+	if (!path || !out || !writer_accepting) {
 		return false;
 	}
 	char key[600];
@@ -571,7 +615,7 @@ bool podcaststate_get(const char *path, podcaststate_t *out) {
 }
 
 bool podcaststate_get_episode(long long episode_id, podcaststate_t *out) {
-	if (episode_id <= 0 || !out || !db_path[0]) {
+	if (episode_id <= 0 || !out || !writer_accepting) {
 		return false;
 	}
 	char key[64];
@@ -598,7 +642,8 @@ double podcaststate_resume_point(const char *path) {
 }
 
 void podcaststate_set_played(const char *path, bool played) {
-	if (!path || !path[0] || !db_path[0]) {
+	unsigned epoch = card_epoch;
+	if (!path || !path[0] || !writer_accepting) {
 		return;
 	}
 	podcaststate_t s;
@@ -618,40 +663,50 @@ void podcaststate_set_played(const char *path, bool played) {
 		s.position = 0;
 	}
 	pthread_mutex_lock(&current_lock);
+	if (!writer_accepting || epoch != card_epoch) {
+		pthread_mutex_unlock(&current_lock);
+		return;
+	}
 	if (current_valid && strcmp(current_key, key) == 0) {
 		current.played = s.played;
 		current.position = s.position;
 		current_dirty = false;
 	}
-	pthread_mutex_unlock(&current_lock);
 	writer_drain();
-	write_now(key, &s);
+	write_now(key, &s, epoch);
+	pthread_mutex_unlock(&current_lock);
 }
 
 void podcaststate_forget(const char *path) {
-	if (!path || !path[0] || !db_path[0]) {
+	unsigned epoch = card_epoch;
+	if (!path || !path[0] || !writer_accepting) {
 		return;
 	}
 	// A file copied by hand has no state apart from its file, and goes with
 	// it. An episode of the catalogue keeps where it was left and whether it was
 	// heard: it can still be streamed, and its row moves to its copy in the
 	// cache, or to no file at all.
-	char key[600];
+	char key[600] = "";
 	bool own_row = key_for(path, 0, key, sizeof(key));
 	pthread_mutex_lock(&current_lock);
-	if (current_valid && strcmp(current.path, path) == 0) {
+	if (!writer_accepting || epoch != card_epoch) {
+		pthread_mutex_unlock(&current_lock);
+		return;
+	}
+	if (current_valid && ((own_row && strcmp(current_key, key) == 0) || strcmp(current.path, path) == 0)) {
 		current_valid = false;
 	}
 	pthread_mutex_unlock(&current_lock);
 	writer_drain();
 	pthread_mutex_lock(&db_lock);
-	sqlite3 *db = open_db();
+	sqlite3 *db = epoch == card_epoch && writer_accepting ? open_db() : NULL;
 	revision++;
 	if (db) {
 		sqlite3_stmt *stmt = NULL;
-		if (own_row &&
-			sqlite3_prepare_v2(db, "DELETE FROM PODCAST_EPISODES WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
+		// The UI may have removed the sidecar already, losing its service ID.
+		if (sqlite3_prepare_v2(db, "DELETE FROM PODCAST_EPISODES WHERE (key=? OR path=?) AND key NOT LIKE 'e:%'", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, 2, relative(path), -1, SQLITE_TRANSIENT);
 			sqlite3_step(stmt);
 			sqlite3_finalize(stmt);
 		}
@@ -659,8 +714,7 @@ void podcaststate_forget(const char *path) {
 		long long episodes[4];
 		int count = 0;
 		stmt = NULL;
-		if (sqlite3_prepare_v2(db, "SELECT episode_id FROM PODCAST_EPISODES WHERE path=? AND episode_id>0", -1,
-							   &stmt, NULL) == SQLITE_OK) {
+		if (sqlite3_prepare_v2(db, "SELECT episode_id FROM PODCAST_EPISODES WHERE path=? AND episode_id>0", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, relative(path), -1, SQLITE_STATIC);
 			while (count < 4 && sqlite3_step(stmt) == SQLITE_ROW) {
 				episodes[count++] = (long long)sqlite3_column_int64(stmt, 0);
@@ -675,8 +729,7 @@ void podcaststate_forget(const char *path) {
 			char episode_key[64];
 			snprintf(episode_key, sizeof(episode_key), "e:%lld", episodes[i]);
 			stmt = NULL;
-			if (sqlite3_prepare_v2(db, "UPDATE PODCAST_EPISODES SET path=? WHERE key=?", -1, &stmt, NULL) ==
-				SQLITE_OK) {
+			if (sqlite3_prepare_v2(db, "UPDATE PODCAST_EPISODES SET path=? WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
 				sqlite3_bind_text(stmt, 1, cached[0] ? relative(cached) : "", -1, SQLITE_STATIC);
 				sqlite3_bind_text(stmt, 2, episode_key, -1, SQLITE_STATIC);
 				sqlite3_step(stmt);
@@ -687,19 +740,18 @@ void podcaststate_forget(const char *path) {
 	pthread_mutex_unlock(&db_lock);
 }
 
-void podcaststate_downloaded(long long episode_id, const char *path) {
-	if (episode_id <= 0 || !path || !path[0] || !db_path[0] || !podcastdl_owns(path)) {
+void podcaststate_downloaded(long long episode_id, const char *path, unsigned epoch) {
+	if (episode_id <= 0 || !path || !path[0] || !writer_accepting || !podcastdl_owns(path)) {
 		return;
 	}
 	char key[64];
 	snprintf(key, sizeof(key), "e:%lld", episode_id);
 	pthread_mutex_lock(&db_lock);
-	sqlite3 *db = open_db();
+	sqlite3 *db = epoch == card_epoch && writer_accepting ? open_db() : NULL;
 	podcaststate_t old;
 	// Never played: nothing to move. Already on a file of the folder that is
 	// still there: that one stays.
-	if (db && select_key(db, key, &old) && strcmp(old.path, path) != 0 &&
-		!(old.path[0] && podcastdl_owns(old.path) && access(old.path, F_OK) == 0)) {
+	if (db && select_key(db, key, &old) && strcmp(old.path, path) != 0 && !(old.path[0] && podcastdl_owns(old.path) && access(old.path, F_OK) == 0)) {
 		sqlite3_stmt *stmt = NULL;
 		if (sqlite3_prepare_v2(db, "UPDATE PODCAST_EPISODES SET path=? WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, relative(path), -1, SQLITE_STATIC);
@@ -717,9 +769,17 @@ void podcaststate_downloaded(long long episode_id, const char *path) {
 // episode playing laid over its own row.
 static int select_many(const char *where, const char *text, const char *text_end, long long number,
 					   podcaststate_cb_t cb, void *user) {
-	if (!cb || !db_path[0]) {
+	if (!cb || !writer_accepting) {
 		return 0;
 	}
+	podcaststate_t playing;
+	char playing_key[sizeof(current_key)];
+	pthread_mutex_lock(&current_lock);
+	bool playing_valid = current_valid;
+	unsigned epoch = current_epoch;
+	playing = current;
+	snprintf(playing_key, sizeof(playing_key), "%s", current_key);
+	pthread_mutex_unlock(&current_lock);
 	char sql[300];
 	snprintf(sql, sizeof(sql), "SELECT %s,key FROM PODCAST_EPISODES WHERE %s", COLUMNS, where);
 	int n = 0;
@@ -740,17 +800,15 @@ static int select_many(const char *where, const char *text, const char *text_end
 				podcaststate_t s;
 				read_row(stmt, &s);
 				const char *key = (const char *)sqlite3_column_text(stmt, 10);
-				pthread_mutex_lock(&current_lock);
-				if (current_valid && key && strcmp(key, current_key) == 0) {
+				if (playing_valid && epoch == card_epoch && key && strcmp(key, playing_key) == 0) {
 					// The file stays the row's: the episode may be playing from
 					// the cache while the row points at its download.
 					char path[sizeof(s.path)];
 					snprintf(path, sizeof(path), "%s", s.path);
-					s = current;
+					s = playing;
 					snprintf(s.path, sizeof(s.path), "%s", path);
 					s.touched = PODCASTSTATE_TOUCHED_NOW;
 				}
-				pthread_mutex_unlock(&current_lock);
 				cb(&s, user);
 				n++;
 			}
@@ -769,8 +827,10 @@ int podcaststate_in_folder(const char *folder, podcaststate_cb_t cb, void *user)
 	// is the character after '/', so the range is exactly what is inside.
 	char from[600];
 	char to[600];
+	pthread_mutex_lock(&db_lock);
 	snprintf(from, sizeof(from), "%s/", relative(folder));
 	snprintf(to, sizeof(to), "%s0", relative(folder));
+	pthread_mutex_unlock(&db_lock);
 	return select_many("path>=? AND path<?", from, to, 0, cb, user);
 }
 
@@ -782,7 +842,7 @@ int podcaststate_for_feed(long long feed_id, podcaststate_cb_t cb, void *user) {
 }
 
 int podcaststate_in_progress(podcaststate_t *out, int max) {
-	if (!out || max <= 0 || !db_path[0]) {
+	if (!out || max <= 0 || !writer_accepting) {
 		return 0;
 	}
 	int n = 0;
@@ -820,7 +880,8 @@ int podcaststate_in_progress(podcaststate_t *out, int max) {
 }
 
 void podcaststate_set_played_episode(const podcast_episode_t *episode, const char *image, bool played) {
-	if (!episode || episode->id <= 0 || !db_path[0]) {
+	unsigned epoch = card_epoch;
+	if (!episode || episode->id <= 0 || !writer_accepting) {
 		return;
 	}
 	char key[64];
@@ -840,14 +901,18 @@ void podcaststate_set_played_episode(const podcast_episode_t *episode, const cha
 		s.position = 0;
 	}
 	pthread_mutex_lock(&current_lock);
+	if (!writer_accepting || epoch != card_epoch) {
+		pthread_mutex_unlock(&current_lock);
+		return;
+	}
 	if (current_valid && strcmp(current_key, key) == 0) {
 		current.played = s.played;
 		current.position = s.position;
 		current_dirty = false;
 	}
-	pthread_mutex_unlock(&current_lock);
 	writer_drain();
-	write_now(key, &s);
+	write_now(key, &s, epoch);
+	pthread_mutex_unlock(&current_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -855,11 +920,12 @@ void podcaststate_set_played_episode(const podcast_episode_t *episode, const cha
 // ---------------------------------------------------------------------------
 
 void podcaststate_set_root(const char *sd_root) {
-	writer_drain();
 	pthread_mutex_lock(&current_lock);
+	writer_accepting = false;
+	writer_drain();
 	current_valid = false;
-	pthread_mutex_unlock(&current_lock);
 	pthread_mutex_lock(&db_lock);
+	card_epoch++;
 	close_db();
 	if (!sd_root || !sd_root[0]) {
 		card_root[0] = '\0';
@@ -871,7 +937,9 @@ void podcaststate_set_root(const char *sd_root) {
 		mkdir(dir, 0777);
 		snprintf(db_path, sizeof(db_path), "%s/podcast.db", dir);
 	}
+	writer_accepting = db_path[0] != 0;
 	pthread_mutex_unlock(&db_lock);
+	pthread_mutex_unlock(&current_lock);
 }
 
 int podcaststate_margin(void) {

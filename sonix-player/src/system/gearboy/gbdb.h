@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "src/system/device/system.h"
+
 // The Game Boy ROM catalogue: which ones are on the card, and what they are
 // really called.
 //
@@ -54,8 +56,22 @@ void gbdb_set_root(const char *sd_root);
 // NULL; returning false from it stops the scan, and what has been done so far
 // is still written to the cache.
 //
-// Returns how many were found, or -1 when there is no root.
+// Returns how many were found, -1 when there is no root, or -ENOMEM on
+// allocation failure. Errors leave *out NULL and do not save a partial cache.
+// Missing catalogue entries and ordinary CRC/name lookup I/O failures retain
+// the filename fallback; a CRC buffer allocation failure is an error.
+// The wrapper obtains one authoritative storage admission; -EAGAIN means its
+// owner is busy. A revoked original admission returns -ESTALE, never a new card.
 int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), void *user);
+
+// Uses the admission captured before the worker starts. Neither scan nor commit
+// may re-admit a new card at the same root. No card pin spans CRC/catalogue I/O.
+// Revoked cache admission returns -ESTALE; ordinary optional cache I/O errors
+// and read-only storage retain the discovered list. GUI consumers must still
+// validate this token when applying results and before acting on displayed rows.
+int gbdb_scan_admitted(gbrom_t **out, const char *root, const storage_card_token_t *token,
+					   bool (*progress)(int done, int total, void *user), void *user);
+
 
 // <card>/Games/Saves, where the games' battery-backed RAM and save states go.
 // Empty string when there is no card. The pointer is to a static buffer: use it

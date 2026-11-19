@@ -23,6 +23,11 @@
 // call again; returns false if the file cannot be opened, in which case every
 // call below is a no-op.
 bool library_open(const char *db_path);
+// Normal storage/process exit: stop new scan/import admission and finish the
+// existing writers while the current epoch stays available. The caller then
+// drains accepted application history before library_close. Safe to repeat.
+// Uses the existing bounded scanner stop; a stuck driver can outlast that wait.
+void library_prepare_close(void);
 void library_close(void);
 
 // Closes and reopens the index when its file is no longer the one that was
@@ -34,6 +39,22 @@ bool library_reopen_if_replaced(void);
 
 // How many tracks the index currently holds.
 int library_track_count(void);
+
+// What a full scan would add to the index that is open: the things read from
+// a file at scan time and nowhere else, which an index written by an older
+// firmware -- the stock one, or this one before they came in -- does not have
+// (library.c, "What the index was written with"). Nothing is rescanned on its
+// own account; the Music page offers it. 0 when the index has them all, and
+// with no index open.
+#define LIBRARY_INDEX_COMPILATIONS (1u << 0) // compilations without an album artist kept together
+#define LIBRARY_INDEX_DURATIONS (1u << 1)	 // track lengths
+// Every album's colour and thumbnails (covertone.h). Unlike the two above it
+// does not wait for a scan: the background job makes them on an index that
+// lacks them, and the bit is written when it has been through every album,
+// so the notice goes by itself. A scan is just the faster way.
+#define LIBRARY_INDEX_COVERS (1u << 2)
+#define LIBRARY_INDEX_FEATURES (LIBRARY_INDEX_COMPILATIONS | LIBRARY_INDEX_DURATIONS | LIBRARY_INDEX_COVERS)
+unsigned library_index_missing(void);
 
 // ---------------------------------------------------------------------------
 // Scanning
@@ -134,6 +155,14 @@ void library_set_genre_separators(unsigned separators);
 char **library_artist_exceptions(int *count);
 void library_artist_exceptions_free(char **names, int count);
 void library_set_artist_exceptions(const char *const *names, int count);
+
+// [library] artist_albums_by_year, on by default: an artist's, an album
+// artist's or a genre's records listed by release year (an album's year being
+// its tracks' latest), then by name, the ones without a year last -- and the
+// tracks of "Play artist" and the like, gathered by record, in that same order.
+// Off, the records go by name. Read when a list is opened.
+bool library_artist_albums_by_year(void);
+void library_set_artist_albums_by_year(bool on);
 
 // [library] join_albums, off by default.
 bool library_join_albums(void);
@@ -244,7 +273,16 @@ typedef enum {
 	// The tracks played most, most plays first: those still in the index that
 	// library_note_play() has counted. Handles only.
 	LIBRARY_LIST_MOST_PLAYED,
+	// The tracks played last, the latest on top: the same counted plays as
+	// LIBRARY_LIST_MOST_PLAYED, by when each was last heard, the latest
+	// LIBRARY_RECENT_MAX of them. Handles only.
+	LIBRARY_LIST_RECENTLY_PLAYED,
 } library_list_t;
+
+// How many rows the two "recent" lists keep: the tracks played last, and the
+// records added last (LIBRARY_FILTER_RECENT). Enough to scroll back a few weeks,
+// few enough that neither turns into a second copy of the whole library.
+#define LIBRARY_RECENT_MAX 100
 
 // Fills `out` with up to `max` names, in the collation's order (see above).
 // Returns how many were written.
@@ -252,19 +290,31 @@ int library_list(library_list_t kind, char out[][256], int max);
 
 // Optional filter for LIBRARY_LIST_TRACKS: only the tracks of one album,
 // artist, album artist or genre.
+// The most hits a search list holds. A query that matches more than this is
+// one to type more of; the page says "2000+" (search.c).
+#define LIBRARY_SEARCH_MAX 2000
+
 typedef enum {
 	LIBRARY_FILTER_NONE = 0,
 	LIBRARY_FILTER_ALBUM,
 	LIBRARY_FILTER_ARTIST,
 	LIBRARY_FILTER_ALBUM_ARTIST,
 	LIBRARY_FILTER_GENRE,
-	// The tracks, albums or artists whose name contains the value, matched the
-	// way library_search() matches. For the handles below only.
+	// The tracks, albums or artists that hold every word of the value, in any
+	// order, case and accents aside: a track by its title, artist, album or
+	// album artist, an album by its name or its artist, an artist by the
+	// name. At most LIBRARY_SEARCH_MAX of each, the first in list order. For
+	// the handles below only.
 	LIBRARY_FILTER_SEARCH,
 	// The albums of one year, the value being the year, and the tracks of
 	// those albums: an album whose tracks carry different years is filed under
 	// the latest of them, here as in LIBRARY_ORDER_YEAR. For the handles only.
 	LIBRARY_FILTER_YEAR,
+	// The records that arrived last, newest first: the albums whose newest file
+	// landed on the card latest, as many as the value says (a number, normally
+	// LIBRARY_RECENT_MAX), and the tracks of those albums -- gathered newest
+	// record first under LIBRARY_ORDER_ALBUM. For the handles only.
+	LIBRARY_FILTER_RECENT,
 } library_filter_t;
 
 // Streams the whole result set, sorted by the collation, one row per call:
@@ -293,9 +343,15 @@ typedef enum {
 							   // that have no year last -- which is why it is an
 							   // order of its own and not the one above read
 							   // backwards
+	LIBRARY_ORDER_ARTIST,	   // all albums: by the artist the album list
+							   // shows under each record (its first track's
+							   // album artist, or artist), each artist's
+							   // records by year and then by name -- a shelf
+							   // filed the way a record shop files it. All
+							   // tracks: by the track's artist, then record
+							   // by name, then disc order
 } library_order_t;
-int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order,
-							 library_row_cb cb, void *user);
+int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order, library_row_cb cb, void *user);
 
 // Looks a track's display title up by its file path (the scan stored it).
 // False when the file is not in the index; `out` untouched then.
@@ -322,6 +378,12 @@ size_t library_track_places(const char *const *paths, size_t count, library_plac
 // saved before albums were told apart still means.
 #define LIBRARY_ALBUM_KEY_SEP '\x1f'
 
+// The album artist a compilation is filed under when its tracks carry the
+// compilation flag but no album artist of their own: all of its tracks then
+// make one album rather than one per performer. Stored as it is, in English,
+// like the tag MusicBrainz writes, so it matches discs tagged that way by hand.
+#define LIBRARY_VARIOUS_ARTISTS "Various Artists"
+
 // The part of such a value a person reads: the name, without the key.
 void library_album_title(const char *value, char *out, size_t size);
 
@@ -337,6 +399,14 @@ bool library_track_album(const char *path, char *out, size_t out_size);
 // The same album as a value that names the record and not every album of its
 // name: what "Show album" opens.
 bool library_track_album_value(const char *path, char *out, size_t out_size);
+
+// Whose page "Show artist" opens for a track: the album artist it is filed
+// under -- the whole discography, features and all -- with *by_album_artist
+// set; or, on a compilation filed under "Various Artists" or the like, the
+// track's own performer, since a page of every compilation on the card is not
+// what anyone asking about one song wants. False when the file is not indexed
+// or names no artist at all.
+bool library_track_artist_page(const char *path, char *out, size_t out_size, bool *by_album_artist);
 
 // Finds indexed tracks by file name alone -- the whole batch in one pass over
 // the table, because a name without its folders cannot use an index and would
@@ -370,6 +440,9 @@ typedef struct {
 	char artist[256];
 	char genre[128];
 	int year;
+	int tracks;			 // how many tracks the album has
+	uint64_t length_ms;	 // their lengths added up; 0 when none of them is known
+	bool length_partial; // some track has no length on record: the sum is short
 } library_album_info_t;
 bool library_album_info(const char *album, library_album_info_t *out);
 
@@ -398,6 +471,12 @@ typedef enum {
 // guess: no badge is better than a wrong one.
 library_quality_t library_track_quality(const char *path, int *rate_out, int *bits_out);
 
+// The same lookup, and the track's length in milliseconds into `length_ms`
+// (end_time, as the scan read it from the header; 0 when it could not, and on
+// an index written before the scan timed anything). For the track rows, which
+// want both and would otherwise ask twice.
+library_quality_t library_track_quality_length(const char *path, uint32_t *length_ms);
+
 // --- Favourites ---
 //
 // A small table of starred tracks, in its own right rather than a view over
@@ -412,8 +491,7 @@ bool library_fav_toggle(const char *path, const char *name, const char *artist);
 // play has gone on long enough to count (playcount.h).
 void library_note_play(const char *path);
 
-// The history of what the queue has played: one entry each time a track was
-// left, finished or skipped (playhistory.h), oldest first. Only the latest
+// Confirmed listening events (playhistory.h), oldest first. Only the latest
 // LIBRARY_HISTORY_MAX are kept.
 #define LIBRARY_HISTORY_MAX 1000
 
@@ -424,16 +502,27 @@ typedef struct {
 
 // Adds an entry at the end, with the title and artist it is to be shown by.
 void library_history_add(const char *path, const char *name, const char *artist, long long played_at);
+// >0 stored id, -1 foreign transaction (defer), 0 stale/offline/write failure.
+long long library_history_record_at(unsigned epoch, const char *path, const char *name, const char *artist, long long played_at);
+// 1 updated, -1 defer, 0 stale/offline/write failure. Never joins a transaction.
+int library_history_update_at(unsigned epoch, long long id, const char *path, const char *name, const char *artist);
 
 // Every entry, oldest first, in an array the caller frees. Returns how many.
 int library_history_items(library_history_item_t **out);
 
 // One entry's file and title. False when it is not there.
-bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size);
+bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size, char *artist, size_t artist_size);
+bool library_history_entry_at(unsigned epoch, long long id, char *path, size_t path_size, char *name, size_t name_size, char *artist, size_t artist_size);
 
 // The id of the newest entry, 0 while there is none: it only grows, so it
 // changes whenever an entry is added.
 long long library_history_revision(void);
+
+// Small versioned GUI playback routes, scoped to this card's database.
+// Only the fixed service names are accepted, at most one 2048-byte row each.
+// store: 1 saved, -1 foreign transaction (defer), 0 stale/offline/failure.
+int library_place_store_at(unsigned epoch, const char *source, const void *route, size_t size);
+bool library_place_read_at(unsigned epoch, const char *source, void *route, size_t size);
 
 bool library_fav_contains(const char *path);
 
@@ -457,6 +546,8 @@ int library_fav_remove_many(const char *const *paths, int count);
 // leaves in what it left behind. Their favourites and play counts go with
 // them. Returns how many tracks went.
 int library_forget_deleted(const char *const *paths, int count);
+// Late filesystem completion may only prune the database it started with.
+int library_forget_deleted_at(unsigned epoch, const char *const *paths, int count);
 
 // Removes from the favourites (and from the saved playback state) everything
 // under `prefix`. It is what clears rows pointing into the stream cache, whose
@@ -530,10 +621,8 @@ typedef struct library_index library_index_t;
 // Builds a handle over the same list library_for_each_ordered() would stream.
 // `desc` reads the list backwards without asking the database for a second
 // sort. NULL when the list cannot be built.
-library_index_t *library_index_open(library_list_t kind, library_filter_t filter, const char *value,
-									library_order_t order, bool desc);
+library_index_t *library_index_open(library_list_t kind, library_filter_t filter, const char *value, library_order_t order, bool desc);
 void library_index_close(library_index_t *ix);
-
 
 int library_index_count(const library_index_t *ix);
 
@@ -658,17 +747,66 @@ bool library_playlist_rename(const char *name, const char *new_name);
 // Appends a row, creating the playlist if it is not there.
 bool library_playlist_append(const char *name, const library_playlist_row_t *row);
 
-// Appending many, one at a time, under one transaction: an import writes
-// hundreds of rows and a commit each would be hundreds of card writes, while an
-// array of them all would be the megabytes described above.
-//
-// begin() creates the playlist if it is not there. Every row() that returns
-// false has left the writer failed, and end() then rolls the whole thing back;
-// end() also rolls back when `keep` is false. The writer is freed either way.
+// Compatibility append writer for callers with rows already prepared. Import
+// readers use the bounded stage API below, so metadata lookup never leaves a
+// long transaction on this shared connection.
+// begin() rejects a foreign transaction before any table mutation and creates
+// the playlist if missing. The caller must serialize all other SQL on this
+// connection between begin() and end(). Under that contract, a failed row or
+// keep=false rolls back the writer transaction. This compatibility API is not
+// a transaction arbiter: a foreign COMMIT followed by BEGIN in the same database
+// epoch cannot be distinguished. General callers must use the bounded stage API.
+// A revoked/closed database rejects subsequent rows/end without touching a newer
+// database. The caller releases the writer with end().
 typedef struct library_playlist_writer library_playlist_writer_t;
 library_playlist_writer_t *library_playlist_write_begin(const char *name);
 bool library_playlist_write_row(library_playlist_writer_t *writer, const library_playlist_row_t *row);
 bool library_playlist_write_end(library_playlist_writer_t *writer, bool keep);
+
+// Card/database identity, independent of a rescan or a playlist edit. Zero
+// without an open index. Callers must not treat a mount-path string as identity.
+unsigned library_database_epoch(void);
+
+// GUI capture copies only an immutable handle's RAM identity/row IDs. It does
+// not wait for db_lock or perform SQL. Resolution is worker-only and validates
+// both the database and source generation while holding the index lock.
+typedef struct {
+	library_index_spec_t spec;
+	unsigned generation, database_epoch;
+} library_export_source_t;
+// Produced only by a successful publish under the database owner lock.
+// It certifies that a different playlist table changed, not this source.
+typedef struct {
+	bool valid;
+	library_export_source_t source;
+	unsigned new_generation;
+} library_export_receipt_t;
+bool library_index_export_source(const library_index_t *index, library_export_source_t *out);
+bool library_index_export_ack(library_index_t *index, const library_export_receipt_t *receipt);
+bool library_index_export_id(const library_index_t *index, int position, int32_t *row_id);
+bool library_export_paths(const library_export_source_t *source, const int32_t *row_ids, int count, char paths[][512]);
+
+// Bounded staging for a background queue/import writer. No statement, mutex or
+// transaction is retained between calls. A changed database rejects every call.
+// Stage rows are hidden from the playlist picker until one atomic publish.
+#define LIBRARY_PLAYLIST_STAGE_BATCH 16
+// Import-only heap buffer; never used by the live GUI queue capture.
+#define LIBRARY_PLAYLIST_IMPORT_BATCH 256
+typedef struct library_playlist_stage library_playlist_stage_t;
+typedef enum { LIBRARY_PLAYLIST_APPEND, LIBRARY_PLAYLIST_CREATE, LIBRARY_PLAYLIST_REPLACE } library_playlist_publish_t;
+library_playlist_stage_t *library_playlist_stage_begin(unsigned database_epoch, const library_export_source_t *source);
+bool library_playlist_stage_rows(library_playlist_stage_t *stage, const library_playlist_row_t *rows, int count);
+// Capture epoch/revision before import parsing. Any intervening playlist edit
+// rejects staging/publication; cleanup still owns only this stage/epoch.
+library_playlist_stage_t *library_playlist_stage_begin_import(unsigned database_epoch, unsigned namespace_revision);
+bool library_playlist_stage_import_rows(library_playlist_stage_t *stage, const library_playlist_row_t *rows, int count);
+bool library_playlist_stage_publish(library_playlist_stage_t *stage, const char *name, library_playlist_publish_t mode, const library_export_source_t *source);
+bool library_playlist_stage_publish_receipt(library_playlist_stage_t *stage, const char *name, library_playlist_publish_t mode, const library_export_source_t *source, library_export_receipt_t *receipt);
+// Consumes stage on every path; never cleans up a newer database/job.
+void library_playlist_stage_discard(library_playlist_stage_t *stage);
+// Activity policy can keep shutdown/MEM off during an owned stage without
+// keeping the display lit or waiting for db_lock.
+bool library_playlist_stage_busy(void);
 
 // The same, for a caller that already holds the rows. Only for a handful of
 // them: see the note on the size of one.
@@ -713,6 +851,8 @@ int library_playlist_count(const char *name);
 // already been taken into the index. See playlists_init().
 bool library_playlists_migrated(void);
 void library_playlists_set_migrated(void);
+// Mark only the captured card/index, outside any foreign transaction.
+bool library_playlists_set_migrated_at(unsigned database_epoch);
 
 // A remembered track count for a playlist held as an .m3u file, where counting
 // means one card lookup per entry -- seconds of blocked interface on a list of
@@ -733,8 +873,22 @@ void library_playlist_count_save(const char *path, long mtime, long size, int tr
 bool library_playlist_count_is_verified(const char *path, long mtime, long size);
 
 // Playback state for the "remember track" option: one track plus position.
-void library_playback_state_save(const char *path, double position);
 bool library_playback_state_load(char *path_out, size_t path_size, double *position_out);
+
+// Bounded, latest-state checkpoints for normal playback. Admission only copies
+// scalars; it never waits for SQLite. A single lazy writer combines the current
+// queue offset and remembered position in one transaction after a short settle.
+// The database epoch and saved queue generation travel with every snapshot.
+void library_checkpoint_position_at(unsigned epoch, const char *path, double position);
+void library_checkpoint_queue_at(unsigned epoch, int index, bool query);
+// After an explicit track reload, validate only this position against the
+// reopened DB's path queue. Never adopts or rewrites the caller's old queue.
+// Matching path/index/count/custom and no query form are checked by the writer.
+void library_checkpoint_queue_entry_at(unsigned epoch, int index, int count, bool custom, const char *path);
+void library_checkpoint_poll(void);
+// Explicit power/storage barriers only. False means a write was not confirmed.
+bool library_checkpoint_flush(void);
+void library_checkpoint_shutdown(void);
 
 // The playback queue, mirrored on disk so it survives a power cycle. Without it
 // a reboot leaves the player holding the remembered track and nothing around
@@ -765,8 +919,7 @@ bool library_queue_load_album(char *out, int size);
 // `extra_slots[i]` is where extra[i] sits in the playing order, which is what
 // puts it back where it was rather than in front of playback. Pass NULL to
 // store no slots.
-void library_queue_save_query(const library_index_spec_t *spec, int position, const char *const *extra,
-							  const int *extra_slots, int extra_count);
+void library_queue_save_query(const library_index_spec_t *spec, int position, const char *const *extra, const int *extra_slots, int extra_count);
 bool library_queue_load_query(library_index_spec_t *spec, int *position_out);
 
 // The rows beside a saved query -- what "add to queue" put into a library list

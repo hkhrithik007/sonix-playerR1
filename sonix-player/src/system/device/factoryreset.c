@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "factoryreset.h"
+#include "src/system/device/recoveryprep.h"
 
 #include "src/system/audio/audio.h"
 #include "src/system/core/config.h"
@@ -10,9 +11,8 @@
 #include "src/system/library/library.h"
 #include "src/system/core/logging.h"
 #include "src/system/bluetooth/btlog.h"
-#include "src/system/streaming/qobuzcache.h"
+#include "src/system/streaming/provider.h"
 #include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/tidalcache.h"
 #include "src/system/remote/dlna.h"
 #include "src/system/device/sysserver.h"
 #include "src/system/device/system.h"
@@ -85,6 +85,10 @@
 // is not a reset -- and because a file nobody deletes is a file that outlives
 // the thing that made it.
 #define EBOOK_CONFIG_FILE "/usr/data/ebook_config.ini"
+// A streaming session imported from a file on the card (Zvuk's token): it is
+// an account, and a reset must not leave it signed in -- the recovery script
+// would empty /data too, but not on a rootfs without it (see above).
+#define ZVUK_SESSION_FILE "/usr/data/zvuk_session.ini"
 
 // The two functions below serve only the real procedure, which the host build
 // does not have; without this guard the compiler reports them as defined but
@@ -146,9 +150,10 @@ bool factoryreset_supported(void) {
 }
 
 void factoryreset_run(void) {
+	if (recovery_prep_active()) return;
 #ifdef HOST_BUILD
-	printf("factoryreset: (build host) would delete %s and %s, write the note and reboot\n", CONFIG_FILE,
-		   EBOOK_CONFIG_FILE);
+	printf("factoryreset: (build host) would delete %s, %s and %s, write the note and reboot\n", CONFIG_FILE,
+		   EBOOK_CONFIG_FILE, ZVUK_SESSION_FILE);
 #else
 	printf("factoryreset: starting the reset\n");
 
@@ -173,8 +178,7 @@ void factoryreset_run(void) {
 	// Streaming caches (tracks and covers) go before the card is unmounted:
 	// after unmount_card() those files are unreachable, and a factory reset
 	// must not leave streamed tracks behind.
-	qobuzcache_clear_on_exit();
-	tidalcache_clear_on_exit();
+	stream_provider_wipe_all();
 	podcastcache_clear_on_exit();
 	dlna_clear_on_exit();
 
@@ -188,7 +192,7 @@ void factoryreset_run(void) {
 	unmount_card();
 
 	// This player's configuration goes now, without waiting for the reboot.
-	static const char *const OURS[] = {CONFIG_FILE, EBOOK_CONFIG_FILE};
+	static const char *const OURS[] = {CONFIG_FILE, EBOOK_CONFIG_FILE, ZVUK_SESSION_FILE};
 	for (size_t i = 0; i < sizeof(OURS) / sizeof(OURS[0]); i++) {
 		if (unlink(OURS[i]) == 0) {
 			printf("factoryreset: %s deleted\n", OURS[i]);

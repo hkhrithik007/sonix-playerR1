@@ -18,4 +18,11 @@ void chapters_init(gui_config_t *cfg);
 // comes back to the player rather than to whatever page was behind it.
 void chapters_open(void);
 
+// Move between embedded chapters or folder parts without changing the screen.
+// False at either end or when this book has no chapters.
+bool chapters_step(int direction);
+
+// Reuse the player's progress poll; no chapter-specific timer or disk writes.
+void chapters_refresh(void);
+
 #endif /* CHAPTERS_H */

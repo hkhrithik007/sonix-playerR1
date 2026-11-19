@@ -1,1383 +1,1261 @@
 #include "trackmenu.h"
+#include "src/gui/nowplaying/historypage.h"
+#include "src/gui/shell/artview.h"
+#include "src/gui/streaming/svcui.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/icons.h"
+#include "src/gui/library/browser.h"
+#include "src/gui/library/listacts.h"
 #include "src/gui/library/medialist.h"
-#include "src/gui/nowplaying/player.h"
 #include "src/gui/library/playlistpage.h"
-#include "src/gui/streaming/qobuzpage.h"
-#include "src/gui/streaming/tidalpage.h"
-#include "src/gui/shell/popover.h"
+#include "src/gui/nowplaying/chapters.h"
+#include "src/gui/nowplaying/cover.h"
+#include "src/gui/nowplaying/npicons.h"
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/queueundo.h"
 #include "src/gui/settings/musicsettings.h"
+#include "src/gui/shell/confirm.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/playbackplace.h"
+#include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_frame.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_toast.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
-#include "src/gui/nowplaying/cover.h"
-#include "src/system/audio/audio.h"
-#include "src/system/audio/replaygain.h"
-#include "src/system/decode/decode.h"
-#include "src/system/library/metadata.h"
-#include "src/system/playback/device_state.h"
-#include "src/system/core/lang.h"
+#include "src/gui/shell/topbar.h"
 #include "src/gui/streaming/podcastcard.h"
 #include "src/gui/streaming/podcastpage.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/tidalcache.h"
-#include "src/system/library/library.h"
-#include "src/system/playback/playlist.h"
+#include "src/system/audio/audio.h"
+#include "src/system/audio/replaygain.h"
+#include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
-#include "src/system/device/system.h"
-#include "lvgl/src/core/lv_obj_scroll_private.h"
+#include "src/system/decode/decode.h"
+#include "src/system/library/covertone.h"
+#include "src/system/library/covertonefan.h"
+#include "src/system/library/library.h"
+#include "src/system/library/metadata.h"
+#include "src/system/playback/audiobook.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/playback/playlist.h"
+#include "src/system/remote/dlna.h"
+#include "src/system/streaming/podcastcache.h"
+#include "src/system/streaming/provider.h"
 
 lv_obj_t *queue_screen;
 lv_obj_t *details_screen;
 
-// The queue is windowed like every other long list here: a fixed pool of row
-// widgets rides the scroll position, and each row looks up its title (one
-// indexed database lookup) at the moment it binds. Opening the page costs a
-// dozen binds, not hundreds, which is what makes it instant.
-#define QUEUE_THUMB_SIZE 56
-#define QUEUE_ROW_HEIGHT 72
-#define QUEUE_ROW_GAP 8
-#define QUEUE_ROW_PITCH (QUEUE_ROW_HEIGHT + QUEUE_ROW_GAP)
-#define QUEUE_ROW_POOL 12
-#define QUEUE_GRIP_SIZE 56
+// ---------------------------------------------------------------------------
+// The queue (Sonix UI 2.0, the handoff's "Очередь")
+//
+// A compact list in three runs, each under its heading: СЕЙЧАС ИГРАЕТ (the
+// playing track), ДАЛЕЕ · N (what is still to come, in the order it will
+// play) and УЖЕ ИГРАЛИ · N (what has played, oldest first). The rows are the
+// 2.0 row (sx_row, compact: 64 px, 84 with Large rows): the album's
+// thumbnail -- its tone plaque until there is one -- the title, the artist
+// and the length; the playing one on the surface with the equaliser.
+//
+// Gestures, the handoff's matrix for a queue row: a tap plays it (and the
+// page stays: the mini player says what plays), a drag to the left takes it
+// out ("✕ Remove", not the playing one) with "Undo" in the toast, a hold
+// opens its sheet (play now, move to next, up, down, show the album,
+// remove). The header's ⋮: save as a playlist, shuffle what is left, clear
+// "Up next" -- each with "Undo" (queueundo.h).
+//
+// What plays outside the queue (the handoff's `ext`): a station, AirPlay or
+// the Bluetooth receiver play beside it, so the queue is all there, with a
+// note on top instead of the playing run, and its next run starting at the
+// track it will go back to. A book (or a phone's track over DLNA) took the
+// queue's place, and the music queue it interrupted is kept aside
+// (device_state_parked()): that is the one listed, and a tap on it goes back
+// to it. Nothing ever played (the idle state): "Nothing is playing", and the
+// one button, "Shuffle all music".
+//
+// Windowed, as every long list here: the queue may be a whole library. The
+// runs have fixed row heights, so where any entry sits is arithmetic
+// (queue_row_y), and a pool of QUEUE_POOL rows is bound to whatever is in
+// view as the list scrolls. A bind is three indexed lookups (names, length,
+// album) and, when the album has one, its 56 px thumbnail read into the row's
+// own buffer (6 KB, allocated on first use and freed when the page is left).
+//
+// UI thread.
+// ---------------------------------------------------------------------------
 
-// The room a heading takes above its rows: History over the tracks already
-// played, Now playing over the track playing and the ones after it.
-#define QUEUE_HEADER_H 48
+#define QUEUE_POOL 16
+#define QUEUE_GROUP_H 44 // the handoff: 14 above, the 16 px heading, 6 below
+#define QUEUE_PAD_BOTTOM 24
 
-// The history is split by day, under a smaller heading of its own: Today,
-// Yesterday or the date. Only the ones near the top of the page are drawn, from
-// a pool of labels, as the rows are.
-#define QUEUE_SEP_H 40
-#define QUEUE_SEP_POOL 8
-
-// The page rests with Now playing at the top, and the history sits above it.
-// Pulling down into the history meets resistance: the list moves
-// QUEUE_PULL_NUM / QUEUE_PULL_DEN of what the finger does, and gives way once
-// it has moved QUEUE_PULL_OPEN_PX. Let go before that and it springs back.
-#define QUEUE_PULL_NUM 2
-#define QUEUE_PULL_DEN 5
-#define QUEUE_PULL_OPEN_PX 56
-
-// Carrying a row: how far the finger has to travel before a release counts as
-// a drop, and how close to an edge of the list it has to be before the list
-// moves under it, by QUEUE_EDGE_STEP each time the finger is read.
-#define QUEUE_DROP_MIN_TRAVEL 8
-#define QUEUE_EDGE_PX 70
-#define QUEUE_EDGE_STEP 18
-
-typedef struct {
-	lv_obj_t *button;
-	lv_obj_t *icon;
-	lv_obj_t *label;
-	lv_obj_t *check; // the tick on a chosen row while choosing
-	lv_obj_t *grip;	 // the handle on a row that can be moved, while reordering
-	int vindex;		 // the row of the page it shows (see queue_vrow_y), or -1
-	int index;		 // its position in the queue, or -1 on a row of the history
-	int hist;		 // its entry of queue_hist, or -1 on a row of the queue
-	bool has_thumb;
-	cover_image_t thumb;
-} queue_row_t;
-
-static lv_obj_t *queue_list; // the scrollable viewport
-static lv_obj_t *queue_body; // fixed-height canvas the pool rows sit on
-static lv_obj_t *queue_empty;
-static lv_obj_t *queue_history_header;
-static lv_obj_t *queue_now_header;
-static queue_row_t queue_rows[QUEUE_ROW_POOL];
-static int queue_total;	  // how many tracks the queue holds, from its first
-static int queue_current; // the track playing, as the rows were laid out for it
-static int queue_view_h;  // the height of the viewport
-static lv_obj_t *queue_title;
-
-// The history (playhistory.h) as the page was laid out for it, oldest first,
-// with where each of its rows sits, and the day headings between them.
-static library_history_item_t *queue_hist;
-static int queue_hist_count;
-static int *queue_hist_y;
-static int queue_hist_end; // where the history ends and Now playing begins
-// The history is off the page while choosing or reordering: neither acts on
-// it, and the page is not to be scrolled up into it meanwhile.
-static bool queue_hist_hidden;
-static struct {
-	int y;
-	long long when; // the time of the first entry under it
-} *queue_seps;
-static int queue_sep_count;
-static lv_obj_t *queue_sep_labels[QUEUE_SEP_POOL];
-static int queue_sep_bound[QUEUE_SEP_POOL]; // which heading each label shows, or -1
-
-// The two buttons always in the corner put the page into choosing rows to take
-// out (SELECT) or moving them by hand (REORDER). A long press on a row of the
-// history picks the row up, to be put down in what is still to play.
 typedef enum {
-	QUEUE_IDLE,
-	QUEUE_SELECT,
-	QUEUE_REORDER,
+	QUEUE_MODE_IDLE,   // nothing has played: the empty state
+	QUEUE_MODE_QUEUE,  // the queue, its track playing
+	QUEUE_MODE_BESIDE, // something plays beside the queue: a station, AirPlay, the receiver
+	QUEUE_MODE_PARKED, // a book or the phone took its place: the parked queue
 } queue_mode_t;
 
+typedef struct {
+	lv_obj_t *row;
+	int index;	   // the entry bound, -1 for none
+	int64_t album; // the album whose thumbnail is in `buf`, 0 for none
+	uint32_t display_generation;
+	uint8_t *buf; // COVERTONE_THUMB_BYTES(56), on first use
+	lv_image_dsc_t dsc;
+} queue_row_t;
+
+static lv_obj_t *queue_title;
+static lv_obj_t *queue_more_btn;
+static lv_obj_t *queue_list; // the scrollable viewport
+static lv_obj_t *queue_body; // as tall as the whole list; the rows sit on it
+static lv_obj_t *queue_heads[3];
+static lv_obj_t *queue_note_out;   // "Now playing X -- outside the queue"
+static lv_obj_t *queue_note_empty; // "Nothing next"
+static lv_obj_t *queue_idle;	   // the idle state
+static queue_row_t queue_rows[QUEUE_POOL];
+
+// The layout, as queue_layout() last worked it out.
 static queue_mode_t queue_mode;
-// While choosing: one per entry of the queue, and how many are set. Only what
-// is still to play can be chosen.
-static uint8_t *queue_chosen;
-static int queue_chosen_count;
-static lv_obj_t *queue_select_btn;
-static lv_obj_t *queue_reorder_btn;
-static lv_obj_t *queue_remove_btn;
-static lv_obj_t *queue_close_btn;
+static int queue_total;		 // entries of the list shown
+static int queue_cur;		 // the entry shown as playing; -1 when none is
+static int queue_next_first; // the first entry of the "Up next" run
+static int queue_next_count;
+static int queue_played_count; // entries 0 .. queue_played_count - 1
+static int queue_pitch;		   // a row and the gap under it
+static int32_t queue_y_cur, queue_y_next, queue_y_played;
+// What the layout was worked out for, so the poll's look (trackmenu_queue_
+// poll) costs nothing when nothing moved -- a layout binds every row in view
+// again, three lookups each.
+static unsigned queue_seen_revision;
+static unsigned queue_seen_metadata_revision;
+static int queue_seen_current = -2;
+static queue_mode_t queue_seen_mode;
+static char queue_seen_outside[256];
 
-// The row being carried, by its grip or, out of the history, by the row itself.
-// The row stays where it is, dimmed, and a copy of it follows the finger; the
-// accent rule says where it would land.
-static struct {
-	bool active;
-	bool moved;
-	bool by_row;	   // held by the row: its scroll chain is off until the drop
-	int from;		   // its position in the queue, or -1 for an entry of the history
-	long long hist_id; // the entry of the history it is, or -1
-	int target;		   // the position it would be put in front of, or -1
-	lv_obj_t *held;
-	lv_point_t start;
-	int32_t grab_dx;
-	int32_t grab_dy;
-} queue_drag;
-static lv_obj_t *queue_drag_layer;
-static lv_obj_t *queue_ghost;
-static lv_obj_t *queue_drop_line;
-// A row carried out of the history is let go of as a tap would be: the click
-// that follows the drop must not play it.
-static bool queue_drop_guard;
-
-// The pull into the history, for the drag under way. Only a drag that began at
-// or below Now playing meets it.
-static struct {
-	bool on;
-	bool adjusting;	 // the list is being put back where the pull wants it
-	int32_t natural; // where the list would be without the resistance
-	int32_t last;	 // where it was left last
-} queue_pull;
-
-static lv_obj_t *details_card;
-static lv_obj_t *details_scroll;
-static gui_config_t *g_cfg;
-
-// ---------------------------------------------------------------------------
-// Queue: the history of what was played, the track playing and the ones after
-// it, tappable to play.
-//
-// The rows of the page are counted as one run: first the entries of the
-// history, then the queue from the track playing on. What came before the track
-// playing in the queue is not shown: in order it is what was skipped over, and
-// what was played of it is in the history; a shuffle deals the track playing
-// first, so there everything is still to come.
-// ---------------------------------------------------------------------------
-
-// Where Now playing begins on the canvas: under the history, when there is one.
-static int queue_now_top(void) { return queue_hist_end; }
-
-// How many rows of the queue the page shows: the track playing and those after.
-static int queue_shown(void) { return queue_total > 0 ? queue_total - queue_current : 0; }
-
-// Where queued track `index` (the track playing or one after it) sits on the
-// canvas. `queue_total` gives the end of the last row.
-static int queue_row_y(int index) { return queue_now_top() + QUEUE_HEADER_H + (index - queue_current) * QUEUE_ROW_PITCH; }
-
-// Where row `vindex` of the page sits on the canvas.
-static int queue_vrow_y(int vindex) {
-	if (vindex < queue_hist_count) {
-		return queue_hist_y[vindex];
-	}
-	return queue_row_y(queue_current + vindex - queue_hist_count);
-}
-
-// The row of the page at height `y` on the canvas, or the nearest one.
-static int queue_vindex_at(int y) {
-	int count = queue_hist_count + queue_shown();
-	int vindex;
-	if (queue_hist_count > 0 && y < queue_now_top()) {
-		// The last row of the history that starts above `y`.
-		int lo = 0, hi = queue_hist_count - 1;
-		while (lo < hi) {
-			int mid = (lo + hi + 1) / 2;
-			if (queue_hist_y[mid] <= y) {
-				lo = mid;
-			} else {
-				hi = mid - 1;
-			}
-		}
-		vindex = lo;
-	} else {
-		vindex = queue_hist_count + (y - queue_now_top() - QUEUE_HEADER_H) / QUEUE_ROW_PITCH;
-		if (vindex < queue_hist_count) {
-			vindex = queue_hist_count;
-		}
-	}
-	if (vindex >= count) {
-		vindex = count - 1;
-	}
-	return vindex < 0 ? 0 : vindex;
-}
-
-// The scroll position furthest down the list can go.
-static int queue_scroll_max(void) {
-	int max = lv_obj_get_height(queue_body) - queue_view_h;
-	return max < 0 ? 0 : max;
-}
-
-static void queue_row_paint_check(queue_row_t *row) {
-	bool on = queue_mode == QUEUE_SELECT && queue_chosen && row->index >= 0 && row->index < queue_total && queue_chosen[row->index];
-	if (on) {
-		lv_obj_set_style_image_recolor(row->check, theme()->accent, 0);
-	}
-	lv_obj_set_hidden(row->check, !on);
-}
-
-// The tick, the grip and the dimming of the row being carried: what a row
-// shows of the mode the page is in.
-static void queue_row_paint_tools(queue_row_t *row) {
-	queue_row_paint_check(row);
-	bool grip = queue_mode == QUEUE_REORDER && row->index > queue_current && row->index < queue_total;
-	lv_obj_set_hidden(row->grip, !grip);
-	bool carried = queue_drag.active && ((row->index >= 0 && row->index == queue_drag.from) || (row->hist >= 0 && queue_hist[row->hist].id == queue_drag.hist_id));
-	lv_opa_t opa = carried ? LV_OPA_40 : LV_OPA_COVER;
-	if (lv_obj_get_style_opa(row->button, 0) != opa) {
-		lv_obj_set_style_opa(row->button, opa, 0);
-	}
-}
-
-static void queue_paint_rows(void) {
-	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		queue_row_paint_tools(&queue_rows[i]);
-	}
-}
-
-// The corner, for the mode the page is in: the two ways in while idle, the bin
-// and the close button while choosing, and only the reorder button while
-// reordering, lit in the accent; otherwise the local colour is taken off again,
-// so the icon style, and with it the palette, reaches the glyph. An empty queue
-// has nothing to choose or move.
-static void queue_mode_show(void) {
-	bool idle = queue_mode == QUEUE_IDLE && queue_total > 0;
-	bool select = queue_mode == QUEUE_SELECT;
-	bool reorder = queue_mode == QUEUE_REORDER;
-	lv_obj_set_hidden(queue_select_btn, !idle);
-	lv_obj_set_hidden(queue_reorder_btn, !(idle || reorder));
-	lv_obj_set_hidden(queue_remove_btn, !select);
-	lv_obj_set_hidden(queue_close_btn, !select);
-
-	lv_obj_t *glyph = lv_obj_get_child(queue_reorder_btn, 0);
-	if (glyph && reorder) {
-		lv_obj_set_style_image_recolor(glyph, theme()->accent, 0);
-	} else if (glyph) {
-		lv_obj_remove_local_style_prop(glyph, LV_STYLE_IMAGE_RECOLOR, 0);
-	}
-	// The bin is there from the start, faded until something is chosen.
-	lv_obj_set_style_opa(queue_remove_btn, queue_chosen_count > 0 ? LV_OPA_COVER : LV_OPA_40, 0);
-
-	settingsrow_title_corner_slots(queue_title, g_cfg, idle || select ? 2 : (reorder ? 1 : 0));
-	queue_paint_rows();
-}
+// Editing never changes playback or the parked queue. Revisions invalidate picks.
+static int queue_edit_mode; // 0 view, 1 select, 2 reorder
+static unsigned queue_edit_revision;
+static int queue_edit_current;
+static int queue_edit_count;
+static unsigned char *queue_selected;
+static int queue_drag_from = -1, queue_drag_to;
+static int queue_drag_y, queue_drag_origin;
+static lv_obj_t *queue_drag_row;
+static void queue_edit_end(void *unused);
+static void queue_edit_paint(void);
+static bool queue_edit_valid(void);
+static void queue_edit_reset(void);
+static void queue_grip_cb(lv_event_t *e);
+static void queue_edit_toggle(int index);
 
 static void queue_layout(void);
-static void queue_scroll_to(int scroll, lv_anim_enable_t anim);
+static queue_mode_t queue_mode_now(void);
 static void queue_window_update(void);
+static int32_t queue_row_y(int index);
 
-// Takes the history off the page, or puts it back, with the page staying on
-// what it shows: what is below Now playing moves by as much as the history
-// above it grew or shrank.
-static void queue_history_hide(bool hidden) {
-	if (hidden == queue_hist_hidden) {
+static bool queue_page_up(void) { return queue_screen && lv_screen_active() == queue_screen; }
+
+// The name a row, a sheet and a toast give entry `index`.
+static bool queue_path_at(int index, char *out, size_t size) {
+	if (queue_mode == QUEUE_MODE_PARKED) {
+		return device_state_parked_path(index, out, size);
+	}
+	return playlist_path_at(index, out, size);
+}
+
+static void queue_names_of(const char *path, char *title, size_t title_size, char *artist, size_t artist_size, char *album, size_t album_size) {
+	if (album && album_size)
+		album[0] = '\0';
+	title[0] = '\0';
+	artist[0] = '\0';
+	if (library_track_names(path, title, title_size, artist, artist_size) && title[0]) {
 		return;
 	}
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	int top = queue_now_top();
-	queue_hist_hidden = hidden;
-	queue_layout();
-	queue_scroll_to(scroll + queue_now_top() - top, LV_ANIM_OFF);
-	queue_window_update();
-}
-
-static void queue_mode_set(queue_mode_t mode) {
-	if (mode != QUEUE_SELECT) {
-		free(queue_chosen);
-		queue_chosen = NULL;
-		queue_chosen_count = 0;
+	// Not in the library: a streamed track keeps its tags in the sidecar
+	// beside the cache file, and a file from outside the music its own.
+	song_metadata_t meta = {0};
+	stream_provider_fill_metadata(path, &meta);
+	if (!meta.title[0]) {
+		metadata_read(path, &meta);
 	}
-	queue_mode = mode;
-	queue_history_hide(mode != QUEUE_IDLE);
-	queue_mode_show();
-}
-
-// Starts choosing, with nothing chosen yet.
-static bool queue_selection_start(void) {
-	if (queue_total <= 0) {
-		return false;
-	}
-	free(queue_chosen);
-	queue_chosen = calloc((size_t)queue_total, 1);
-	if (!queue_chosen) {
-		queue_mode_set(QUEUE_IDLE);
-		return false;
-	}
-	queue_chosen_count = 0;
-	queue_mode = QUEUE_SELECT;
-	queue_history_hide(true);
-	queue_mode_show();
-	return true;
-}
-
-// Chooses the row, or lets it go. The mode stays on until it is closed.
-static void queue_selection_toggle(queue_row_t *row) {
-	int index = row->index;
-	if (queue_mode != QUEUE_SELECT || !queue_chosen || index <= queue_current || index >= queue_total) {
+	if (album && album_size)
+		snprintf(album, album_size, "%s", meta.album);
+	if (meta.title[0]) {
+		snprintf(title, title_size, "%s", meta.title);
+		snprintf(artist, artist_size, "%s", metadata_shown_artist(&meta));
 		return;
 	}
-	queue_chosen[index] = !queue_chosen[index];
-	queue_chosen_count += queue_chosen[index] ? 1 : -1;
-	queue_mode_show();
-}
-
-static queue_row_t *queue_row_of(lv_obj_t *button) {
-	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		if (queue_rows[i].button == button && queue_rows[i].vindex >= 0) {
-			return &queue_rows[i];
-		}
-	}
-	return NULL;
-}
-
-static void queue_row_drop_thumb(queue_row_t *row) {
-	if (row->has_thumb) {
-		// The widget must stop pointing at the pixels before they go.
-		lv_image_set_src(row->icon, &icon_music2);
-		lv_obj_add_style(row->icon, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(row->icon, LV_OPA_COVER, 0);
-		cover_free(&row->thumb);
-		row->has_thumb = false;
-	}
-}
-
-// No artwork on these rows: a queue is a list of what is coming, and a column
-// of covers is slower to read and slower to build. The playing track gets the
-// now-playing mark in the accent colour instead; everything else gets the plain
-// note.
-//
-// Its own function because the mark changes without the row changing: painting
-// it only where a row is bound would leave the mark on a finished track until
-// the list scrolled far enough to rebind that row.
-static void queue_row_paint_mark(queue_row_t *row) {
-	if (!row->icon || row->vindex < 0) {
-		return;
-	}
-	bool is_playing_row = row->index >= 0 && row->index == playlist_current_index();
-	lv_image_set_src(row->icon, is_playing_row ? &icon_now_playing : &icon_music2);
-	lv_obj_add_style(row->icon, &theme_style_icon, 0);
-	if (is_playing_row) {
-		lv_obj_set_style_image_recolor(row->icon, theme()->accent, 0);
-	} else {
-		lv_obj_remove_local_style_prop(row->icon, LV_STYLE_IMAGE_RECOLOR, 0);
-	}
-	lv_obj_set_style_image_recolor_opa(row->icon, LV_OPA_COVER, 0);
-}
-
-// A title for a file with none: its name, without the extension.
-static void queue_file_title(const char *path, char *title, size_t size) {
 	const char *slash = strrchr(path, '/');
-	snprintf(title, size, "%.250s", slash ? slash + 1 : path);
+	snprintf(title, title_size, "%s", slash ? slash + 1 : path);
 	char *dot = strrchr(title, '.');
-	if (dot) {
+	if (dot && dot != title) {
 		*dot = '\0';
 	}
 }
 
-// Points a pool row at row `vindex` of the page and resolves its title on the
-// spot; an indexed lookup is cheap enough to do during a scroll.
-static void queue_row_bind(queue_row_t *row, int vindex) {
-	if (row->vindex == vindex) {
-		return;
-	}
-
-	queue_row_drop_thumb(row);
-	row->vindex = vindex;
-	row->index = -1;
-	row->hist = -1;
-
-	if (vindex < 0 || vindex >= queue_hist_count + queue_shown()) {
-		row->vindex = -1;
-		lv_obj_set_hidden(row->button, true);
-		return;
-	}
-
+static void queue_title_of(int index, char *out, size_t size) {
 	char path[512];
-	char title[256];
-	if (vindex < queue_hist_count) {
-		// The title was written down with the entry.
-		row->hist = vindex;
-		if (!library_history_entry(queue_hist[vindex].id, path, sizeof(path), title, sizeof(title))) {
-			row->vindex = -1;
-			lv_obj_set_hidden(row->button, true);
+	out[0] = '\0';
+	if (queue_path_at(index, path, sizeof(path))) {
+		char title[256];
+		char artist[256];
+		queue_names_of(path, title, sizeof(title), artist, sizeof(artist), NULL, 0);
+		snprintf(out, size, "%s", title);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The rows
+// ---------------------------------------------------------------------------
+
+static int queue_user_index(void *user) { return (int)(intptr_t)user - 1; }
+
+// Whether entry `index` may be taken out: never the playing track, and
+// nothing of a parked queue (it is not the queue now).
+static bool queue_removable(int index) { return (queue_mode == QUEUE_MODE_QUEUE || queue_mode == QUEUE_MODE_BESIDE) && index != playlist_current_index(); }
+
+// The album's 56 px thumbnail on the row, or its tone plaque until there is
+// one (covertone.h, "List rows").
+static void queue_row_cover(queue_row_t *q, const char *path, const char *fallback_album) {
+	char album[512];
+	int64_t id = 0;
+	char shown[256] = "";
+	if (library_track_album_value(path, album, sizeof(album)) && album[0]) {
+		id = covertone_album_id(album);
+		library_album_title(album, shown, sizeof(shown));
+	}
+	float hue = sx_placeholder_file_hue(path, shown[0] ? shown : fallback_album);
+	lv_color_t tone = sx_placeholder_tone(hue);
+	if (id && id == q->album) {
+		return; // that thumbnail is up already
+	}
+	// Off the buffer before it is written to.
+	sx_row_set_thumb(q->row, NULL, tone);
+	sx_row_set_content(q->row, hue, false, false, 0);
+	q->album = 0;
+	if (!id) {
+		return;
+	}
+	if (!q->buf) {
+		q->buf = malloc(COVERTONE_THUMB_BYTES(COVERTONE_THUMB_SMALL));
+		if (!q->buf) {
 			return;
 		}
-		if (!title[0]) {
-			queue_file_title(path, title, sizeof(title));
-		}
-		lv_obj_set_hidden(row->button, false);
-		lv_obj_set_y(row->button, queue_vrow_y(vindex));
-		lv_label_set_text(row->label, title);
-		queue_row_paint_mark(row);
-		queue_row_paint_tools(row);
-		return;
 	}
-
-	int index = queue_current + vindex - queue_hist_count;
-	row->index = index;
-	if (!playlist_path_at(index, path, sizeof(path))) {
-		row->vindex = -1;
-		row->index = -1;
-		lv_obj_set_hidden(row->button, true);
-		return;
-	}
-
-	if (!library_track_title(path, title, sizeof(title))) {
-		// Not in the library: it may be a Qobuz track, which is kept out of the
-		// library on purpose. The title is still there, in the sidecar file next
-		// to the track. Without this the queue showed a column of numbers, which
-		// were the file names.
-		song_metadata_t meta;
-		metadata_read(path, &meta);
-		if (meta.title[0]) {
-			snprintf(title, sizeof(title), "%.250s", meta.title);
-		} else {
-			queue_file_title(path, title, sizeof(title));
-		}
-	}
-
-	lv_obj_set_hidden(row->button, false);
-	lv_obj_set_y(row->button, queue_row_y(index));
-	lv_label_set_text(row->label, title);
-
-	queue_row_paint_mark(row);
-	queue_row_paint_tools(row);
-}
-
-// Today, Yesterday, or the day of the month and the month, with the year when
-// it is not this one.
-static void queue_day_text(long long when, char *out, size_t size) {
-	static const char *const MONTHS[12] = {"podcast_january", "podcast_february", "podcast_march", "podcast_april", "podcast_may", "podcast_june", "podcast_july", "podcast_august", "podcast_september", "podcast_october", "podcast_november", "podcast_december"};
-	time_t then = (time_t)when;
-	time_t now = time(NULL);
-	time_t day_before = now - 24 * 60 * 60;
-	struct tm t_then, t_now, t_before;
-	if (!localtime_r(&then, &t_then) || !localtime_r(&now, &t_now) || !localtime_r(&day_before, &t_before)) {
-		out[0] = '\0';
-		return;
-	}
-	if (t_then.tm_year == t_now.tm_year && t_then.tm_yday == t_now.tm_yday) {
-		snprintf(out, size, "%s", tr("history_today"));
-	} else if (t_then.tm_year == t_before.tm_year && t_then.tm_yday == t_before.tm_yday) {
-		snprintf(out, size, "%s", tr("history_yesterday"));
-	} else if (t_then.tm_year == t_now.tm_year) {
-		snprintf(out, size, "%d %s", t_then.tm_mday, tr(MONTHS[t_then.tm_mon % 12]));
+	if (covertone_thumb(id, COVERTONE_THUMB_SMALL, &q->dsc, q->buf, COVERTONE_THUMB_BYTES(COVERTONE_THUMB_SMALL))) {
+		q->album = id;
+		q->display_generation = cover_new_display_generation();
+		sx_row_set_thumb(q->row, &q->dsc, tone);
+		sx_row_set_content(q->row, hue, false, true, q->display_generation);
 	} else {
-		snprintf(out, size, "%d %s %d", t_then.tm_mday, tr(MONTHS[t_then.tm_mon % 12]), t_then.tm_year + 1900);
+		covertone_request(id); // the listener brings it (queue_covertone_changed)
 	}
 }
 
-// The day headings near the top of the page, from the pool. The text is worked
-// out as a label is bound, so Today becomes Yesterday at midnight.
-static void queue_seps_update(int scroll) {
-	// The first heading that can still be seen.
-	int lo = 0, hi = queue_sep_count;
-	while (lo < hi) {
-		int mid = (lo + hi) / 2;
-		if (queue_seps[mid].y + QUEUE_SEP_H <= scroll) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
+static void queue_row_bind(queue_row_t *q, int index) {
+	q->index = index;
+	char path[512];
+	if (index < 0 || !queue_path_at(index, path, sizeof(path))) {
+		q->index = -1;
+		lv_obj_set_hidden(q->row, true);
+		return;
 	}
-	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
-		int sep = lo + i;
-		if (sep >= queue_sep_count || queue_seps[sep].y >= scroll + queue_view_h) {
-			queue_sep_bound[i] = -1;
-			lv_obj_set_hidden(queue_sep_labels[i], true);
-			continue;
-		}
-		if (queue_sep_bound[i] != sep) {
-			char text[64];
-			queue_day_text(queue_seps[sep].when, text, sizeof(text));
-			lv_label_set_text(queue_sep_labels[i], text);
-			lv_obj_set_y(queue_sep_labels[i], queue_seps[sep].y + 8);
-			queue_sep_bound[i] = sep;
-		}
-		lv_obj_set_hidden(queue_sep_labels[i], false);
+	char title[256];
+	char artist[256];
+	char fallback_album[256];
+	queue_names_of(path, title, sizeof(title), artist, sizeof(artist), fallback_album, sizeof(fallback_album));
+
+	char length[16] = "";
+	uint32_t ms = 0;
+	library_track_quality_length(path, &ms);
+	if (ms > 0) {
+		formatDoubleSeconds(ms / 1000.0, length, sizeof(length));
 	}
+
+	sx_row_set_user(q->row, (void *)(intptr_t)(index + 1));
+	sx_row_set_title(q->row, title);
+	// A "play next" still to come says so: why it is where it is, and that a
+	// change of shuffle will not move it (1.2.5).
+	bool queued = queue_mode == QUEUE_MODE_QUEUE && playlist_is_queued_next(index);
+	char subtitle[384];
+	svcui_track_caption(path, artist, subtitle, sizeof(subtitle));
+	sx_row_set_subtitle(q->row, subtitle, queued ? tr("queue_badge_next") : NULL, length[0] ? length : NULL);
+	sx_row_set_playing(q->row, index == queue_cur);
+	sx_row_set_trail(q->row, queue_edit_mode == 1 && queue_removable(index) ? (queue_selected[index] ? SX_ROW_TRAIL_CHECK : SX_ROW_TRAIL_BLANK) : queue_edit_mode == 2 && index > queue_cur ? SX_ROW_TRAIL_GRIP : SX_ROW_TRAIL_NONE);
+	sx_row_set_swipes(q->row, false, !queue_edit_mode && queue_removable(index));
+	queue_row_cover(q, path, fallback_album);
+
+	lv_obj_set_y(q->row, queue_row_y(index));
+	lv_obj_set_hidden(q->row, false);
+}
+
+// Where entry `index` sits on the body, -1 when it is not listed.
+static int32_t queue_row_y(int index) {
+	if (index < 0) {
+		return -1;
+	}
+	if (index == queue_cur) {
+		return queue_y_cur;
+	}
+	if (index >= queue_next_first && index < queue_next_first + queue_next_count) {
+		return queue_y_next + (int32_t)(index - queue_next_first) * queue_pitch;
+	}
+	if (index < queue_played_count) {
+		return queue_y_played + (int32_t)index * queue_pitch;
+	}
+	return -1;
+}
+
+// The entries of a run of `count` rows starting at `y0` that are within
+// [top, bottom], into `want`.
+static int queue_run_visible(int32_t y0, int first, int count, int32_t top, int32_t bottom, int *want, int n, int max) {
+	if (count <= 0 || y0 + (int32_t)count * queue_pitch < top || y0 > bottom) {
+		return n;
+	}
+	int from = top > y0 ? (int)((top - y0) / queue_pitch) : 0;
+	int to = (int)((bottom - y0) / queue_pitch);
+	if (to > count - 1) {
+		to = count - 1;
+	}
+	for (int k = from; k <= to && n < max; k++) {
+		want[n++] = first + k;
+	}
+	return n;
 }
 
 static void queue_window_update(void) {
-	int count = queue_hist_count + queue_shown();
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	if (scroll < 0) {
-		scroll = 0;
-	}
-	queue_seps_update(scroll);
-	if (count <= 0) {
-		for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-			queue_row_bind(&queue_rows[i], -1);
-		}
+	if (!queue_list) {
 		return;
 	}
-
-	int first = queue_vindex_at(scroll) - 1;
-	if (first + QUEUE_ROW_POOL > count) {
-		first = count - QUEUE_ROW_POOL;
-	}
-	if (first < 0) {
-		first = 0;
-	}
-
-	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		int vindex = first + i;
-		queue_row_bind(&queue_rows[vindex % QUEUE_ROW_POOL], vindex < count ? vindex : -1);
-	}
-}
-
-// Reads the history again and works out where its rows and headings go.
-static void queue_history_layout(void) {
-	free(queue_hist);
-	free(queue_hist_y);
-	free(queue_seps);
-	queue_hist = NULL;
-	queue_hist_y = NULL;
-	queue_seps = NULL;
-	queue_sep_count = 0;
-	queue_hist_count = queue_hist_hidden ? 0 : library_history_items(&queue_hist);
-	if (queue_hist_count > 0) {
-		queue_hist_y = malloc((size_t)queue_hist_count * sizeof(*queue_hist_y));
-		queue_seps = malloc((size_t)queue_hist_count * sizeof(*queue_seps));
-	}
-	if (!queue_hist_y || !queue_seps) {
-		free(queue_hist);
-		free(queue_hist_y);
-		free(queue_seps);
-		queue_hist = NULL;
-		queue_hist_y = NULL;
-		queue_seps = NULL;
-		queue_hist_count = 0;
-	}
-
-	int y = QUEUE_HEADER_H;
-	long long day = -1;
-	for (int i = 0; i < queue_hist_count; i++) {
-		// A new heading where the day changes. An entry from before the clock
-		// was set has no day, and goes under whatever heading is above it.
-		time_t when = (time_t)queue_hist[i].played_at;
-		struct tm t;
-		if (when > 0 && localtime_r(&when, &t)) {
-			long long key = (long long)t.tm_year * 1000 + t.tm_yday;
-			if (key != day) {
-				day = key;
-				queue_seps[queue_sep_count].y = y;
-				queue_seps[queue_sep_count].when = queue_hist[i].played_at;
-				queue_sep_count++;
-				y += QUEUE_SEP_H;
-			}
+	int want[QUEUE_POOL];
+	int n = 0;
+	if (queue_mode != QUEUE_MODE_IDLE && queue_pitch > 0) {
+		int32_t top = lv_obj_get_scroll_y(queue_list) - queue_pitch;
+		int32_t bottom = top + lv_obj_get_height(queue_list) + 2 * queue_pitch;
+		if (queue_cur >= 0) {
+			n = queue_run_visible(queue_y_cur, queue_cur, 1, top, bottom, want, n, QUEUE_POOL);
 		}
-		queue_hist_y[i] = y;
-		y += QUEUE_ROW_PITCH;
-	}
-	queue_hist_end = queue_hist_count > 0 ? y : 0;
-	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
-		queue_sep_bound[i] = -1;
-	}
-}
-
-// Lays the page out for the queue as it is now: the headings, the canvas and,
-// at the next window update, every row.
-static void queue_layout(void) {
-	queue_total = playlist_count();
-	if (queue_total < 0) {
-		queue_total = 0;
-	}
-	int current = playlist_current_index();
-	if (current >= queue_total) {
-		current = queue_total - 1;
-	}
-	queue_current = current < 0 ? 0 : current;
-	queue_history_layout();
-
-	lv_obj_set_hidden(queue_history_header, queue_hist_count == 0);
-	lv_obj_set_hidden(queue_now_header, queue_total == 0);
-	lv_obj_set_y(queue_now_header, queue_now_top() + 10);
-	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, queue_now_top() + 72);
-
-	// Tall enough for Now playing to reach the top of the page however little
-	// comes after it.
-	int height = queue_total ? queue_row_y(queue_total) : 0;
-	if (height < queue_now_top() + queue_view_h) {
-		height = queue_now_top() + queue_view_h;
-	}
-	lv_obj_set_height(queue_body, height);
-	// A scroll set next is clamped to the scrollable range, and that range comes
-	// from the height just set. Without the layout being brought up to date
-	// first the clamp uses the old height.
-	lv_obj_update_layout(queue_list);
-
-	// Every row binds again, and until it does it points at nothing: the
-	// entries it pointed at may not be there any more.
-	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		queue_rows[i].vindex = -2;
-		queue_rows[i].index = -1;
-		queue_rows[i].hist = -1;
-	}
-	lv_obj_set_hidden(queue_empty, queue_total != 0);
-	queue_pull.on = false;
-}
-
-// Puts the list at `scroll`, within what it can reach.
-static void queue_scroll_to(int scroll, lv_anim_enable_t anim) {
-	int max = queue_scroll_max();
-	scroll = scroll < 0 ? 0 : (scroll > max ? max : scroll);
-	lv_obj_scroll_to_y(queue_list, scroll, anim);
-}
-
-static void queue_rebuild(void) {
-	queue_layout();
-	// Opened on Now playing rather than at the top: the top is wherever the
-	// history begins, which may be days ago.
-	queue_scroll_to(queue_now_top(), LV_ANIM_OFF);
-	queue_window_update();
-	queue_mode_show();
-}
-
-// The pointer that is scrolling the list, if one is: the throw that follows a
-// lift runs from the animation timer, where there is no active input device.
-static lv_indev_t *queue_scrolling_indev(void) {
-	for (lv_indev_t *indev = lv_indev_get_next(NULL); indev; indev = lv_indev_get_next(indev)) {
-		if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER && lv_indev_get_scroll_obj(indev) == queue_list) {
-			return indev;
-		}
-	}
-	return NULL;
-}
-
-// Back to Now playing, for a pull into the history that did not go far enough.
-static void queue_pull_spring_back(lv_indev_t *indev) {
-	queue_pull.on = false;
-	queue_pull.adjusting = true;
-	if (indev) {
-		// The throw would go on carrying the list the other way.
-		lv_indev_reset(indev, queue_list);
-	}
-	queue_scroll_to(queue_now_top(), LV_ANIM_ON);
-	queue_pull.adjusting = false;
-}
-
-// While the finger drags the list above Now playing, it is kept to a part of
-// what the finger does; once it has gone far enough it moves freely. After the
-// lift, a list still above Now playing goes back to it.
-static void queue_pull_follow(void) {
-	lv_indev_t *indev = queue_scrolling_indev();
-	if (!indev) {
-		return;
-	}
-	int32_t anchor = queue_now_top();
-	int32_t scroll = lv_obj_get_scroll_y(queue_list);
-	if (lv_indev_get_state(indev) != LV_INDEV_STATE_PRESSED) {
-		if (scroll < anchor) {
-			queue_pull_spring_back(indev);
-		}
-		return;
+		n = queue_run_visible(queue_y_next, queue_next_first, queue_next_count, top, bottom, want, n, QUEUE_POOL);
+		n = queue_run_visible(queue_y_played, 0, queue_played_count, top, bottom, want, n, QUEUE_POOL);
 	}
 
-	queue_pull.natural += scroll - queue_pull.last;
-	int32_t wanted = queue_pull.natural;
-	if (wanted < anchor) {
-		wanted = anchor - (anchor - wanted) * QUEUE_PULL_NUM / QUEUE_PULL_DEN;
-	}
-	if (anchor - wanted >= QUEUE_PULL_OPEN_PX) {
-		queue_pull.on = false; // through: from here the list follows the finger
-	}
-	if (wanted != scroll) {
-		queue_pull.adjusting = true;
-		lv_obj_scroll_by_raw(queue_list, 0, scroll - wanted);
-		queue_pull.adjusting = false;
-	}
-	queue_pull.last = wanted;
-}
-
-static void queue_scroll_cb(lv_event_t *e) {
-	if (queue_pull.adjusting) {
-		return;
-	}
-	lv_event_code_t code = lv_event_get_code(e);
-	if (code == LV_EVENT_RELEASED) {
-		// Let go short of the history: back now, before a throw can carry
-		// the list any further into it.
-		if (queue_pull.on && lv_obj_get_scroll_y(queue_list) < queue_now_top()) {
-			queue_pull_spring_back(queue_scrolling_indev());
-		}
-		return;
-	}
-	if (code == LV_EVENT_SCROLL_BEGIN) {
-		// A drag starting at or below Now playing meets the pull; one that
-		// starts in the history is already through it.
-		lv_indev_t *indev = queue_scrolling_indev();
-		if (indev) {
-			// A finger on the list stops a spring back still under way, rather
-			// than being fought by it.
-			queue_pull.adjusting = true;
-			lv_anim_delete(queue_list, NULL);
-			queue_pull.adjusting = false;
-		}
-		int32_t scroll = lv_obj_get_scroll_y(queue_list);
-		queue_pull.on = indev && queue_hist_count > 0 && scroll >= queue_now_top();
-		queue_pull.natural = scroll;
-		queue_pull.last = scroll;
-		return;
-	}
-	if (code == LV_EVENT_SCROLL_END) {
-		if (queue_pull.on && lv_obj_get_scroll_y(queue_list) < queue_now_top()) {
-			queue_pull_spring_back(NULL);
-		}
-		queue_pull.on = false;
-		return;
-	}
-	if (queue_pull.on) {
-		queue_pull_follow();
-	}
-	queue_window_update();
-}
-
-// The track changed under the page. With the page showing, the one left joins
-// the history, the headings move round the new track, and a list resting on Now
-// playing follows it there; otherwise only the marks are repainted, and opening
-// the page lays it out.
-// Called from the one place in the player that sees every change of track, the
-// same way the browser and the library lists are told.
-static void queue_drag_end(bool drop);
-
-void trackmenu_notify_now_playing(void) {
-	if (!queue_list || lv_screen_active() != queue_screen) {
-		for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-			queue_row_paint_mark(&queue_rows[i]);
-		}
-		return;
-	}
-
-	int total = queue_total;
-	int anchor = queue_now_top();
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	queue_layout();
-	if (queue_total != total) {
-		// Entries came or went: the choices and the carried row no longer
-		// point where they did.
-		queue_drag_end(false);
-		queue_mode_set(QUEUE_IDLE);
-	} else if (queue_chosen && queue_chosen[queue_current]) {
-		// The track playing cannot be chosen.
-		queue_chosen[queue_current] = 0;
-		queue_chosen_count--;
-	}
-	if (LV_ABS(scroll - anchor) <= 1) {
-		queue_scroll_to(queue_now_top(), LV_ANIM_ON);
-	} else if (scroll > queue_scroll_max()) {
-		queue_scroll_to(scroll, LV_ANIM_OFF);
-	}
-	queue_window_update();
-	queue_mode_show();
-}
-
-// ---------------------------------------------------------------------------
-// Carrying a row: by its grip while reordering, or out of the history after a
-// long press. Either way it can only be put down after the track playing.
-// ---------------------------------------------------------------------------
-
-// The accent rule in front of position `before`. Drawn on the canvas, so it
-// scrolls with the rows.
-static void queue_drop_line_show(int before) {
-	if (!queue_drop_line) {
-		queue_drop_line = lv_obj_create(queue_body);
-		lv_obj_set_ignore_layout(queue_drop_line, true);
-		lv_obj_set_scrollable(queue_drop_line, false);
-		lv_obj_set_clickable(queue_drop_line, false);
-		lv_obj_set_style_border_width(queue_drop_line, 0, 0);
-		lv_obj_set_style_shadow_width(queue_drop_line, 0, 0);
-		lv_obj_set_style_pad_all(queue_drop_line, 0, 0);
-		lv_obj_add_style(queue_drop_line, &theme_style_accent_bg, 0);
-		lv_obj_set_style_radius(queue_drop_line, 2, 0);
-		lv_obj_set_size(queue_drop_line, lv_obj_get_width(queue_body), 4);
-	}
-	lv_obj_set_pos(queue_drop_line, 0, queue_row_y(before) - QUEUE_ROW_GAP / 2 - 2);
-	lv_obj_set_hidden(queue_drop_line, false);
-	lv_obj_move_foreground(queue_drop_line);
-}
-
-// Puts the copy where the finger is holding it. See kblayoutpage.c: the
-// difference is read back rather than computed, so nothing here has to know
-// about the parent's insets.
-static void queue_ghost_follow(lv_point_t point) {
-	lv_area_t here;
-	lv_obj_get_coords(queue_ghost, &here);
-	int32_t dx = (point.x - queue_drag.grab_dx) - here.x1;
-	int32_t dy = (point.y - queue_drag.grab_dy) - here.y1;
-	lv_obj_set_pos(queue_ghost, lv_obj_get_x(queue_ghost) + dx, lv_obj_get_y(queue_ghost) + dy);
-}
-
-static void queue_drag_start(queue_row_t *row, lv_obj_t *held, lv_point_t point) {
-	lv_area_t area;
-	lv_obj_get_coords(row->button, &area);
-	queue_drag.active = true;
-	queue_drag.moved = false;
-	queue_drag.by_row = held == row->button;
-	queue_drag.from = row->index;
-	queue_drag.hist_id = row->hist >= 0 ? queue_hist[row->hist].id : -1;
-	queue_drag.target = -1;
-	queue_drag.held = held;
-	queue_drag.start = point;
-	queue_drag.grab_dx = point.x - area.x1;
-	queue_drag.grab_dy = point.y - area.y1;
-
-	if (queue_drag.by_row) {
-		// A drag that goes on from the long press carries the row, not the
-		// list. The row is a handle until the drop, and is not shown pressed.
-		lv_obj_set_scroll_chain_ver(held, false);
-		lv_obj_remove_state(held, LV_STATE_PRESSED);
-	}
-
-	// A copy on the layer above the list, because the row lives on a canvas
-	// that clips it.
-	queue_ghost = lv_obj_create(queue_drag_layer);
-	lv_obj_set_size(queue_ghost, lv_area_get_width(&area), QUEUE_ROW_HEIGHT);
-	lv_obj_add_style(queue_ghost, &theme_style_card, 0);
-	lv_obj_set_style_radius(queue_ghost, 12, 0);
-	lv_obj_set_style_border_width(queue_ghost, 2, 0);
-	lv_obj_set_style_border_color(queue_ghost, theme()->accent, 0);
-	lv_obj_set_style_shadow_width(queue_ghost, 0, 0);
-	lv_obj_set_style_pad_all(queue_ghost, 8, 0);
-	lv_obj_set_style_pad_column(queue_ghost, 14, 0);
-	lv_obj_set_scrollable(queue_ghost, false);
-	lv_obj_set_clickable(queue_ghost, false);
-	lv_obj_set_flex_flow(queue_ghost, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(queue_ghost, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-	lv_obj_t *icon = lv_image_create(queue_ghost);
-	lv_obj_set_size(icon, QUEUE_THUMB_SIZE, QUEUE_THUMB_SIZE);
-	lv_image_set_inner_align(icon, LV_IMAGE_ALIGN_CENTER);
-	lv_image_set_src(icon, &icon_music2);
-	lv_obj_add_style(icon, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-
-	lv_obj_t *label = lv_label_create(queue_ghost);
-	lv_label_set_text(label, lv_label_get_text(row->label));
-	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-	lv_obj_set_flex_grow(label, 1);
-	lv_obj_set_height(label, 32);
-	lv_obj_add_style(label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(label, &font_ui_24, 0);
-
-	if (!queue_drag.by_row) {
-		lv_obj_t *grip = lv_image_create(queue_ghost);
-		lv_obj_set_size(grip, QUEUE_GRIP_SIZE, QUEUE_GRIP_SIZE);
-		lv_image_set_inner_align(grip, LV_IMAGE_ALIGN_CENTER);
-		lv_image_set_src(grip, &icon_grip);
-		lv_obj_add_style(grip, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(grip, LV_OPA_COVER, 0);
-	}
-
-	queue_ghost_follow(point);
-	queue_paint_rows();
-}
-
-static bool queue_history_path(long long id, char *path, size_t size);
-
-// Lets go of the row. With `drop`, it is put where the rule was, if the finger
-// went anywhere and the queue is still the one the drag began on: a row of the
-// queue is moved there, an entry of the history is added there and stays in
-// the history.
-static void queue_drag_end(bool drop) {
-	if (!queue_drag.active) {
-		return;
-	}
-	queue_drag.active = false;
-	if (queue_drag.by_row) {
-		lv_obj_set_scroll_chain_ver(queue_drag.held, true);
-		if (!drop) {
-			// Let go of with the finger still down: the rest of the press
-			// must neither play the row nor turn into the swipe back.
-			for (lv_indev_t *indev = lv_indev_get_next(NULL); indev; indev = lv_indev_get_next(indev)) {
-				if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
-					lv_indev_wait_release(indev);
-				}
-			}
-		}
-	}
-	if (queue_ghost) {
-		lv_obj_delete(queue_ghost);
-		queue_ghost = NULL;
-	}
-	if (queue_drop_line) {
-		lv_obj_set_hidden(queue_drop_line, true);
-	}
-	queue_paint_rows();
-
-	int from = queue_drag.from;
-	int target = queue_drag.target;
-	if (!drop || !queue_drag.moved || target < 0 || playlist_count() != queue_total || playlist_current_index() != queue_current) {
-		return;
-	}
-
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	unsigned revision = playlist_revision();
-	if (from >= 0) {
-		int to = target > from ? target - 1 : target;
-		if (to == from) {
-			return;
-		}
-		playlist_move(from, to);
-	} else {
-		char path[512];
-		if (!queue_history_path(queue_drag.hist_id, path, sizeof(path))) {
-			return;
-		}
-		playlist_insert_at(path, target);
-	}
-	if (playlist_revision() != revision) {
-		// Written down now, as a removal is: the mirror on disk is otherwise
-		// refreshed only when a track is loaded. A move turned down after the
-		// queue became a list of paths has changed it too.
-		device_state_queue_changed();
-	}
-	// Only what is to play changed, below Now playing: the page stays where
-	// it is.
-	queue_layout();
-	queue_scroll_to(scroll, LV_ANIM_OFF);
-	queue_window_update();
-	queue_mode_show();
-}
-
-// Follows the finger: the copy, the list at either edge, and the rule.
-static void queue_drag_follow(lv_point_t point) {
-	if (LV_ABS(point.y - queue_drag.start.y) > QUEUE_DROP_MIN_TRAVEL || LV_ABS(point.x - queue_drag.start.x) > QUEUE_DROP_MIN_TRAVEL) {
-		queue_drag.moved = true;
-	}
-
-	// Not before the finger has moved: a row picked up near an edge would
-	// otherwise set the list going under it straight away.
-	lv_area_t view;
-	lv_obj_get_coords(queue_list, &view);
-	int step = 0;
-	if (queue_drag.moved && point.y < view.y1 + QUEUE_EDGE_PX) {
-		step = -QUEUE_EDGE_STEP;
-	} else if (queue_drag.moved && point.y > view.y2 - QUEUE_EDGE_PX) {
-		step = QUEUE_EDGE_STEP;
-	}
-	if (step != 0) {
-		int scroll = lv_obj_get_scroll_y(queue_list);
-		int wanted = scroll + step;
-		int max = queue_scroll_max();
-		wanted = wanted < 0 ? 0 : (wanted > max ? max : wanted);
-		if (wanted != scroll) {
-			lv_obj_scroll_to_y(queue_list, wanted, LV_ANIM_OFF);
-		}
-	}
-
-	queue_ghost_follow(point);
-
-	// The position the finger is in front of, counting from the middle of each
-	// row of what is to play. Over the history, or over the top half of the
-	// track playing, there is nowhere to put it.
-	lv_area_t body;
-	lv_obj_get_coords(queue_body, &body);
-	int y = point.y - body.y1;
-	int upcoming = queue_now_top() + QUEUE_HEADER_H;
-	int target = -1;
-	if (y >= upcoming + QUEUE_ROW_PITCH / 2) {
-		target = queue_current + (y - upcoming + QUEUE_ROW_PITCH / 2) / QUEUE_ROW_PITCH;
-		if (target > queue_total) {
-			target = queue_total;
-		}
-	}
-	// Where the row already is is not a move.
-	if (queue_drag.from >= 0 && (target == queue_drag.from || target == queue_drag.from + 1)) {
-		target = -1;
-	}
-	queue_drag.target = target;
-	if (target >= 0 && queue_drag.moved) {
-		queue_drop_line_show(target);
-	} else if (queue_drop_line) {
-		lv_obj_set_hidden(queue_drop_line, true);
-	}
-}
-
-static void queue_drag_cb(lv_event_t *e) {
-	lv_event_code_t code = lv_event_get_code(e);
-	lv_obj_t *target = lv_event_get_current_target(e);
-	if (code == LV_EVENT_PRESSED && queue_mode == QUEUE_REORDER && !queue_drag.active) {
-		// A grip, taken hold of.
-		for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-			queue_row_t *row = &queue_rows[i];
-			if (row->grip == target && row->index > queue_current && row->index < queue_total) {
-				lv_indev_t *indev = lv_indev_active();
-				lv_point_t point = {0, 0};
-				if (indev) {
-					lv_indev_get_point(indev, &point);
-				}
-				queue_drag_start(row, target, point);
+	// Rows already showing a wanted entry keep it; the rest are free.
+	bool kept[QUEUE_POOL] = {false};
+	bool placed[QUEUE_POOL] = {false};
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		queue_row_t *q = &queue_rows[i];
+		for (int k = 0; k < n && q->index >= 0; k++) {
+			if (!placed[k] && want[k] == q->index) {
+				placed[k] = true;
+				kept[i] = true;
 				break;
 			}
 		}
-		return;
 	}
-	if (!queue_drag.active || target != queue_drag.held) {
-		return;
-	}
-
-	if (code == LV_EVENT_PRESSING) {
-		// The swipe back must not see a carried row go sideways.
-		lv_event_stop_bubbling(e);
-		lv_indev_t *indev = lv_indev_active();
-		if (indev) {
-			lv_point_t point;
-			lv_indev_get_point(indev, &point);
-			queue_drag_follow(point);
+	int free_row = 0;
+	for (int k = 0; k < n; k++) {
+		if (placed[k]) {
+			continue;
 		}
-		return;
+		while (free_row < QUEUE_POOL && kept[free_row]) {
+			free_row++;
+		}
+		if (free_row >= QUEUE_POOL) {
+			break;
+		}
+		kept[free_row] = true;
+		queue_row_bind(&queue_rows[free_row], want[k]);
 	}
-	if (code == LV_EVENT_RELEASED) {
-		// A row carried by itself is let go of as if tapped, and the click
-		// comes next.
-		queue_drop_guard = queue_drag.by_row;
-		queue_drag_end(true);
-	} else if (code == LV_EVENT_PRESS_LOST) {
-		queue_drag_end(false);
-	}
-}
-
-// The file of an entry of the history, if it is still there. Says so when it
-// is not: a file deleted since, or a stream's copy cleared out.
-static bool queue_history_path(long long id, char *path, size_t size) {
-	struct stat st;
-	if (!library_history_entry(id, path, size, NULL, 0) || stat(path, &st) != 0) {
-		toast_error("history_track_gone");
-		return false;
-	}
-	return true;
-}
-
-static void queue_row_pressed_cb(lv_event_t *e) {
-	(void)e;
-	queue_drop_guard = false;
-}
-
-static void queue_row_long_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active() || queue_drag.active) {
-		return;
-	}
-	lv_obj_t *button = lv_event_get_current_target(e);
-	queue_row_t *row = queue_row_of(button);
-	if (!row) {
-		return;
-	}
-	lv_indev_t *indev = lv_indev_active();
-
-	// Only a row of the history: picked up, to be put down in what is to play.
-	// On any other row a long press is a slow tap.
-	if (row->hist < 0 || queue_total <= 0 || queue_mode == QUEUE_SELECT || !indev) {
-		return;
-	}
-	lv_point_t point;
-	lv_indev_get_point(indev, &point);
-	queue_drag_start(row, button, point);
-}
-
-static void queue_remove_cb(lv_event_t *e) {
-	(void)e;
-	if (queue_mode != QUEUE_SELECT || queue_chosen_count == 0) {
-		return;
-	}
-	int *indices = malloc((size_t)queue_chosen_count * sizeof(*indices));
-	int n = 0;
-	for (int i = 0; indices && i < queue_total && n < queue_chosen_count; i++) {
-		if (queue_chosen[i]) {
-			indices[n++] = i;
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		if (!kept[i] && queue_rows[i].index != -1) {
+			queue_rows[i].index = -1;
+			lv_obj_set_hidden(queue_rows[i].row, true);
 		}
 	}
-	queue_mode_set(QUEUE_IDLE);
-	bool removed = indices && playlist_remove(indices, n);
-	free(indices);
-	if (!removed) {
-		return;
+}
+
+// Every row bound again where it is: the entries under them changed.
+static void queue_rebind_all(void) {
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		queue_rows[i].index = -1;
+		lv_obj_set_hidden(queue_rows[i].row, true);
 	}
-	// Written down now, as an addition is: the mirror on disk is otherwise
-	// refreshed only when a track is loaded.
-	device_state_queue_changed();
-	toast_success("queue_tracks_removed");
-	// Only what is to play can go, so the page stays where it is.
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	queue_layout();
-	queue_scroll_to(scroll, LV_ANIM_OFF);
 	queue_window_update();
-	queue_mode_show();
 }
 
-static void queue_close_cb(lv_event_t *e) {
+static void queue_scroll_cb(lv_event_t *e) {
 	(void)e;
-	queue_mode_set(QUEUE_IDLE);
+	queue_window_update();
 }
 
-static void queue_select_cb(lv_event_t *e) {
-	(void)e;
-	if (queue_mode == QUEUE_IDLE) {
-		queue_selection_start();
-	}
+// ---------------------------------------------------------------------------
+// The layout: which runs, where
+// ---------------------------------------------------------------------------
+
+static void queue_head_place(int which, int32_t y, const char *text) {
+	lv_label_set_text(queue_heads[which], text);
+	lv_obj_set_y(queue_heads[which], y);
+	lv_obj_set_hidden(queue_heads[which], false);
 }
 
-// On, and on again turns it off. Every drop is written down when it happens,
-// so there is nothing to save on the way out.
-static void queue_reorder_cb(lv_event_t *e) {
-	(void)e;
-	queue_drag_end(false);
-	queue_mode_set(queue_mode == QUEUE_REORDER ? QUEUE_IDLE : QUEUE_REORDER);
+static int32_t queue_note_place(lv_obj_t *note, int32_t y, const char *text) {
+	lv_label_set_text(note, text);
+	lv_obj_set_y(note, y);
+	lv_obj_set_hidden(note, false);
+	lv_obj_update_layout(note);
+	return lv_obj_get_height(note);
 }
 
-static void queue_row_clicked_cb(lv_event_t *e) {
-	if (queue_drop_guard) {
-		queue_drop_guard = false;
+static void queue_layout(void) {
+	if (queue_edit_mode && !queue_edit_valid())
+		queue_edit_reset();
+	if (!queue_list) {
 		return;
 	}
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
+	queue_seen_revision = playlist_revision();
+	queue_seen_metadata_revision = device_state_metadata_revision();
+	queue_seen_current = playlist_current_index();
+	queue_pitch = sx_row_height(true) + SX_ROW_GAP;
+
+	char outside[256] = "";
+	bool beside = false;
+	int parked_count = 0, parked_at = -1;
+	bool parked = device_state_parked(&parked_count, &parked_at);
+	if (player_outside_title(outside, sizeof(outside))) {
+		beside = !audiobook_is_playing() && !dlna_owns_playback();
 	}
 
-	queue_row_t *row = queue_row_of(lv_event_get_current_target(e));
-	if (!row) {
+	snprintf(queue_seen_outside, sizeof(queue_seen_outside), "%s", outside);
+	int count = playlist_count();
+	int current = playlist_current_index();
+	if (outside[0] && !beside) {
+		queue_mode = QUEUE_MODE_PARKED;
+		queue_total = parked ? parked_count : 0;
+		queue_cur = -1;
+		queue_next_first = parked_at >= 0 ? parked_at : 0;
+	} else if (outside[0]) {
+		queue_mode = QUEUE_MODE_BESIDE;
+		queue_total = count;
+		queue_cur = -1;
+		queue_next_first = current >= 0 ? current : 0; // where the queue goes back to
+	} else if (count <= 0 && !sx_mini_has_track()) {
+		queue_mode = QUEUE_MODE_IDLE;
+		queue_total = 0;
+		queue_cur = -1;
+		queue_next_first = 0;
+	} else {
+		queue_mode = QUEUE_MODE_QUEUE;
+		queue_total = count > 0 ? count : 0;
+		queue_cur = current >= 0 && current < queue_total ? current : -1;
+		queue_next_first = queue_cur + 1;
+	}
+	queue_seen_mode = queue_mode;
+	if (queue_next_first > queue_total) {
+		queue_next_first = queue_total;
+	}
+	queue_next_count = queue_total - queue_next_first;
+	queue_played_count = queue_mode == QUEUE_MODE_QUEUE ? (queue_cur > 0 ? queue_cur : 0) : queue_next_first;
+
+	for (int i = 0; i < 3; i++) {
+		lv_obj_set_hidden(queue_heads[i], true);
+	}
+	lv_obj_set_hidden(queue_note_out, true);
+	lv_obj_set_hidden(queue_note_empty, true);
+	lv_obj_set_hidden(queue_idle, queue_mode != QUEUE_MODE_IDLE);
+	// Nothing to save, shuffle or clear in a queue that is not the queue.
+	bool menu = (queue_mode == QUEUE_MODE_QUEUE && queue_total > 0) || library_history_revision() > 0;
+	lv_obj_set_hidden(queue_more_btn, !menu);
+
+	int32_t y = 0;
+	char text[320];
+	if (queue_mode == QUEUE_MODE_IDLE) {
+		lv_obj_set_height(queue_body, 1);
+		lv_obj_update_layout(queue_list);
+		queue_rebind_all();
+		lv_obj_readjust_scroll(queue_list, LV_ANIM_OFF);
 		return;
 	}
-	switch (queue_mode) {
-	case QUEUE_SELECT:
-		queue_selection_toggle(row);
-		return;
-	case QUEUE_REORDER:
-		return; // the rows are being arranged, not played
-	case QUEUE_IDLE:
-		break;
-	}
-	int index = row->index;
-	if (row->hist >= 0) {
-		// An entry of the history plays from the queue: put in right after the
-		// track playing, so what was coming still comes after it.
-		char path[512];
-		if (!queue_history_path(queue_hist[row->hist].id, path, sizeof(path))) {
-			return;
+	if (queue_mode == QUEUE_MODE_QUEUE) {
+		if (queue_cur >= 0) {
+			queue_head_place(0, y, tr("queue_group_now"));
+			y += QUEUE_GROUP_H;
+			queue_y_cur = y;
+			y += queue_pitch;
 		}
-		index = queue_total > 0 ? queue_current + 1 : 0;
-		if (!playlist_insert_at(path, index)) {
-			return;
+	} else {
+		snprintf(text, sizeof(text), tr("queue_outside_fmt"), outside);
+		y += queue_note_place(queue_note_out, y + 8, text) + 8;
+	}
+
+	snprintf(text, sizeof(text), tr("queue_group_next_fmt"), queue_next_count);
+	queue_head_place(1, y, text);
+	y += QUEUE_GROUP_H;
+	queue_y_next = y;
+	if (queue_next_count > 0) {
+		y += (int32_t)queue_next_count * queue_pitch;
+	} else {
+		// The end of this pass is not the end of a repeating queue.
+		playback_mode_t mode = playlist_get_mode();
+		char path[512], title[256];
+		if (queue_mode == QUEUE_MODE_QUEUE && (mode == PLAYBACK_MODE_REPEAT_ALL || mode == PLAYBACK_MODE_REPEAT_ONE) && playlist_peek_auto(path, sizeof(path))) {
+			char artist[256];
+			queue_names_of(path, title, sizeof(title), artist, sizeof(artist), NULL, 0);
+			snprintf(text, sizeof(text), "%s · %s", tr(mode == PLAYBACK_MODE_REPEAT_ONE ? "player_mode_repeat_one" : "player_mode_repeat_all"), title);
+			y += queue_note_place(queue_note_empty, y, text);
+		} else {
+			y += queue_note_place(queue_note_empty, y, tr(queue_mode == QUEUE_MODE_QUEUE && mode == PLAYBACK_MODE_SHUFFLE_REPEAT ? "player_mode_shuffle_repeat" : "queue_next_empty"));
 		}
 	}
-	if (device_state_play_queue_index(index)) {
-		player_refresh_now_playing();
-		switch_screen(player_screen);
+
+	if (queue_played_count > 0) {
+		snprintf(text, sizeof(text), tr("queue_group_played_fmt"), queue_played_count);
+		queue_head_place(2, y, text);
+		y += QUEUE_GROUP_H;
+		queue_y_played = y;
+		y += (int32_t)queue_played_count * queue_pitch;
+	}
+	lv_obj_set_height(queue_body, y + QUEUE_PAD_BOTTOM);
+	lv_obj_update_layout(queue_list);
+	queue_rebind_all();
+	lv_obj_readjust_scroll(queue_list, LV_ANIM_OFF);
+}
+
+// The layout again, one tick later: from inside a row's own gesture, which
+// must finish on the objects it started on.
+static void queue_layout_async_cb(void *user) {
+	(void)user;
+	if (queue_page_up()) {
+		queue_layout();
 	}
 }
+
+static void queue_layout_soon(void) { lv_async_call(queue_layout_async_cb, NULL); }
+
+void trackmenu_queue_refresh(void) {
+	if (queue_page_up()) {
+		queue_layout();
+	}
+}
+
+static queue_mode_t queue_mode_for_outside(bool has_outside) {
+	if (has_outside) {
+		return audiobook_is_playing() || dlna_owns_playback() ? QUEUE_MODE_PARKED : QUEUE_MODE_BESIDE;
+	}
+	return playlist_count() <= 0 && !sx_mini_has_track() ? QUEUE_MODE_IDLE : QUEUE_MODE_QUEUE;
+}
+
+static queue_mode_t queue_mode_now(void) {
+	char outside[8];
+	return queue_mode_for_outside(player_outside_title(outside, sizeof(outside)));
+}
+
+void trackmenu_queue_poll(void) {
+	if (!queue_page_up()) {
+		return;
+	}
+	// Do not replace an indexed row under a finger when the deal or current
+	// track changes. Its activation also checks the revision before use.
+	for (lv_indev_t *input = lv_indev_get_next(NULL); input; input = lv_indev_get_next(input)) {
+		if (lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER && lv_indev_get_state(input) == LV_INDEV_STATE_PRESSED)
+			return;
+	}
+	char outside[256];
+	bool has_outside = player_outside_title(outside, sizeof(outside));
+	if (strcmp(outside, queue_seen_outside) != 0) {
+		queue_layout();
+		return;
+	}
+	if (playlist_revision() != queue_seen_revision || playlist_current_index() != queue_seen_current || queue_mode_for_outside(has_outside) != queue_seen_mode) {
+		queue_layout();
+	} else if (device_state_metadata_revision() != queue_seen_metadata_revision) {
+		queue_seen_metadata_revision = device_state_metadata_revision();
+		for (int i = 0; i < QUEUE_POOL; i++) {
+			if (queue_rows[i].index >= 0) {
+				queue_row_bind(&queue_rows[i], queue_rows[i].index);
+			}
+		}
+	}
+}
+
+// The track changed under the page: the runs move round it.
+void trackmenu_notify_now_playing(void) { trackmenu_queue_poll(); }
+
+// covertone has thumbnails or tones it did not have (covertonefan.h): the
+// rows still on their plaque look again.
+static void queue_covertone_changed(void) {
+	if (!queue_page_up()) {
+		return;
+	}
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		queue_row_t *q = &queue_rows[i];
+		if (q->index >= 0 && q->album == 0) {
+			char path[512];
+			char title[256], artist[256];
+			if (queue_path_at(q->index, path, sizeof(path))) {
+				queue_names_of(path, title, sizeof(title), artist, sizeof(artist), NULL, 0);
+				queue_row_cover(q, path, title);
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What the rows do
+// ---------------------------------------------------------------------------
+
+// Plays entry `index` of the list shown. The page stays (the owner's rule for
+// 2.0: playing never pulls the player up; the mini player says what plays).
+static void queue_play(int index) {
+	bool ok;
+	if (queue_mode == QUEUE_MODE_PARKED) {
+		ok = device_state_resume_parked(index);
+	} else {
+		ok = device_state_play_queue_index(index);
+	}
+	if (ok) {
+		player_refresh_now_playing(); // which comes back here (trackmenu_notify_now_playing)
+	}
+}
+
+static bool queue_view_current(void) {
+	if (queue_seen_revision == playlist_revision() && queue_seen_current == playlist_current_index() && queue_seen_mode == queue_mode_now())
+		return true;
+	queue_layout_soon();
+	return false;
+}
+
+static void queue_row_tap(lv_obj_t *row, void *user) {
+	(void)row;
+	if (!queue_view_current())
+		return;
+	if (queue_edit_mode) {
+		if (queue_edit_mode == 1)
+			queue_edit_toggle(queue_user_index(user));
+		return;
+	}
+	queue_play(queue_user_index(user));
+}
+
+static void queue_remove_index(int index) {
+	if (!queue_removable(index)) {
+		return;
+	}
+	static char text[320];
+	char title[256];
+	queue_title_of(index, title, sizeof(title));
+	queue_undo_begin();
+	if (!playlist_remove(&index, 1)) {
+		queue_undo_cancel();
+		return;
+	}
+	// Written down now, as an addition is: the mirror on the card is
+	// otherwise refreshed only when a track is loaded.
+	device_state_queue_changed();
+	player_queue_changed();
+	snprintf(text, sizeof(text), tr("queue_removed_fmt"), title);
+	queue_undo_commit(text);
+	queue_layout_soon();
+}
+
+static void queue_row_swiped_out(lv_obj_t *row, void *user) {
+	(void)row;
+	if (!queue_view_current())
+		return;
+	queue_remove_index(queue_user_index(user));
+}
+
+// The row's sheet.
+static int queue_sheet_index;
+static unsigned queue_sheet_revision;
+static queue_mode_t queue_sheet_mode;
+static char queue_sheet_path[512];
+
+static bool queue_sheet_valid(void) {
+	char path[512];
+	if (queue_sheet_revision == playlist_revision() && queue_sheet_mode == queue_mode_now() && queue_path_at(queue_sheet_index, path, sizeof(path)) && !strcmp(path, queue_sheet_path))
+		return true;
+	queue_layout_soon();
+	return false;
+}
+
+static void queue_sheet_play(void *user) {
+	(void)user;
+	if (!queue_sheet_valid())
+		return;
+	queue_play(queue_sheet_index);
+}
+
+static void queue_sheet_next(void *user) {
+	(void)user;
+	if (!queue_sheet_valid())
+		return;
+	static char text[320];
+	char title[256];
+	queue_title_of(queue_sheet_index, title, sizeof(title));
+	queue_undo_begin();
+	if (!playlist_move_next(queue_sheet_index)) {
+		queue_undo_cancel();
+		return;
+	}
+	device_state_queue_changed();
+	player_queue_changed();
+	snprintf(text, sizeof(text), tr("queue_moved_next_fmt"), title);
+	queue_undo_commit(text);
+	queue_layout();
+}
+
+// One place up or down, as 1.2.5's arrows did: among what is still to come.
+static void queue_sheet_move(void *user) {
+	if (!queue_sheet_valid())
+		return;
+	int delta = (int)(intptr_t)user;
+	if (!playlist_move(queue_sheet_index, delta)) {
+		return;
+	}
+	device_state_queue_changed();
+	player_queue_changed();
+	queue_layout();
+}
+
+static void queue_sheet_remove(void *user) {
+	(void)user;
+	if (!queue_sheet_valid())
+		return;
+	queue_remove_index(queue_sheet_index);
+}
+
+static void queue_sheet_album(void *user) {
+	(void)user;
+	if (!queue_sheet_valid())
+		return;
+	char path[512];
+	char album[512];
+	if (!queue_path_at(queue_sheet_index, path, sizeof(path)) || !library_track_album_value(path, album, sizeof(album)) || !album[0]) {
+		gui_notify_popup("trackmenu_no_album");
+		return;
+	}
+	medialist_open(album, LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ALBUM, album);
+}
+
+static void queue_row_hold(lv_obj_t *row, void *user) {
+	(void)row;
+	if (!queue_view_current())
+		return;
+	if (queue_edit_mode) {
+		if (queue_edit_mode == 1)
+			queue_edit_toggle(queue_user_index(user));
+		return;
+	}
+	int index = queue_user_index(user);
+	queue_sheet_index = index;
+	char path[512];
+	if (!queue_path_at(index, path, sizeof(path))) {
+		return;
+	}
+	queue_sheet_revision = playlist_revision();
+	queue_sheet_mode = queue_mode_now();
+	snprintf(queue_sheet_path, sizeof(queue_sheet_path), "%s", path);
+	static char title[256];
+	static char sub[128];
+	char artist[256];
+	queue_names_of(path, title, sizeof(title), artist, sizeof(artist), NULL, 0);
+	snprintf(sub, sizeof(sub), tr("queue_position_fmt"), index + 1, queue_total);
+
+	char album[512];
+	bool has_album = library_track_album_value(path, album, sizeof(album)) && album[0];
+	bool parked = queue_mode == QUEUE_MODE_PARKED;
+	bool playing = index == queue_cur;
+	int current = playlist_current_index();
+	bool upcoming = !parked && index > current;
+
+	sx_sheet_item_t items[6];
+	int n = 0;
+	if (!playing) {
+		items[n++] = (sx_sheet_item_t){tr("queue_play_now"), &npicon_play, false, false, queue_sheet_play, NULL};
+	}
+	if (!parked && !playing && index != current + 1) {
+		items[n++] = (sx_sheet_item_t){tr("queue_move_next"), &npicon_play_next, false, false, queue_sheet_next, NULL};
+	}
+	if (upcoming && index - 1 > current) {
+		items[n++] = (sx_sheet_item_t){tr("queue_move_up"), &npicon_move_up, false, false, queue_sheet_move, (void *)(intptr_t)-1};
+	}
+	if (upcoming && index + 1 < queue_total) {
+		items[n++] = (sx_sheet_item_t){tr("queue_move_down"), &npicon_move_down, false, false, queue_sheet_move, (void *)(intptr_t)1};
+	}
+	if (has_album) {
+		items[n++] = (sx_sheet_item_t){tr("show_album"), &npicon_album, false, false, queue_sheet_album, NULL};
+	}
+	if (queue_removable(index)) {
+		items[n++] = (sx_sheet_item_t){tr("queue_remove"), &npicon_remove, false, true, queue_sheet_remove, NULL};
+	}
+	if (n > 0) {
+		sx_sheet_menu(title, sub, items, n);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The header's ⋮
+// ---------------------------------------------------------------------------
+
+// The queue as it would play, through the existing playlist picker and a
+// bounded GUI producer/background stage: the user chooses a playlist or makes
+// a new one there. Streamed tracks are left out: their files are a
+// cache's and are gone a few albums later, which is also why the queue mirror
+// on the card never holds them.
+static void queue_save_cb(void *user) {
+	(void)user;
+	playlistpage_add_queue();
+}
+
+static void queue_shuffle_rest_cb(void *user) {
+	(void)user;
+	queue_undo_begin();
+	if (!playlist_shuffle_upcoming()) {
+		queue_undo_cancel();
+		return;
+	}
+	device_state_queue_changed();
+	player_queue_changed();
+	queue_undo_commit(tr("queue_shuffled"));
+	queue_layout();
+}
+
+// "Clear Up next": no question asked first any more -- the toast's "Undo" is
+// the way back (principle 6: a confirmation only for what cannot be undone).
+static void queue_clear_cb(void *user) {
+	(void)user;
+	queue_undo_begin();
+	if (!playlist_clear_upcoming()) {
+		queue_undo_cancel();
+		return;
+	}
+	device_state_queue_changed();
+	player_queue_changed();
+	queue_undo_commit(tr("trackmenu_queue_cleared"));
+	queue_layout();
+}
+
+static void queue_edit_paint(void) {
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		if (queue_rows[i].index >= 0)
+			queue_row_bind(&queue_rows[i], queue_rows[i].index);
+	}
+}
+
+static void queue_drag_reset(void) {
+	if (queue_drag_row) {
+		if (queue_drag_from >= 0)
+			lv_obj_set_y(queue_drag_row, queue_row_y(queue_drag_from));
+		lv_obj_remove_local_style_prop(queue_drag_row, LV_STYLE_BG_COLOR, 0);
+		lv_obj_remove_local_style_prop(queue_drag_row, LV_STYLE_BG_OPA, 0);
+	}
+	queue_drag_from = -1;
+	queue_drag_row = NULL;
+	lv_obj_set_scrollable(queue_list, true);
+}
+
+static void queue_edit_reset(void) {
+	queue_drag_reset();
+	free(queue_selected);
+	queue_selected = NULL;
+	queue_edit_mode = 0;
+}
+
+static void queue_edit_end(void *unused) {
+	(void)unused;
+	queue_edit_reset();
+	queue_edit_paint();
+}
+
+static bool queue_edit_valid(void) { return queue_mode_now() == QUEUE_MODE_QUEUE && queue_edit_revision == playlist_revision() && queue_edit_current == playlist_current_index() && queue_edit_count == playlist_count(); }
+
+static void queue_edit_toggle(int index) {
+	if (!queue_edit_valid()) {
+		queue_edit_end(NULL);
+		return;
+	}
+	if (!queue_selected || !queue_removable(index))
+		return;
+	queue_selected[index] = !queue_selected[index];
+	queue_edit_paint();
+}
+
+static void queue_edit_begin(void *user) {
+	queue_edit_reset();
+	queue_layout();
+	if (queue_mode != QUEUE_MODE_QUEUE)
+		return;
+	int mode = (int)(intptr_t)user;
+	if (mode == 1) {
+		queue_selected = calloc((size_t)queue_total, 1);
+		if (!queue_selected)
+			return;
+	}
+	queue_edit_revision = playlist_revision();
+	queue_edit_current = playlist_current_index();
+	queue_edit_count = playlist_count();
+	queue_edit_mode = mode;
+	queue_edit_paint();
+}
+
+static void queue_edit_remove(void *unused) {
+	(void)unused;
+	if (!queue_edit_valid() || !queue_selected) {
+		queue_edit_end(NULL);
+		return;
+	}
+	int *indices = malloc((size_t)queue_total * sizeof(*indices));
+	if (!indices) {
+		queue_edit_end(NULL);
+		return;
+	}
+	int count = 0;
+	for (int i = 0; i < queue_total; i++)
+		if (queue_selected[i])
+			indices[count++] = i;
+	queue_undo_begin();
+	bool changed = count > 0 && playlist_remove(indices, count);
+	free(indices);
+	queue_edit_reset();
+	if (changed) {
+		device_state_queue_changed();
+		player_queue_changed();
+		queue_undo_commit(tr("queue_tracks_removed"));
+	} else
+		queue_undo_cancel();
+	queue_layout();
+}
+
+static void queue_grip_cb(lv_event_t *e) {
+	if (queue_edit_mode != 2)
+		return;
+	lv_event_stop_bubbling(e);
+	if (!queue_edit_valid()) {
+		queue_edit_end(NULL);
+		return;
+	}
+	queue_row_t *q = lv_event_get_user_data(e);
+	lv_point_t point;
+	lv_indev_t *input = lv_indev_active();
+	if (!input)
+		return;
+	lv_indev_get_point(input, &point);
+	lv_event_code_t code = lv_event_get_code(e);
+	if (code == LV_EVENT_PRESSED && q->index > queue_cur) {
+		queue_drag_from = queue_drag_to = q->index;
+		queue_drag_y = point.y;
+		queue_drag_origin = queue_row_y(q->index);
+		queue_drag_row = q->row;
+		lv_obj_set_style_bg_color(queue_drag_row, sx_pal()->surface, 0);
+		lv_obj_set_style_bg_opa(queue_drag_row, LV_OPA_COVER, 0);
+		lv_obj_move_foreground(q->row);
+		lv_obj_set_scrollable(queue_list, false);
+	} else if (code == LV_EVENT_PRESSING && queue_drag_from >= 0) {
+		int dy = point.y - queue_drag_y;
+		queue_drag_to = queue_drag_from + dy / queue_pitch;
+		if (queue_drag_to <= queue_cur)
+			queue_drag_to = queue_cur + 1;
+		if (queue_drag_to >= queue_total)
+			queue_drag_to = queue_total - 1;
+		int32_t y = LV_CLAMP(queue_row_y(queue_cur + 1), queue_drag_origin + dy, queue_row_y(queue_total - 1));
+		lv_obj_set_y(queue_drag_row, y);
+	} else if ((code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) && queue_drag_from >= 0) {
+		int from = queue_drag_from, to = queue_drag_to;
+		queue_drag_reset();
+		if (code == LV_EVENT_RELEASED && from != to) {
+			queue_undo_begin();
+			if (playlist_move_to(from, to)) {
+				queue_edit_revision = playlist_revision();
+				device_state_queue_changed();
+				player_queue_changed();
+				queue_undo_commit(tr("queue_reordered"));
+			} else
+				queue_undo_cancel();
+			queue_layout();
+		}
+	}
+}
+
+static void queue_edit_unloaded(lv_event_t *e) {
+	(void)e;
+	queue_edit_reset();
+}
+
+static void queue_more_cb(lv_event_t *e) {
+	(void)e;
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	static char sub[64];
+	snprintf(sub, sizeof(sub), tr("queue_count_fmt"), playlist_count());
+	bool upcoming = queue_mode == QUEUE_MODE_QUEUE && playlist_current_index() >= 0 && playlist_current_index() + 1 < playlist_count();
+	bool shufflable = queue_mode == QUEUE_MODE_QUEUE && playlist_current_index() >= 0 && playlist_current_index() + 2 < playlist_count();
+	sx_sheet_item_t items[6];
+	int n = 0;
+	if (queue_edit_mode) {
+		if (queue_edit_mode == 1)
+			items[n++] = (sx_sheet_item_t){tr("queue_remove_selected"), &npicon_remove, false, false, queue_edit_remove, NULL};
+		items[n++] = (sx_sheet_item_t){tr("done"), NULL, false, false, queue_edit_end, NULL};
+		sx_sheet_menu(tr("trackmenu_queue"), NULL, items, n);
+		return;
+	}
+	if (upcoming && queue_mode == QUEUE_MODE_QUEUE) {
+		items[n++] = (sx_sheet_item_t){tr("queue_select"), NULL, false, false, queue_edit_begin, (void *)(intptr_t)1};
+		items[n++] = (sx_sheet_item_t){tr("queue_reorder"), NULL, false, false, queue_edit_begin, (void *)(intptr_t)2};
+	}
+	items[n++] = (sx_sheet_item_t){tr("queue_history"), &icon_radio_recent, false, false, historypage_open, NULL};
+	if (queue_mode == QUEUE_MODE_QUEUE && queue_total > 0)
+		items[n++] = (sx_sheet_item_t){tr("queue_save_as_playlist"), &npicon_add_playlist, false, false, queue_save_cb, NULL};
+	if (shufflable) {
+		items[n++] = (sx_sheet_item_t){tr("queue_shuffle_rest"), &npicon_shuffle, false, false, queue_shuffle_rest_cb, NULL};
+	}
+	if (upcoming) {
+		items[n++] = (sx_sheet_item_t){tr("queue_clear_next"), &npicon_clear, false, true, queue_clear_cb, NULL};
+	}
+	sx_sheet_menu(tr("trackmenu_queue"), sub, items, n);
+}
+
+static void queue_shuffle_all_cb(lv_event_t *e) {
+	(void)e;
+	// The one "Shuffle all music" (listacts.h): the idle cards on Home and
+	// Music start the same, with the same toast and the shuffle mode.
+	if (listacts_shuffle_all()) {
+		queue_layout();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Queueing from the menus
+// ---------------------------------------------------------------------------
+
+int trackmenu_queue_paths(const char *const *paths, int count, playlist_queue_where_t where) {
+	// The snapshot (or note) first, so the toast can offer "Undo"; the queue
+	// written down and the pages told (queueundo.h).
+	int queued = queue_undo_add_paths(paths, count, where);
+	if (queued > 0) {
+		static char text[320];
+		if (queued == 1 && paths && paths[0]) {
+			char title[256], artist[256];
+			queue_names_of(paths[0], title, sizeof(title), artist, sizeof(artist), NULL, 0);
+			snprintf(text, sizeof(text), tr(where == PLAYLIST_QUEUE_NEXT ? "queue_next_named_fmt" : "queue_end_named_fmt"), title);
+		} else {
+			snprintf(text, sizeof(text), "%s", tr(where == PLAYLIST_QUEUE_NEXT ? "queue_will_play_next" : "queue_added_to_end"));
+		}
+		queue_undo_commit(text);
+	}
+	return queued;
+}
+
+static trackmenu_queue_chosen_cb choose_cb;
+static void *choose_user;
+
+static void choose_picked(void *user) {
+	trackmenu_queue_chosen_cb cb = choose_cb;
+	choose_cb = NULL;
+	if (cb) {
+		cb((playlist_queue_where_t)(intptr_t)user, choose_user);
+	}
+}
+
+void trackmenu_queue_choose(lv_obj_t *anchor, trackmenu_queue_chosen_cb chosen, void *user) {
+	if (!anchor || !chosen) {
+		return;
+	}
+	if (!playlist_enqueue_ask()) {
+		chosen(playlist_enqueue_at_end() ? PLAYLIST_QUEUE_END : PLAYLIST_QUEUE_NEXT, user);
+		return;
+	}
+	static const popover_item_t ITEMS[] = {
+		{"queue_play_next", choose_picked, (void *)(intptr_t)PLAYLIST_QUEUE_NEXT},
+		{"queue_add_to_end", choose_picked, (void *)(intptr_t)PLAYLIST_QUEUE_END},
+	};
+	choose_cb = chosen;
+	choose_user = user;
+	popover_show(anchor, ITEMS, 2);
+}
+
+// ---------------------------------------------------------------------------
+// The page
+// ---------------------------------------------------------------------------
 
 static void queue_loaded_cb(lv_event_t *e) {
 	(void)e;
-	queue_rebuild();
+	queue_layout();
+	// From the top: the playing run is the first thing on it.
+	lv_obj_scroll_to_y(queue_list, 0, LV_ANIM_OFF);
+	queue_window_update();
 }
 
+// The thumbnails' buffers go with the page: 6 KB a row is not memory to keep
+// for a page nobody is looking at.
 static void queue_unloaded_cb(lv_event_t *e) {
 	(void)e;
-	queue_drag_end(false);
-	queue_mode_set(QUEUE_IDLE);
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		queue_row_t *q = &queue_rows[i];
+		sx_row_set_thumb(q->row, NULL, sx_pal()->cover_tone);
+		q->album = 0;
+		q->index = -1;
+		lv_obj_set_hidden(q->row, true);
+		free(q->buf);
+		q->buf = NULL;
+	}
 }
 
-static lv_obj_t *queue_corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph, lv_event_cb_t cb) {
-	lv_obj_t *button = lv_btn_create(queue_screen);
-	lv_obj_set_size(button, 56, 56);
-	lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_border_width(button, 0, 0);
-	lv_obj_set_style_shadow_width(button, 0, 0);
-	lv_obj_set_style_pad_all(button, 0, 0);
-	lv_obj_align(button, LV_ALIGN_TOP_RIGHT, -cfg->padding - slot * (56 + 6), cfg->padding + cfg->top_bar_height);
-	lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, NULL);
-	lv_obj_t *icon = lv_image_create(button);
-	lv_image_set_src(icon, glyph);
-	lv_obj_add_style(icon, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-	lv_obj_center(icon);
-	lv_obj_set_hidden(button, true);
-	return button;
-}
-
-static lv_obj_t *queue_header(const char *tag, int y) {
-	lv_obj_t *label = lv_label_create(queue_body);
-	lv_label_set_text(label, tr(tag));
-	lv_obj_add_style(label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(label, &font_ui_22_bold, 0);
-	lv_obj_set_pos(label, 4, y + 10);
-	lv_obj_set_hidden(label, true);
+static lv_obj_t *queue_label(lv_obj_t *parent, const lv_font_t *font, bool secondary) {
+	lv_obj_t *label = lv_label_create(parent);
+	lv_obj_set_style_text_font(label, font, 0);
+	lv_obj_add_style(label, secondary ? &sx_style_text2 : &sx_style_text, 0);
 	return label;
 }
 
 static void build_queue_page(gui_config_t *cfg) {
 	lv_obj_add_style(queue_screen, &theme_style_screen, 0);
 	queue_title = settingsrow_title(queue_screen, cfg, "trackmenu_queue");
-	// Two pairs in the same two places: the ways in, and choosing.
-	queue_reorder_btn = queue_corner_button(cfg, 0, &icon_arrow_down_up, queue_reorder_cb);
-	queue_select_btn = queue_corner_button(cfg, 1, &icon_select_mode, queue_select_cb);
-	queue_close_btn = queue_corner_button(cfg, 0, &icon_close, queue_close_cb);
-	queue_remove_btn = queue_corner_button(cfg, 1, &icon_trash, queue_remove_cb);
+	lv_obj_add_event_cb(queue_screen, queue_edit_unloaded, LV_EVENT_SCREEN_UNLOADED, NULL);
+
+	queue_more_btn = lv_btn_create(queue_screen);
+	lv_obj_remove_style_all(queue_more_btn);
+	lv_obj_set_size(queue_more_btn, SX_HEADER_BTN, SX_HEADER_BTN);
+	lv_obj_add_style(queue_more_btn, &sx_style_press, LV_STATE_PRESSED);
+	lv_obj_set_style_radius(queue_more_btn, LV_RADIUS_CIRCLE, 0);
+	lv_obj_align(queue_more_btn, LV_ALIGN_TOP_RIGHT, 0, SX_STATUSBAR_H + (SX_HEADER_H - SX_HEADER_BTN) / 2);
+	lv_obj_add_event_cb(queue_more_btn, queue_more_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *more_icon = lv_image_create(queue_more_btn);
+	lv_image_set_src(more_icon, &icon_ellipsis_vertical);
+	lv_obj_add_style(more_icon, &sx_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(more_icon, LV_OPA_COVER, 0);
+	lv_obj_center(more_icon);
+	settingsrow_title_corner_slots(queue_title, cfg, 1);
 
 	int content_top = settingsrow_content_top(cfg);
-	int width = cfg->screen_width - 2 * cfg->padding;
-	queue_view_h = cfg->screen_height - content_top;
-
 	queue_list = lv_obj_create(queue_screen);
-	lv_obj_set_size(queue_list, cfg->screen_width, queue_view_h);
+	lv_obj_remove_style_all(queue_list);
+	lv_obj_set_size(queue_list, cfg->screen_width, cfg->screen_height - content_top);
 	lv_obj_align(queue_list, LV_ALIGN_TOP_LEFT, 0, content_top);
-	lv_obj_set_style_bg_opa(queue_list, 0, 0);
-	lv_obj_set_style_border_width(queue_list, 0, 0);
-	lv_obj_set_style_radius(queue_list, 0, 0);
-	lv_obj_set_style_pad_hor(queue_list, cfg->padding, 0);
-	lv_obj_set_style_pad_ver(queue_list, 0, 0);
+	lv_obj_set_style_pad_hor(queue_list, SX_BODY_PAD_L, 0);
 	lv_obj_set_scroll_dir(queue_list, LV_DIR_VER);
-	lv_obj_set_scrollbar_mode(queue_list, LV_SCROLLBAR_MODE_AUTO);
-	lv_obj_add_event_cb(queue_list, queue_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+	lv_obj_set_scrollbar_mode(queue_list, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_add_event_cb(queue_list, queue_scroll_cb, LV_EVENT_SCROLL, NULL);
-	lv_obj_add_event_cb(queue_list, queue_scroll_cb, LV_EVENT_SCROLL_END, NULL);
-	lv_obj_add_event_cb(queue_list, queue_scroll_cb, LV_EVENT_RELEASED, NULL);
+	// The last rows clear the mini player.
+	sx_frame_reserve_bottom(queue_list);
 
+	int width = cfg->screen_width - 2 * SX_BODY_PAD_L;
 	queue_body = lv_obj_create(queue_list);
-	lv_obj_set_width(queue_body, width);
-	lv_obj_set_height(queue_body, QUEUE_ROW_PITCH);
-	lv_obj_set_pos(queue_body, 0, 0);
-	lv_obj_set_style_bg_opa(queue_body, 0, 0);
-	lv_obj_set_style_border_width(queue_body, 0, 0);
-	lv_obj_set_style_pad_all(queue_body, 0, 0);
+	lv_obj_remove_style_all(queue_body);
+	lv_obj_set_size(queue_body, width, 1);
 	lv_obj_set_scrollable(queue_body, false);
 	lv_obj_set_event_bubble(queue_body, true);
 
-	queue_history_header = queue_header("queue_history", 0);
-	queue_now_header = queue_header("queue_now_playing", 0);
-	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
-		queue_sep_labels[i] = lv_label_create(queue_body);
-		lv_obj_add_style(queue_sep_labels[i], &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(queue_sep_labels[i], &font_ui_18, 0);
-		lv_obj_set_x(queue_sep_labels[i], 4);
-		lv_obj_set_hidden(queue_sep_labels[i], true);
-		queue_sep_bound[i] = -1;
+	// The three headings: the handoff's 16 px mono capitals, a little apart.
+	for (int i = 0; i < 3; i++) {
+		lv_obj_t *head = queue_label(queue_body, &font_ui_17, true);
+		lv_obj_set_width(head, width);
+		lv_obj_set_style_text_letter_space(head, 1, 0);
+		lv_obj_set_style_pad_top(head, 14, 0);
+		lv_obj_set_style_pad_left(head, 6, 0);
+		lv_label_set_long_mode(head, LV_LABEL_LONG_DOT);
+		lv_obj_set_hidden(head, true);
+		queue_heads[i] = head;
+	}
+	lv_obj_t *const notes[2] = {queue_label(queue_body, &font_ui_20, true), queue_label(queue_body, &font_ui_20, true)};
+	for (int i = 0; i < 2; i++) {
+		lv_obj_set_width(notes[i], width);
+		lv_label_set_long_mode(notes[i], LV_LABEL_LONG_WRAP);
+		lv_obj_set_style_pad_left(notes[i], 6, 0);
+		lv_obj_set_style_pad_right(notes[i], 6, 0);
+		lv_obj_set_style_pad_top(notes[i], 4, 0);
+		lv_obj_set_style_pad_bottom(notes[i], 12, 0);
+		lv_obj_set_style_text_line_space(notes[i], 6, 0);
+		lv_obj_set_hidden(notes[i], true);
+	}
+	queue_note_out = notes[0];
+	queue_note_empty = notes[1];
+
+	sx_row_handlers_t handlers = {
+		.on_tap = queue_row_tap,
+		.on_long_press = queue_row_hold,
+		.on_swipe_end = queue_row_swiped_out,
+		.end_is_remove = true,
+	};
+	for (int i = 0; i < QUEUE_POOL; i++) {
+		queue_row_t *q = &queue_rows[i];
+		q->row = sx_row_create(queue_body, &handlers, true);
+		lv_obj_t *grip = sx_row_trail(q->row);
+		lv_obj_add_event_cb(grip, queue_grip_cb, LV_EVENT_PRESSED, q);
+		lv_obj_add_event_cb(grip, queue_grip_cb, LV_EVENT_PRESSING, q);
+		lv_obj_add_event_cb(grip, queue_grip_cb, LV_EVENT_RELEASED, q);
+		lv_obj_add_event_cb(grip, queue_grip_cb, LV_EVENT_PRESS_LOST, q);
+		lv_obj_set_width(q->row, width);
+		lv_obj_set_pos(q->row, 0, 0);
+		lv_obj_set_hidden(q->row, true);
+		q->index = -1;
 	}
 
-	queue_empty = lv_label_create(queue_list);
-	lv_label_set_text(queue_empty, tr("trackmenu_queue_empty"));
-	lv_obj_set_style_text_align(queue_empty, LV_TEXT_ALIGN_CENTER, 0);
-	lv_obj_add_style(queue_empty, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(queue_empty, &font_ui_24, 0);
-	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, 72);
-	lv_obj_set_hidden(queue_empty, true);
+	// The idle state: nothing has ever played.
+	queue_idle = lv_obj_create(queue_list);
+	lv_obj_remove_style_all(queue_idle);
+	lv_obj_set_size(queue_idle, width, LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_top(queue_idle, 90, 0);
+	lv_obj_set_style_pad_hor(queue_idle, 16, 0);
+	lv_obj_set_flex_flow(queue_idle, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(queue_idle, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_scrollable(queue_idle, false);
+	lv_obj_set_hidden(queue_idle, true);
 
-	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		queue_row_t *row = &queue_rows[i];
+	lv_obj_t *disc = lv_obj_create(queue_idle);
+	lv_obj_remove_style_all(disc);
+	lv_obj_set_size(disc, 84, 84);
+	lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+	lv_obj_add_style(disc, &sx_style_surface, 0);
+	lv_obj_t *glyph = lv_image_create(disc);
+	lv_image_set_src(glyph, &npicon_queue);
+	lv_obj_add_style(glyph, &sx_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(glyph, LV_OPA_COVER, 0);
+	lv_obj_center(glyph);
 
-		row->button = lv_btn_create(queue_body);
-		lv_obj_set_size(row->button, width, QUEUE_ROW_HEIGHT);
-		lv_obj_set_x(row->button, 0);
-		lv_obj_add_style(row->button, &theme_style_card, 0);
-		lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
-		lv_obj_set_style_radius(row->button, 12, 0);
-		lv_obj_set_style_border_width(row->button, 0, 0);
-		lv_obj_set_style_shadow_width(row->button, 0, 0);
-		lv_obj_set_style_pad_all(row->button, 8, 0);
-		lv_obj_set_style_pad_column(row->button, 14, 0);
-		lv_obj_set_hidden(row->button, true);
-		lv_obj_set_event_bubble(row->button, true);
-		lv_obj_add_event_cb(row->button, queue_row_pressed_cb, LV_EVENT_PRESSED, NULL);
-		lv_obj_add_event_cb(row->button, queue_row_clicked_cb, LV_EVENT_CLICKED, NULL);
-		lv_obj_add_event_cb(row->button, queue_row_long_cb, LV_EVENT_LONG_PRESSED, NULL);
-		lv_obj_add_event_cb(row->button, queue_drag_cb, LV_EVENT_PRESSING, NULL);
-		lv_obj_add_event_cb(row->button, queue_drag_cb, LV_EVENT_RELEASED, NULL);
-		lv_obj_add_event_cb(row->button, queue_drag_cb, LV_EVENT_PRESS_LOST, NULL);
-		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
-		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_t *head = queue_label(queue_idle, &font_ui_30_bold, false);
+	lv_label_set_text(head, tr("queue_idle_title"));
+	lv_obj_set_style_pad_top(head, 20, 0);
+	lv_obj_t *text = queue_label(queue_idle, &font_ui_22, true);
+	lv_label_set_text(text, tr("queue_idle_text"));
+	lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(text, lv_pct(100));
+	lv_obj_set_style_text_align(text, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_set_style_pad_top(text, 8, 0);
 
-		row->icon = lv_image_create(row->button);
-		lv_obj_set_size(row->icon, QUEUE_THUMB_SIZE, QUEUE_THUMB_SIZE);
-		lv_image_set_inner_align(row->icon, LV_IMAGE_ALIGN_CENTER);
+	lv_obj_t *button = lv_btn_create(queue_idle);
+	lv_obj_remove_style_all(button);
+	lv_obj_set_height(button, 68);
+	lv_obj_set_style_pad_hor(button, 56, 0);
+	lv_obj_set_style_margin_top(button, 28, 0);
+	lv_obj_set_style_radius(button, 34, 0);
+	lv_obj_add_style(button, &sx_style_accent, 0);
+	lv_obj_add_style(button, &sx_style_press, LV_STATE_PRESSED);
+	lv_obj_add_event_cb(button, queue_shuffle_all_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *button_text = lv_label_create(button);
+	lv_label_set_text(button_text, tr("queue_shuffle_all"));
+	lv_obj_set_style_text_font(button_text, &font_ui_24_bold, 0);
+	lv_obj_center(button_text);
+	lv_obj_set_width(button, LV_SIZE_CONTENT);
 
-		row->label = lv_label_create(row->button);
-		lv_label_set_long_mode(row->label, LV_LABEL_LONG_DOT);
-		lv_obj_set_flex_grow(row->label, 1);
-		lv_obj_set_height(row->label, 32);
-		lv_obj_add_style(row->label, &theme_style_text, 0);
-		lv_obj_set_style_text_font(row->label, &font_ui_24, 0);
-
-		row->check = lv_image_create(row->button);
-		lv_image_set_src(row->check, &icon_check);
-		lv_obj_add_style(row->check, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(row->check, LV_OPA_COVER, 0);
-		lv_obj_set_clickable(row->check, false);
-		lv_obj_set_hidden(row->check, true);
-
-		// The handle, while reordering. Not a button: it is the part of the
-		// row that can be taken hold of, and a drag that starts on it carries
-		// the row, not the list.
-		row->grip = lv_obj_create(row->button);
-		lv_obj_set_size(row->grip, QUEUE_GRIP_SIZE, QUEUE_GRIP_SIZE);
-		lv_obj_set_style_bg_opa(row->grip, 0, 0);
-		lv_obj_set_style_border_width(row->grip, 0, 0);
-		lv_obj_set_style_pad_all(row->grip, 0, 0);
-		lv_obj_set_scrollable(row->grip, false);
-		lv_obj_set_clickable(row->grip, true);
-		lv_obj_set_scroll_chain_ver(row->grip, false);
-		lv_obj_set_scroll_chain_hor(row->grip, false);
-		lv_obj_t *grip_icon = lv_image_create(row->grip);
-		lv_image_set_src(grip_icon, &icon_grip);
-		lv_obj_add_style(grip_icon, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(grip_icon, LV_OPA_COVER, 0);
-		lv_obj_center(grip_icon);
-		lv_obj_add_event_cb(row->grip, queue_drag_cb, LV_EVENT_PRESSED, NULL);
-		lv_obj_add_event_cb(row->grip, queue_drag_cb, LV_EVENT_PRESSING, NULL);
-		lv_obj_add_event_cb(row->grip, queue_drag_cb, LV_EVENT_RELEASED, NULL);
-		lv_obj_add_event_cb(row->grip, queue_drag_cb, LV_EVENT_PRESS_LOST, NULL);
-		lv_obj_set_hidden(row->grip, true);
-
-		row->vindex = -1;
-		row->index = -1;
-		row->hist = -1;
-		row->has_thumb = false;
-	}
-
-	// Over everything, and transparent to the finger: only the copy of a
-	// carried row is ever on it, and only while one is carried.
-	queue_drag_layer = lv_obj_create(queue_screen);
-	lv_obj_set_size(queue_drag_layer, lv_pct(100), lv_pct(100));
-	lv_obj_set_pos(queue_drag_layer, 0, 0);
-	lv_obj_set_style_bg_opa(queue_drag_layer, 0, 0);
-	lv_obj_set_style_border_width(queue_drag_layer, 0, 0);
-	lv_obj_set_style_pad_all(queue_drag_layer, 0, 0);
-	lv_obj_set_scrollable(queue_drag_layer, false);
-	lv_obj_set_clickable(queue_drag_layer, false);
-	lv_obj_set_ignore_layout(queue_drag_layer, true);
-
-	// No player-sheet swipe on the queue: it kept sliding the player over the
-	// list being read. The swipe-back drag still works from here.
 	switcher_attach_back_gesture(queue_list);
 	lv_obj_add_event_cb(queue_screen, queue_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(queue_screen, queue_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+	covertonefan_add(queue_covertone_changed);
 }
+
+static lv_obj_t *details_card;
+static lv_obj_t *details_scroll;
 
 // ---------------------------------------------------------------------------
 // Details: everything known about the playing file.
@@ -1418,21 +1296,6 @@ static void details_add_row(const char *name, const char *value) {
 // the player's own menu).
 static char details_path[512];
 
-// The path as it is on the card: the mount point in front of it is the same
-// on every track and says nothing. A file anywhere else keeps its whole path.
-static const char *details_card_path(const char *file) {
-	static const char *const ROOTS[] = {"/mnt/sd_0", "/data/mnt/sd_0", "/usr/data/mnt/sd_0"};
-	const char *mounted = storage_sd_root();
-	for (int i = -1; i < (int)(sizeof(ROOTS) / sizeof(ROOTS[0])); i++) {
-		const char *root = i < 0 ? mounted : ROOTS[i];
-		size_t length = root ? strlen(root) : 0;
-		if (length > 0 && strncmp(file, root, length) == 0 && file[length] == '/') {
-			return file + length + 1;
-		}
-	}
-	return file;
-}
-
 // The common tail of both variants: tags, format, size, path.
 // `codec` is the name the decoder reports ("MP3", "AAC", "ALAC"...), empty when
 // it has none; `kbps` is the bitrate the file declares, 0 when it declares
@@ -1453,9 +1316,7 @@ static void details_add_gain(const char *name, float gain_db, float peak) {
 
 // `playing` adds what the player is applying to this file right now, which
 // only exists for the track being played.
-static void details_fill(const char *file, const song_metadata_t *tags, int bits, double sample_rate,
-						 int channels, double duration_secs, const char *codec, int kbps, bool lossy,
-						 bool playing) {
+static void details_fill(const char *file, const song_metadata_t *tags, int bits, double sample_rate, int channels, double duration_secs, const char *codec, int kbps, bool lossy, bool playing) {
 	char buffer[64];
 
 	const char *slash = strrchr(file, '/');
@@ -1493,8 +1354,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 			details_add_row("trackmenu_format", buffer);
 		}
 	} else if (sample_rate > 0) {
-		snprintf(buffer, sizeof(buffer), tr("trackmenu_bit_khz_channels"), bits > 0 ? bits : 16,
-				 sample_rate / 1000.0, channels);
+		snprintf(buffer, sizeof(buffer), tr("trackmenu_bit_khz_channels"), bits > 0 ? bits : 16, sample_rate / 1000.0, channels);
 		details_add_row("trackmenu_format", buffer);
 	}
 
@@ -1502,7 +1362,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	// duration, which is how dense the file is. Lossy files already carry it in
 	// the row above, and for a streamed track the cache file may be half
 	// downloaded, making the number meaningless.
-	if (!lossy && !qobuzcache_owns(file) && !tidalcache_owns(file) && duration_secs > 0.5) {
+	if (!lossy && !stream_provider_owns(file) && duration_secs > 0.5) {
 		struct stat st_kbps;
 		if (stat(file, &st_kbps) == 0 && st_kbps.st_size > 0) {
 			int avg = (int)((double)st_kbps.st_size * 8.0 / duration_secs / 1000.0 + 0.5);
@@ -1532,7 +1392,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	// which may still be downloading -- a number that grows on screen by itself
 	// and describes the download, not the track.
 	struct stat st;
-	if (!qobuzcache_owns(file) && !tidalcache_owns(file) && stat(file, &st) == 0) {
+	if (!stream_provider_owns(file) && stat(file, &st) == 0) {
 		snprintf(buffer, sizeof(buffer), "%.1f MB", st.st_size / (1024.0 * 1024.0));
 		details_add_row("trackmenu_size", buffer);
 	}
@@ -1540,12 +1400,11 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	// The path, except for a streamed track: that lives in a cache directory
 	// nobody chose, under a numeric name, and showing it implies a file of the
 	// user's own that does not exist. The source service is shown instead.
-	if (qobuzcache_owns(file)) {
-		details_add_row("trackmenu_source", "qobuz");
-	} else if (tidalcache_owns(file)) {
-		details_add_row("trackmenu_source", "tidal");
+	const stream_provider_t *service = stream_provider_for_path(file);
+	if (service) {
+		details_add_row("trackmenu_source", tr(service->id));
 	} else {
-		details_add_row("trackmenu_file", details_card_path(file));
+		details_add_row("trackmenu_file", file);
 	}
 }
 
@@ -1590,8 +1449,7 @@ static void details_rebuild(void) {
 			}
 		}
 
-		details_fill(details_path, &tags, bits, sample_rate, channels, duration_secs, codec, kbps, lossy,
-					 false);
+		details_fill(details_path, &tags, bits, sample_rate, channels, duration_secs, codec, kbps, lossy, false);
 		return;
 	}
 
@@ -1612,16 +1470,14 @@ static void details_rebuild(void) {
 	// As in the player: when the file declares no bitrate, fall back to the real
 	// average, but only for a local file -- a streamed one may still be half
 	// downloaded and the number would climb by itself.
-	if (lossy && kbps <= 0 && !qobuzcache_owns(state.current_file) && !tidalcache_owns(state.current_file) &&
-		state.progress_total_secs > 0.5) {
+	if (lossy && kbps <= 0 && !stream_provider_owns(state.current_file) && state.progress_total_secs > 0.5) {
 		struct stat st_lossy;
 		if (stat(state.current_file, &st_lossy) == 0 && st_lossy.st_size > 0) {
 			kbps = (int)((double)st_lossy.st_size * 8.0 / state.progress_total_secs / 1000.0 + 0.5);
 		}
 	}
 
-	details_fill(state.current_file, &state.metadata, audio_get_stream_bits(), state.stream_sample_rate,
-				 state.stream_channels, state.progress_total_secs, codec, kbps, lossy, true);
+	details_fill(state.current_file, &state.metadata, audio_get_stream_bits(), state.stream_sample_rate, state.stream_channels, state.progress_total_secs, codec, kbps, lossy, true);
 }
 
 static void details_loaded_cb(lv_event_t *e) {
@@ -1680,7 +1536,20 @@ static void build_details_page(gui_config_t *cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// the popover
+// The player's ⋮ (Sonix UI 2.0, the handoff's "Лист плеера")
+//
+// A bottom sheet with the playing track's title and artist on top, and:
+// stop after this track, stop after this album, the sleep timer (its own
+// sheet: off, 15, 30, 60 minutes, at the end of the track), add to a
+// playlist, show the album, show the artist -- the handoff's five -- and what
+// the 1.2.5 menu had besides: shuffle (the repeat button cycles repeat only
+// now), the lyrics (which a swipe on the artwork used to pull in), the queue,
+// the details page and the music settings.
+//
+// What is offered follows what plays: a podcast's episode has its podcast in
+// place of the album and no artist page; a station, AirPlay or a phone over
+// DLNA play outside the queue and keep only the timer, the queue and the
+// settings (a book has its own menu, player.c).
 // ---------------------------------------------------------------------------
 
 static void open_queue_cb(void *user) {
@@ -1688,13 +1557,83 @@ static void open_queue_cb(void *user) {
 	trackmenu_open_queue();
 }
 
-// The same page without going through the menu: the player calls this when a
-// podcast is playing, where the overflow button becomes the episodes button --
-// and a podcast's episodes are exactly the queue.
+static char menu_save_path[512];
+static int menu_save_duration;
+
+static void save_stream_track_cb(void *user) {
+	const char *path = user;
+	const stream_provider_t *service = stream_provider_for_track(path);
+	if (!service || !service->save_track) {
+		gui_notify_popup("download_failed");
+		return;
+	}
+	if (service->track_saved && service->track_saved(path)) {
+		gui_notify_popup(service->saved_label_key);
+		return;
+	}
+	if (!service->save_track(path, menu_save_duration))
+		gui_notify_popup(service->save_failed_key);
+}
+
+// The same page without going through the menu: the player's "Up next" chip,
+// and its episodes button on a podcast -- a podcast's episodes are exactly the
+// queue.
 void trackmenu_open_queue(void) {
+	bool return_to_player = player_sheet_is_open();
+	if (audiobook_is_playing()) {
+		chapters_open();
+		return;
+	}
 	player_sheet_close(false);
 	switch_screen(queue_screen);
-	switcher_set_player_return(queue_screen);
+	switcher_set_player_return(return_to_player ? queue_screen : NULL);
+}
+
+static void queue_button_clicked(lv_event_t *e) {
+	(void)e;
+	trackmenu_open_queue();
+}
+
+lv_obj_t *trackmenu_queue_button(lv_obj_t *parent, gui_config_t *cfg, int slot) { return svcui_header_button(parent, cfg, slot, &npicon_queue, queue_button_clicked, NULL); }
+
+// "Stop after this track / this album": one-shot, cleared when it fires (see
+// device_state_set_stop_after()); choosing the one already set clears it. The
+// toast says it, with "Undo". "At the end of the track" in the sleep timer is
+// the same switch.
+static void stop_after_undo(void *user) {
+	device_state_set_stop_after((device_state_stop_after_t)(intptr_t)user);
+	topbar_refresh_playback(); // the moon
+}
+
+static void stop_after_pick(void *user) {
+	device_state_stop_after_t want = (device_state_stop_after_t)(intptr_t)user;
+	device_state_stop_after_t was = device_state_stop_after();
+	if (was == want) {
+		want = DEVICE_STATE_STOP_AFTER_NONE;
+	}
+	device_state_set_stop_after(want);
+	topbar_refresh_playback();
+	sx_toast_undo(tr(want == DEVICE_STATE_STOP_AFTER_TRACK ? "trackmenu_stop_after_track_set" : want == DEVICE_STATE_STOP_AFTER_ALBUM ? "trackmenu_stop_after_album_set" : "trackmenu_stop_after_cleared"), stop_after_undo, (void *)(intptr_t)was);
+}
+
+static void chain_cb(void *user) {
+	(void)user;
+	player_chain_open();
+}
+
+static void sleep_cb(void *user) {
+	(void)user;
+	player_sleep_sheet_open();
+}
+
+static void shuffle_cb(void *user) {
+	(void)user;
+	player_playback_mode_menu();
+}
+
+static void lyrics_cb(void *user) {
+	(void)user;
+	player_lyrics_toggle();
 }
 
 static void open_details_cb(void *user) {
@@ -1721,6 +1660,42 @@ static void add_to_playlist_cb(void *user) {
 
 // "Show album": the record the playing track came off. Backing out of it
 // returns to the player, like everything else this menu opens.
+static bool playback_source_available(const device_state_t *state) {
+	if (state->live || !state->current_file[0] || audiobook_is_playing() || podcastcache_is_episode(state->current_file))
+		return false;
+	const stream_provider_t *provider = stream_provider_for_path(state->current_file);
+	if (provider && !provider->gui.open_playback_place)
+		return false;
+	playbackplace_t place;
+	return playbackplace_get(provider ? provider->id : "music", &place) && !strcmp(place.path, state->current_file);
+}
+
+static bool trackmenu_open_playback_source(void) {
+	device_state_t state;
+	device_state_get(&state);
+	if (!playback_source_available(&state))
+		return false;
+	const stream_provider_t *provider = stream_provider_for_path(state.current_file);
+	bool player = player_sheet_is_open();
+	player_sheet_close(false);
+	// Browsing the source is a catalog jump. The mini-player remains the
+	// return point to playback; Back walks the catalog's parents instead.
+	switcher_browse_begin(provider ? provider->id : "music");
+	bool opened = provider ? provider->gui.open_playback_place() : browser_open_playback_place() || medialist_open_playback_place();
+	if (!opened) {
+		if (player)
+			player_sheet_open(false);
+		return false;
+	}
+	return true;
+}
+
+static void open_source_cb(void *unused) {
+	(void)unused;
+	if (!trackmenu_open_playback_source())
+		sx_toast(tr("playback_source_unavailable"));
+}
+
 static void open_album_cb(void *user) {
 	(void)user;
 
@@ -1747,11 +1722,13 @@ static void open_album_cb(void *user) {
 		return;
 	}
 
-	// A Qobuz track is not in the local library, so its album is not looked up
-	// in the database: it is reopened on Qobuz, using the id the sidecar file
-	// kept when the track was downloaded.
-	char qobuz_album[40];
-	if (qobuzcache_album_id(state.current_file, qobuz_album, sizeof(qobuz_album))) {
+	// A streamed track is not in the local library, so its album is not looked
+	// up in the database: it is reopened on the service it came from, using the
+	// id the sidecar file kept when the track was downloaded. The name is not
+	// enough, since different albums share a title.
+	const stream_provider_t *service = stream_provider_for_path(state.current_file);
+	char service_album[64];
+	if (service && service->album_id && service->gui.open_album && service->album_id(state.current_file, service_album, sizeof(service_album))) {
 		char title[256];
 		if (!library_track_album(state.current_file, title, sizeof(title)) || !title[0]) {
 			device_state_t now;
@@ -1759,30 +1736,12 @@ static void open_album_cb(void *user) {
 			snprintf(title, sizeof(title), "%s", now.metadata.album);
 		}
 		player_sheet_close(false);
-		if (!qobuzpage_open_album(qobuz_album, title)) {
-			gui_notify_popup("trackmenu_qobuz_album_failed");
+		switcher_browse_begin(service->id);
+		lv_obj_t *back_to = service->gui.open_album(service_album, title);
+		if (!back_to) {
+			gui_notify_popup(service->album_failed_key);
 			return;
 		}
-		switcher_set_player_return(qobuz_list_screen);
-		return;
-	}
-
-	// Same for Tidal, for the same reason: a streamed track's album is reopened
-	// on the service it came from, not in the local database, where it is not.
-	char tidal_album[40];
-	if (tidalcache_album_id(state.current_file, tidal_album, sizeof(tidal_album))) {
-		char title[256];
-		if (!library_track_album(state.current_file, title, sizeof(title)) || !title[0]) {
-			device_state_t now;
-			device_state_get(&now);
-			snprintf(title, sizeof(title), "%s", now.metadata.album);
-		}
-		player_sheet_close(false);
-		if (!tidalpage_open_album(tidal_album, title)) {
-			gui_notify_popup("trackmenu_tidal_album_failed");
-			return;
-		}
-		switcher_set_player_return(tidal_list_screen);
 		return;
 	}
 
@@ -1793,13 +1752,43 @@ static void open_album_cb(void *user) {
 	}
 
 	player_sheet_close(false);
+	switcher_browse_begin("music");
+	medialist_open(tr("albums"), LIBRARY_LIST_ALBUMS, LIBRARY_FILTER_NONE, NULL);
 	medialist_open(album, LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ALBUM, album);
-	// Over a track list the album takes that list's place on the same page,
-	// and the page brings the list back with the player over it itself.
-	if (!medialist_step_back_to_player()) {
-		switcher_set_player_return(medialist_tracks_screen);
-	}
 }
+
+// "Show artist": the page of whoever the playing track is filed under -- the
+// album artist, or the performer on a compilation. Only the library knows
+// that, so a track it has not indexed (a stream, a file played from outside the
+// card's music) gets a note instead of an empty page.
+static bool open_artist(bool quiet) {
+	device_state_t state;
+	device_state_get(&state);
+	if (!state.current_file[0]) {
+		return false;
+	}
+
+	char name[256];
+	if (!library_track_artist_page(state.current_file, name, sizeof(name), NULL)) {
+		if (!quiet) {
+			gui_notify_popup("trackmenu_no_artist");
+		}
+		return false;
+	}
+
+	player_sheet_close(false);
+	switcher_browse_begin("music");
+	medialist_open(tr("artists"), LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL);
+	medialist_open_track_artist(state.current_file);
+	return true;
+}
+
+static void open_artist_cb(void *user) {
+	(void)user;
+	open_artist(false);
+}
+
+bool trackmenu_show_artist(void) { return open_artist(true); }
 
 static void open_settings_cb(void *user) {
 	(void)user;
@@ -1820,41 +1809,65 @@ void trackmenu_details_open(const char *path) {
 }
 
 void trackmenu_open(lv_obj_t *anchor) {
-	// Two tables rather than one with the label patched at runtime, because of
-	// the string-extraction tool: it reads popover_item_t initialisers (see
-	// LABEL_STRUCTS in tools/extract_strings.py), not assignments. A
-	// "trackmenu_show_podcast" written with an equals sign would never reach the
-	// language files and would stay untranslated everywhere.
-	//
-	// The action behind both is the same: open_album_cb inspects where the
-	// playing file came from and decides for itself. Only the wording differs,
-	// because a podcast episode has no album and calling it one would be a
-	// borrowed term to make a menu line up.
-	static const popover_item_t ITEMS[] = {
-		{"trackmenu_queue", open_queue_cb, NULL},
-		{"add_to_playlist", add_to_playlist_cb, NULL},
-		{"show_album", open_album_cb, NULL},
-		{"details", open_details_cb, NULL},
-		{"settings", open_settings_cb, NULL},
-	};
-	static const popover_item_t ITEMS_PODCAST[] = {
-		{"trackmenu_queue", open_queue_cb, NULL},
-		{"add_to_playlist", add_to_playlist_cb, NULL},
-		{"trackmenu_show_podcast", open_album_cb, NULL},
-		{"details", open_details_cb, NULL},
-		{"settings", open_settings_cb, NULL},
-	};
+	(void)anchor; // the sheet comes up from the bottom, wherever the button is
 
 	device_state_t state;
 	device_state_get(&state);
-	bool podcast = state.current_file[0] && podcastcache_is_episode(state.current_file);
+	bool podcast = !state.live && state.current_file[0] && podcastcache_is_episode(state.current_file);
+	char outside[256];
+	bool ext = player_outside_title(outside, sizeof(outside));
+	bool loaded = state.live || state.current_file[0];
+	device_state_stop_after_t stop = device_state_stop_after();
 
-	popover_show(anchor, podcast ? ITEMS_PODCAST : ITEMS, 5);
+	// The title and the artist, as the panel shows them.
+	static char title[256];
+	static char sub[256];
+	const char *slash = strrchr(state.current_file, '/');
+	snprintf(title, sizeof(title), "%.255s", ext && outside[0] ? outside : state.metadata.title[0] ? state.metadata.title : (slash ? slash + 1 : state.current_file));
+	snprintf(sub, sizeof(sub), "%s", state.live ? state.metadata.artist : metadata_shown_artist(&state.metadata));
+
+	sx_sheet_item_t items[14];
+	int n = 0;
+	const stream_provider_t *service = !state.live && !ext ? stream_provider_for_track(state.current_file) : NULL;
+	if (!ext && loaded && playback_source_available(&state))
+		items[n++] = (sx_sheet_item_t){tr("playback_source_open"), &npicon_album, false, false, open_source_cb, NULL};
+	if (service && service->save_track) {
+		snprintf(menu_save_path, sizeof(menu_save_path), "%s", state.current_file);
+		menu_save_duration = (int)state.progress_total_secs;
+		bool saved = service->track_saved && service->track_saved(menu_save_path);
+		items[n++] = (sx_sheet_item_t){tr(saved ? service->saved_label_key : service->save_label_key), &icon_download, saved, false, saved ? NULL : save_stream_track_cb, menu_save_path};
+	}
+	if (!ext && !state.live && loaded) {
+		items[n++] = (sx_sheet_item_t){tr("np_stop_after_track"), &npicon_stop_after, stop == DEVICE_STATE_STOP_AFTER_TRACK, false, stop_after_pick, (void *)(intptr_t)DEVICE_STATE_STOP_AFTER_TRACK};
+	}
+	items[n++] = (sx_sheet_item_t){player_sleep_label(), &npicon_sleep, false, false, sleep_cb, NULL};
+	items[n++] = (sx_sheet_item_t){tr("np_audio_chain"), &npicon_details, false, false, chain_cb, NULL};
+	if (!ext && loaded) {
+		items[n++] = (sx_sheet_item_t){tr("add_to_playlist"), &npicon_add_playlist, false, false, add_to_playlist_cb, NULL};
+		items[n++] = (sx_sheet_item_t){tr(podcast ? "trackmenu_show_podcast" : "show_album"), &npicon_album, false, false, open_album_cb, NULL};
+		if (!podcast) {
+			items[n++] = (sx_sheet_item_t){tr("show_artist"), &npicon_artist, false, false, open_artist_cb, NULL};
+			items[n++] = (sx_sheet_item_t){tr("musicsettings_playback_options"), &npicon_shuffle, false, false, shuffle_cb, NULL};
+		}
+		if (player_lyrics_available()) {
+			items[n++] = (sx_sheet_item_t){tr("np_lyrics"), &npicon_lyrics, player_lyrics_shown(), false, lyrics_cb, NULL};
+		}
+	}
+	items[n++] = (sx_sheet_item_t){tr("trackmenu_queue"), &npicon_queue, false, false, open_queue_cb, NULL};
+	if (loaded && !state.live) {
+		items[n++] = (sx_sheet_item_t){tr("details"), &npicon_details, false, false, open_details_cb, NULL};
+	}
+	items[n++] = (sx_sheet_item_t){tr("settings"), &npicon_settings, false, false, open_settings_cb, NULL};
+
+	sx_sheet_menu(loaded ? title : tr("trackmenu_queue"), loaded ? sub : NULL, items, n);
 }
 
+// Both pages are built the first time they are opened (gui_page_defer): the
+// queue's sixteen rows are some two hundred and fifty objects, and many
+// players never open the queue in a session. Everything here that reaches
+// into the queue page asks first whether it is the page on show.
 void trackmenu_init(gui_config_t *cfg) {
-	g_cfg = cfg;
-	(void)g_cfg;
-	build_queue_page(cfg);
-	build_details_page(cfg);
+	(void)cfg;
+	gui_page_defer(queue_screen, build_queue_page);
+	gui_page_defer(details_screen, build_details_page);
 }

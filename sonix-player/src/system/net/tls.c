@@ -1,10 +1,12 @@
 #define _GNU_SOURCE 1
 
 #include "tls.h"
+#include "openssl_runtime.h"
 
 #include "src/system/core/config.h"
 
 #include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -125,18 +127,7 @@ static bool bind_symbol(void *lib, const char *name, void *slot) {
 	}
 
 static bool load_symbols(void) {
-	// The target has 1.1; a development host may have 3. The subset used here
-	// is identical in both, so take whichever answers.
-	static const char *ssl_names[] = {"libssl.so.1.1", "libssl.so.3", "libssl.so", NULL};
-	static const char *crypto_names[] = {"libcrypto.so.1.1", "libcrypto.so.3", "libcrypto.so", NULL};
-
-	for (int i = 0; ssl_names[i] && !lib_ssl; i++) {
-		lib_ssl = dlopen(ssl_names[i], RTLD_NOW | RTLD_GLOBAL);
-	}
-	for (int i = 0; crypto_names[i] && !lib_crypto; i++) {
-		lib_crypto = dlopen(crypto_names[i], RTLD_NOW | RTLD_GLOBAL);
-	}
-	if (!lib_ssl || !lib_crypto) {
+	if (!openssl_runtime_get(&lib_ssl, &lib_crypto)) {
 		fprintf(stderr, "tls: OpenSSL not loadable (%s); https will be unavailable\n", dlerror());
 		return false;
 	}
@@ -190,7 +181,7 @@ static bool dir_exists(const char *path) {
 static bool load_ca(SSL_CTX *ctx) {
 	char candidate[512];
 
-	const char *configured = config_get("network", "ca_bundle", NULL);
+	const char *configured = config_get_copy("network", "ca_bundle", NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if (configured && configured[0] && file_exists(configured)) {
 		if (api.SSL_CTX_load_verify_locations(ctx, configured, NULL) == 1) {
 			snprintf(ca_source, sizeof(ca_source), "%s", configured);
@@ -284,6 +275,43 @@ static bool ensure_loaded(void) {
 
 bool tls_available(void) {
 	return ensure_loaded();
+}
+
+// The preload's thread: SCHED_IDLE, so it only ever runs on a core nothing
+// else wants -- after the first frames, between the interface's redraws -- and
+// a station opened in the meantime simply finds the load done, or waits on
+// load_lock for the rest of it, exactly as it would have waited for it itself.
+static void *preload_thread(void *arg) {
+	(void)arg;
+	thread_be_background("tls-preload");
+	if (!ensure_loaded()) {
+		fprintf(stderr, "tls: unavailable; https radio stations cannot be opened\n");
+	}
+	return NULL;
+}
+
+void tls_preload(void) {
+	static bool started;
+	pthread_mutex_lock(&load_lock);
+	bool go = !started && load_state == LOAD_UNTRIED;
+	started = true;
+	pthread_mutex_unlock(&load_lock);
+	if (!go) {
+		return;
+	}
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	// The PEM parse is OpenSSL's and its stack use is OpenSSL's business: the
+	// same room as the podcast downloader, which also ends up in TLS.
+	pthread_attr_setstacksize(&attr, 256 * 1024);
+	pthread_t thread;
+	if (pthread_create(&thread, &attr, preload_thread, NULL) != 0) {
+		// No thread to spare: the first https connection will load it instead.
+		fprintf(stderr, "tls: no thread for the preload, loading on first use\n");
+	}
+	pthread_attr_destroy(&attr);
 }
 
 const char *tls_version(void) {

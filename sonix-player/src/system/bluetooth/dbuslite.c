@@ -46,6 +46,8 @@ struct dbus_writer {
 	bool overflow; // past the buffer: the send refuses rather than truncates
 };
 
+void dbus_w_reject(dbus_writer_t *writer) { writer->overflow = true; }
+
 static void w_pad(dbus_writer_t *w, size_t align) {
 	while (w->used % align) {
 		if (w->used >= sizeof(w->buf)) {
@@ -186,9 +188,7 @@ void dbus_w_dict_strings(dbus_writer_t *w, const char *key, const char *const *v
 	dbus_w_array_end(w, &a);
 }
 
-void dbus_w_dict_variant_begin(dbus_writer_t *w, const char *key, const char *value_sig) {
-	w_dict_key(w, key, value_sig);
-}
+void dbus_w_dict_variant_begin(dbus_writer_t *w, const char *key, const char *value_sig) { w_dict_key(w, key, value_sig); }
 
 void dbus_w_variant_string(dbus_writer_t *w, const char *value) {
 	w_signature(w, "s");
@@ -205,6 +205,19 @@ void dbus_w_variant_u16(dbus_writer_t *w, uint16_t value) {
 	dbus_w_u16(w, value);
 }
 
+void dbus_w_variant_bytes(dbus_writer_t *w, const uint8_t *values, size_t count) {
+	if (count > WRITE_BUF_MAX || (!values && count)) {
+		w->overflow = true;
+		return;
+	}
+	w_signature(w, "ay");
+	dbus_array_t array;
+	dbus_w_array_begin(w, "y", &array);
+	for (size_t i = 0; i < count; i++)
+		dbus_w_byte(w, values[i]);
+	dbus_w_array_end(w, &array);
+}
+
 void dbus_w_variant_u32(dbus_writer_t *w, uint32_t value) {
 	w_signature(w, "u");
 	dbus_w_u32(w, value);
@@ -214,10 +227,7 @@ void dbus_w_variant_u32(dbus_writer_t *w, uint32_t value) {
 // The reader
 // ---------------------------------------------------------------------------
 
-static uint32_t swap32(uint32_t v) {
-	return ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8) | ((v & 0x00ff0000u) >> 8) |
-		   ((v & 0xff000000u) >> 24);
-}
+static uint32_t swap32(uint32_t v) { return ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8) | ((v & 0x00ff0000u) >> 8) | ((v & 0xff000000u) >> 24); }
 
 // Whether this machine is the byte order a message says it is in. Worked out
 // rather than assumed: the daemon writes its own order, and while in practice
@@ -746,8 +756,7 @@ static bool authenticate(int fd, bool want_fds) {
 	}
 	if (want_fds) {
 		const char *ask = "NEGOTIATE_UNIX_FD\r\n";
-		if (!write_all(fd, ask, strlen(ask)) || !read_line(fd, line, sizeof(line)) ||
-			strncmp(line, "AGREE_UNIX_FD", 13) != 0) {
+		if (!write_all(fd, ask, strlen(ask)) || !read_line(fd, line, sizeof(line)) || strncmp(line, "AGREE_UNIX_FD", 13) != 0) {
 			fprintf(stderr, "dbus: the daemon will not pass descriptors (%s)\n", line);
 			return false;
 		}
@@ -845,8 +854,7 @@ static dbus_writer_t *out_begin(dbus_conn_t *c, uint8_t type) {
 	return &c->writer;
 }
 
-dbus_writer_t *dbus_call_begin(dbus_conn_t *c, const char *destination, const char *path, const char *interface,
-							   const char *member, const char *signature) {
+dbus_writer_t *dbus_call_begin(dbus_conn_t *c, const char *destination, const char *path, const char *interface, const char *member, const char *signature) {
 	dbus_writer_t *w = out_begin(c, DBUS_TYPE_METHOD_CALL);
 	set_str(c->out_destination, sizeof(c->out_destination), destination);
 	set_str(c->out_path, sizeof(c->out_path), path);
@@ -939,8 +947,7 @@ bool dbus_error(dbus_conn_t *c, const dbus_msg_t *call, const char *name, const 
 	return ok;
 }
 
-dbus_writer_t *dbus_signal_begin(dbus_conn_t *c, const char *path, const char *interface, const char *member,
-								 const char *signature) {
+dbus_writer_t *dbus_signal_begin(dbus_conn_t *c, const char *path, const char *interface, const char *member, const char *signature) {
 	dbus_writer_t *w = out_begin(c, DBUS_TYPE_SIGNAL);
 	set_str(c->out_path, sizeof(c->out_path), path);
 	set_str(c->out_interface, sizeof(c->out_interface), interface);
@@ -1150,13 +1157,9 @@ static void *reader_thread(void *arg) {
 
 static dbus_conn_t *connect_system(const char *address, dbus_method_cb on_call, void *user, bool want_fds);
 
-dbus_conn_t *dbus_connect_system(const char *address, dbus_method_cb on_call, void *user) {
-	return connect_system(address, on_call, user, false);
-}
+dbus_conn_t *dbus_connect_system(const char *address, dbus_method_cb on_call, void *user) { return connect_system(address, on_call, user, false); }
 
-dbus_conn_t *dbus_connect_system_fds(const char *address, dbus_method_cb on_call, void *user) {
-	return connect_system(address, on_call, user, true);
-}
+dbus_conn_t *dbus_connect_system_fds(const char *address, dbus_method_cb on_call, void *user) { return connect_system(address, on_call, user, true); }
 
 static dbus_conn_t *connect_system(const char *address, dbus_method_cb on_call, void *user, bool want_fds) {
 	int fd = -1;
@@ -1237,8 +1240,7 @@ void dbus_set_signal_handler(dbus_conn_t *c, dbus_signal_cb cb, void *user) {
 }
 
 bool dbus_add_match(dbus_conn_t *c, const char *rule) {
-	dbus_writer_t *w =
-		dbus_call_begin(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s");
+	dbus_writer_t *w = dbus_call_begin(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s");
 	dbus_w_string(w, rule);
 	char err[DBUS_NAME_MAX];
 	if (!dbus_call_send(c, 5000, err, sizeof(err))) {

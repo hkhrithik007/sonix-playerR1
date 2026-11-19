@@ -1,13 +1,14 @@
 #include "audiobook.h"
 
-#include "src/system/library/audiobookdb.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/decode/mp4.h"
+#include "src/system/library/audiobookdb.h"
 #include "src/system/library/id3chap.h"
 #include "src/system/library/vorbischap.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 typedef struct {
 	double start;
 	char title[192];
+	bool listened;
 } chapter_t;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -41,6 +43,7 @@ static unsigned serial;
 typedef struct {
 	char path[512];
 	char title[192];
+	bool listened;
 } part_t;
 
 static part_t *parts;
@@ -51,6 +54,12 @@ static int part_index;
 static time_t last_save;
 static double last_saved_position;
 static bool finished_marked; // this book has already been put on the shelf
+static bool heard_valid;
+static double heard_seconds, heard_total;
+static uint64_t heard_tick;
+static unsigned history_serial;
+static unsigned heard_transport_serial;
+static unsigned current_card_epoch;
 
 static void clear_locked(void) {
 	free(chapters);
@@ -64,6 +73,8 @@ static void clear_locked(void) {
 	current_is_book = false;
 	current_path[0] = '\0';
 	current_book[0] = '\0';
+	heard_valid = false;
+	heard_total = 0;
 }
 
 // Called with `lock` held, from audiobook_track_changed().
@@ -80,6 +91,7 @@ static bool add_part(const char *path, const char *title, void *user) {
 	}
 	snprintf(parts[part_count].path, sizeof(parts[0].path), "%s", path);
 	snprintf(parts[part_count].title, sizeof(parts[0].title), "%s", title);
+	parts[part_count].listened = false;
 	part_count++;
 	return true;
 }
@@ -187,9 +199,7 @@ static int clamp_skip(long value) {
 
 int audiobook_skip_back(void) { return clamp_skip(config_get_int("audiobook", "skip_back", AUDIOBOOK_SKIP_SHORT)); }
 
-int audiobook_skip_forward(void) {
-	return clamp_skip(config_get_int("audiobook", "skip_forward", AUDIOBOOK_SKIP_SHORT));
-}
+int audiobook_skip_forward(void) { return clamp_skip(config_get_int("audiobook", "skip_forward", AUDIOBOOK_SKIP_SHORT)); }
 
 void audiobook_set_skip_back(int seconds) { config_set_int("audiobook", "skip_back", clamp_skip(seconds)); }
 
@@ -248,15 +258,32 @@ int audiobook_rewind_seconds(void) {
 
 void audiobook_set_rewind_seconds(int seconds) { config_set_int("audiobook", "rewind_seconds", seconds); }
 
+// Called by the database under its lock; the caller already owns our lock.
+static bool load_heard(const char *file, long long start_ms, void *user) {
+	(void)user;
+	if (start_ms == -1) {
+		for (int i = 0; i < part_count; i++)
+			if (!strcmp(file, parts[i].path))
+				parts[i].listened = true;
+	} else if (!strcmp(file, current_path)) {
+		for (int i = 0; i < chapter_count; i++)
+			if ((long long)(chapters[i].start * 1000.0 + 0.5) == start_ms)
+				chapters[i].listened = true;
+	}
+	return true;
+}
+
 void audiobook_track_changed(const char *filepath) {
 	pthread_mutex_lock(&lock);
+	unsigned epoch = audiobookdb_card_epoch();
 
-	if (filepath && filepath[0] && strcmp(filepath, current_path) == 0) {
+	if (filepath && filepath[0] && strcmp(filepath, current_path) == 0 && current_card_epoch == epoch) {
 		pthread_mutex_unlock(&lock); // same file, nothing to redo
 		return;
 	}
 
 	clear_locked();
+	current_card_epoch = epoch;
 	serial++;
 
 	if (!filepath || !filepath[0]) {
@@ -288,6 +315,8 @@ void audiobook_track_changed(const char *filepath) {
 	}
 
 	load_chapters_locked(filepath);
+	audiobookdb_chapter_history(current_book, load_heard, NULL);
+	history_serial++;
 	printf("audiobook: %s (%d chapters, part %d of %d)\n", filepath, chapter_count, part_index + 1, part_count);
 
 	pthread_mutex_unlock(&lock);
@@ -435,6 +464,99 @@ int audiobook_chapter_at(double seconds) {
 }
 
 unsigned audiobook_serial(void) { return serial; }
+
+static uint64_t heard_now(void) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static void mark_chapter_locked(int i) {
+	if (i < 0 || i >= chapter_count || chapters[i].listened)
+		return;
+	chapters[i].listened = true;
+	history_serial++;
+	audiobookdb_queue_chapter_done(current_book, current_path, (long long)(chapters[i].start * 1000.0 + 0.5));
+}
+
+// A progress jump must fit elapsed playback time, even if a caller bypassed
+// device_state_seek(). Screen-off polling and speech speeds remain supported.
+static bool heard_span_locked(double seconds, uint64_t tick, double speed) {
+	double advanced = seconds - heard_seconds;
+	return heard_valid && advanced >= 0 && advanced <= (double)(tick - heard_tick) * speed / 1000.0 + 2.0;
+}
+
+void audiobook_listen_seek(void) {
+	pthread_mutex_lock(&lock);
+	heard_valid = false;
+	pthread_mutex_unlock(&lock);
+}
+
+void audiobook_listen_progress(double seconds, double total, bool playing, unsigned transport_serial) {
+	uint64_t tick = heard_now();
+	double speed = audiobook_speed();
+	pthread_mutex_lock(&lock);
+	if (transport_serial != heard_transport_serial)
+		heard_valid = false;
+	heard_transport_serial = transport_serial;
+	if (!current_is_book || seconds < 0) {
+		heard_valid = false;
+		pthread_mutex_unlock(&lock);
+		return;
+	}
+	if (heard_span_locked(seconds, tick, speed)) {
+		for (int i = 0; i + 1 < chapter_count; i++)
+			if (heard_seconds < chapters[i + 1].start && seconds >= chapters[i + 1].start)
+				mark_chapter_locked(i);
+	}
+	heard_seconds = seconds;
+	if (total > 0)
+		heard_total = total;
+	heard_tick = tick;
+	heard_valid = playing;
+	pthread_mutex_unlock(&lock);
+}
+
+void audiobook_listen_end(unsigned transport_serial) {
+	uint64_t tick = heard_now();
+	double speed = audiobook_speed();
+	pthread_mutex_lock(&lock);
+	if (current_is_book && transport_serial == heard_transport_serial && heard_total > 0 && heard_span_locked(heard_total, tick, speed)) {
+		for (int i = 0; i < chapter_count; i++) {
+			double end = i + 1 < chapter_count ? chapters[i + 1].start : heard_total;
+			if (heard_seconds < end || (i == chapter_count - 1 && heard_seconds == end))
+				mark_chapter_locked(i);
+		}
+		if (part_index >= 0 && part_index < part_count && !parts[part_index].listened) {
+			parts[part_index].listened = true;
+			history_serial++;
+			audiobookdb_queue_chapter_done(current_book, current_path, -1);
+		}
+	}
+	heard_valid = false;
+	pthread_mutex_unlock(&lock);
+}
+
+bool audiobook_chapter_listened(int index) {
+	pthread_mutex_lock(&lock);
+	bool done = index >= 0 && index < chapter_count && chapters[index].listened;
+	pthread_mutex_unlock(&lock);
+	return done;
+}
+
+bool audiobook_part_listened(int index) {
+	pthread_mutex_lock(&lock);
+	bool done = index >= 0 && index < part_count && parts[index].listened;
+	pthread_mutex_unlock(&lock);
+	return done;
+}
+
+unsigned audiobook_history_serial(void) {
+	pthread_mutex_lock(&lock);
+	unsigned value = history_serial;
+	pthread_mutex_unlock(&lock);
+	return value;
+}
 
 double audiobook_saved_position(const char *filepath) {
 	if (!filepath || !filepath[0]) {

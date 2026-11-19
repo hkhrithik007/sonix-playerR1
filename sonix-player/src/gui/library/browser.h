@@ -30,5 +30,6 @@ bool browser_can_go_up(void); // true when the chevron/swipe walks up a folder i
 // Opens a directory directly. Only the soak test uses this; the player itself
 // navigates through the rows and the back button.
 void browser_open_dir_public(const char *path);
+bool browser_open_playback_place(void);
 
 #endif /* BROWSER_H */

@@ -52,13 +52,6 @@ typedef bool (*dual_loader_t)(const char *path, int w, int h, cover_image_t *fir
 
 // The "what is it" job: the same newest-wins discipline as the others, with
 // one number for an answer instead of two pictures.
-//
-// It has a thread of its own (id_worker). The player keeps the last track's
-// cover up until this answer comes, so that a record's next track does not
-// blink to the placeholder and back; behind a decode already running on the
-// other thread -- the next track's cover being made ahead, a list thumbnail --
-// the answer took as long as that decode, and the last track's cover stayed
-// over the new track's title for all of it.
 typedef struct {
 	char path[512];
 	uint32_t generation;
@@ -83,11 +76,19 @@ static dual_job_t saver_job;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wakeup = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t id_wakeup = PTHREAD_COND_INITIALIZER;
-// Only when id_worker could not be started: the worker answers the questions
-// itself, first of all its jobs.
-static bool id_on_worker;
 static bool started;
+
+// Only the worker calls this, after releasing the job lock and immediately
+// before I/O/decode. A screen transition during cond_wait must affect the
+// first job after wake, without a scheduler syscall for every thumbnail.
+static void prepare_job_priority(void) {
+	static int applied = -1;
+	int visible = power_screen_is_on();
+	if (visible != applied) {
+		thread_set_background_level(visible);
+		applied = visible;
+	}
+}
 
 // Picks up the next slot waiting to be decoded. Called with the lock held.
 static int next_pending(void) {
@@ -115,6 +116,7 @@ static void run_dual_job(dual_job_t *job, dual_loader_t load) {
 	job->running = true;
 	pthread_mutex_unlock(&lock);
 
+	prepare_job_priority();
 	cover_image_t first, second;
 	bool found = load(path, fw, fh, &first, sw, sh, &second);
 
@@ -143,31 +145,6 @@ static void run_dual_job(dual_job_t *job, dual_loader_t load) {
 	pthread_mutex_unlock(&lock);
 }
 
-// Answers the question waiting in player_id_job. Called without the lock.
-static void answer_id(void) {
-	pthread_mutex_lock(&lock);
-	if (!player_id_job.pending || player_id_job.running) {
-		pthread_mutex_unlock(&lock);
-		return;
-	}
-	char path[sizeof(player_id_job.path)];
-	memcpy(path, player_id_job.path, sizeof(path));
-	uint32_t generation = player_id_job.generation;
-	player_id_job.pending = false;
-	player_id_job.running = true;
-	pthread_mutex_unlock(&lock);
-
-	uint64_t id = cover_source_id(path);
-
-	pthread_mutex_lock(&lock);
-	player_id_job.running = false;
-	if (player_id_job.generation == generation) {
-		player_id_job.id = id;
-		player_id_job.done = true;
-	}
-	pthread_mutex_unlock(&lock);
-}
-
 static void *worker(void *arg) {
 	(void)arg;
 
@@ -189,21 +166,35 @@ static void *worker(void *arg) {
 		// lost, and after two seconds without progress the link is taken for
 		// gone. A picture for a screen nobody can see is not worth that, so with
 		// the screen off the thread goes back to the bottom of the pile.
-		thread_set_background_level(power_screen_is_on());
-
 		pthread_mutex_lock(&lock);
 
-		while (next_pending() < 0 && !(id_on_worker && player_id_job.pending && !player_id_job.running) &&
+		while (next_pending() < 0 && !(player_id_job.pending && !player_id_job.running) &&
 			   !(player_job.pending && !player_job.running) && !(saver_job.pending && !saver_job.running) &&
 			   !prefetch_job.pending) {
 			pthread_cond_wait(&wakeup, &lock);
 		}
 
-		// First of all, when it is the worker's: the question that can spare
-		// every other piece of work on this list.
-		if (id_on_worker && player_id_job.pending && !player_id_job.running) {
+		// First of all: the question that can spare every other piece of work
+		// on this list. It reads a picture and hashes it, which is a fraction
+		// of what decoding one costs.
+		if (player_id_job.pending && !player_id_job.running) {
+			char path[sizeof(player_id_job.path)];
+			memcpy(path, player_id_job.path, sizeof(path));
+			uint32_t generation = player_id_job.generation;
+			player_id_job.pending = false;
+			player_id_job.running = true;
 			pthread_mutex_unlock(&lock);
-			answer_id();
+
+			prepare_job_priority();
+			uint64_t id = cover_source_id(path);
+
+			pthread_mutex_lock(&lock);
+			player_id_job.running = false;
+			if (player_id_job.generation == generation) {
+				player_id_job.id = id;
+				player_id_job.done = true;
+			}
+			pthread_mutex_unlock(&lock);
 			continue;
 		}
 
@@ -228,6 +219,7 @@ static void *worker(void *arg) {
 			int w = prefetch_job.w, h = prefetch_job.h;
 			prefetch_job.pending = false;
 			pthread_mutex_unlock(&lock);
+			prepare_job_priority();
 			cover_prefetch_player(path, w, h);
 			continue;
 		}
@@ -251,6 +243,7 @@ static void *worker(void *arg) {
 		slot->running = true;
 		pthread_mutex_unlock(&lock);
 
+		prepare_job_priority();
 		cover_image_t image;
 		bool found = share_w > 0 ? cover_load_shared(path, share_w, share_h, size, &image)
 								  : cover_thumb_load(path, false, size, &image);
@@ -279,29 +272,6 @@ static void *worker(void *arg) {
 	return NULL;
 }
 
-// Answers the player's "what is it" questions, and nothing else, so none waits
-// behind a decode. It reads a picture and hashes it -- or finds the answer in
-// the cache's table -- which is a fraction of what decoding one costs; what it
-// shares with the decodes (the cache, the mapped pictures) is already locked
-// for the sonixlink threads that read the same files.
-static void *id_worker(void *arg) {
-	(void)arg;
-	thread_be_low_priority("coverid");
-
-	for (;;) {
-		thread_set_background_level(power_screen_is_on()); // as in worker()
-
-		pthread_mutex_lock(&lock);
-		while (!(player_id_job.pending && !player_id_job.running)) {
-			pthread_cond_wait(&id_wakeup, &lock);
-		}
-		pthread_mutex_unlock(&lock);
-		answer_id();
-	}
-
-	return NULL;
-}
-
 void coverloader_start(void) {
 	pthread_mutex_lock(&lock);
 
@@ -316,17 +286,6 @@ void coverloader_start(void) {
 	if (pthread_create(&thread, NULL, worker, NULL) != 0) {
 		fprintf(stderr, "coverloader: could not start the worker; artwork will not load\n");
 		started = false;
-		return;
-	}
-	pthread_detach(thread);
-
-	if (pthread_create(&thread, NULL, id_worker, NULL) != 0) {
-		// The questions then go to the worker after all (see worker()).
-		fprintf(stderr, "coverloader: could not start the id thread; the worker answers instead\n");
-		pthread_mutex_lock(&lock);
-		id_on_worker = true;
-		pthread_cond_signal(&wakeup); // a question may be waiting already
-		pthread_mutex_unlock(&lock);
 		return;
 	}
 	pthread_detach(thread);
@@ -530,7 +489,7 @@ void coverloader_request_player_id(const char *path) {
 	player_id_job.id = 0;
 	snprintf(player_id_job.path, sizeof(player_id_job.path), "%s", path ? path : "");
 	player_id_job.pending = true;
-	pthread_cond_signal(id_on_worker ? &wakeup : &id_wakeup);
+	pthread_cond_signal(&wakeup);
 	pthread_mutex_unlock(&lock);
 }
 

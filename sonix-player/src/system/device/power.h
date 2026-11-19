@@ -99,14 +99,6 @@ void power_screen_off(void);
 void power_toggle_screen(void);
 bool power_screen_is_on(void);
 
-// For the main loop, after every pass of lv_timer_handler(). LVGL starts its
-// animation timer again whenever an animation is created or ends, so the pause
-// put on it at the blank lasts only until the first animation started in the
-// dark -- a title that starts scrolling at a track change -- and from there it
-// runs every 16 ms until the screen comes back. With the panel off this puts it
-// back to sleep; power_screen_on() catches every animation up on the way back.
-void power_keep_animations_paused(void);
-
 // --- Activity notifications (thread-safe; call from any thread) ---
 // Reset the idle timers because the user did something (e.g. a physical
 // button press). Touch input is already accounted for automatically.
@@ -219,6 +211,13 @@ void power_set_standby_enabled(bool enabled);
 // How long the screen stays dark before standby, in seconds (Settings > Power,
 // [power] standby_mem_seconds). Never less than 15.
 void power_set_standby_after(uint32_t seconds);
+
+// How long Bluetooth stays up with nothing using it and the screen dark before
+// it is parked ("Keep Bluetooth on"). At least 15 s; by default the radios'
+// usual minute. A wait longer than that holds the standby off until it has run
+// out. UI thread. The caller stores [power] bt_park_seconds.
+void power_set_bt_park_seconds(uint32_t seconds);
+uint32_t power_bt_park_seconds(void);
 
 // Powers the Bluetooth radio and its daemons down, in order, through
 // bluetooth_power_down_stack(). The stock init script starts the whole stack at

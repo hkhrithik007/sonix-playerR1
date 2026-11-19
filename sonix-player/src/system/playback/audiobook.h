@@ -114,6 +114,14 @@ int audiobook_chapter_at(double seconds);
 // redraw only when there is something new.
 unsigned audiobook_serial(void);
 
+// History records natural chapter endings, not seeks or inferred earlier rows.
+void audiobook_listen_progress(double seconds, double total, bool playing, unsigned transport_serial);
+void audiobook_listen_end(unsigned transport_serial);
+void audiobook_listen_seek(void);
+bool audiobook_chapter_listened(int index);
+bool audiobook_part_listened(int index);
+unsigned audiobook_history_serial(void);
+
 // Where this book was left last time, in seconds. 0 when it is new, when it
 // is not a book, when it was heard to the end -- a finished book starts over,
 // and is listed as finished so that fact is not simply lost -- or when `filepath`

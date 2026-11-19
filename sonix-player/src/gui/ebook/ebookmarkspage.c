@@ -1,4 +1,5 @@
 #include "ebookmarkspage.h"
+#include "src/gui/shell/artview.h"
 
 #include <dirent.h>
 #include <stdio.h>
@@ -212,7 +213,8 @@ static bool cover_ready(int index, const char *title, const cover_image_t *cover
 	}
 	entry->cover = *cover;
 	entry->has_cover = true;
-	lv_image_set_src(entry->image, &entry->cover.dsc);
+	lv_obj_set_hidden(entry->image, false);
+	sx_artview_bind(entry->image, &entry->cover.dsc, entry->cover.display_generation);
 	lv_obj_set_hidden(entry->image, false);
 	return true;
 }
@@ -224,7 +226,7 @@ static void books_free(void) {
 	}
 	for (int i = 0; i < book_count; i++) {
 		if (books[i].has_cover) {
-			cover_free(&books[i].cover);
+			sx_artview_release_cover(&books[i].cover);
 		}
 	}
 	book_count = 0;

@@ -12,4 +12,12 @@ extern lv_obj_t *gearboypage_screen;
 
 void gearboypage_init(gui_config_t *cfg);
 
+// GUI thread: drain at most one owned terminal result on an existing main-loop
+// pass. Correctness does not depend on GUI message admission or a timer.
+void gearboypage_service_completion(void);
+
+// GUI thread, before process exit: refuse admission and drop ready payloads.
+// Does not join a disk worker or permit live-process LVGL teardown by itself.
+void gearboypage_shutdown_completions(void);
+
 #endif /* GUI_GEARBOYPAGE_H */

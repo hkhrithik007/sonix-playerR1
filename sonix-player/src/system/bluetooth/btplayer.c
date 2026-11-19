@@ -40,7 +40,6 @@ static dbus_conn_t *conn;
 // What was last told to bluez, so PropertiesChanged is emitted on a change and
 // not on a tick.
 static char sent_status[16];
-static char sent_track[512];
 
 bool btplayer_registered(void) { return registered; }
 
@@ -93,6 +92,9 @@ typedef struct {
 	int64_t length_us;
 	char id[512]; // what the track is, for noticing a change
 } track_t;
+
+static track_t sent_track;
+static bool have_sent_track;
 
 static void track_now(track_t *t) {
 	memset(t, 0, sizeof(*t));
@@ -286,6 +288,21 @@ static void emit_metadata(const track_t *t) {
 	dbus_signal_send(conn);
 }
 
+static void update_metadata(void) {
+	track_t t;
+	track_now(&t);
+	// A lazy stream can gain tags and duration without changing its file.
+	// Compare the bounded snapshot, not the GUI-owned metadata revision.
+	if (have_sent_track && strcmp(t.id, sent_track.id) == 0 &&
+		strcmp(t.title, sent_track.title) == 0 && strcmp(t.artist, sent_track.artist) == 0 &&
+		strcmp(t.album, sent_track.album) == 0 && t.length_us == sent_track.length_us) {
+		return;
+	}
+	sent_track = t;
+	have_sent_track = true;
+	emit_metadata(&t);
+}
+
 // ---------------------------------------------------------------------------
 // Coming up, and staying up
 // ---------------------------------------------------------------------------
@@ -321,7 +338,7 @@ static void teardown(void) {
 	conn = NULL;
 	registered = false;
 	sent_status[0] = '\0';
-	sent_track[0] = '\0';
+	have_sent_track = false;
 }
 
 static void *worker_func(void *unused) {
@@ -366,12 +383,7 @@ static void *worker_func(void *unused) {
 			printf("btplayer: status -> %s\n", status);
 		}
 
-		track_t t;
-		track_now(&t);
-		if (strcmp(t.id, sent_track) != 0) {
-			snprintf(sent_track, sizeof(sent_track), "%s", t.id);
-			emit_metadata(&t);
-		}
+		update_metadata();
 
 		usleep(POLL_MS * 1000);
 	}

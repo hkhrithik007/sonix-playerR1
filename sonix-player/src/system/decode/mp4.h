@@ -84,7 +84,8 @@ int mp4_audio_bitrate_kbps(const mp4_file_t *m);
 // Copies frame `index` into `buf`. Returns its length, 0 on failure, and a
 // negative number when the frame does not fit (its size, negated).
 int mp4_read_audio_frame(mp4_file_t *m, uint32_t index, unsigned char *buf, uint32_t buf_size);
-// The largest frame in the file, so a caller can size its buffer once.
+// Exact for uniform-sized frames, otherwise 0 (unknown). Grow the buffer when
+// mp4_read_audio_frame() returns a negative required size.
 uint32_t mp4_max_frame_size(const mp4_file_t *m);
 
 double mp4_frame_time(const mp4_file_t *m, uint32_t index);	  // when frame N starts

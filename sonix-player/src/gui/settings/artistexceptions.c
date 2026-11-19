@@ -7,11 +7,14 @@
 #include <strings.h>
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/sx_mini.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/sx_tokens.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/system/core/lang.h"
 #include "src/system/library/library.h"
 
@@ -59,7 +62,7 @@ static void rebuild(void) {
 		lv_obj_t *row = lv_obj_create(list);
 		lv_obj_set_size(row, lv_pct(100), 84);
 		lv_obj_add_style(row, &theme_style_card, 0);
-		lv_obj_set_style_radius(row, 12, 0);
+		lv_obj_set_style_radius(row, SX_CARD_R, 0);
 		lv_obj_set_style_border_width(row, 0, 0);
 		lv_obj_set_style_shadow_width(row, 0, 0);
 		lv_obj_set_style_pad_left(row, 20, 0);
@@ -102,7 +105,10 @@ static void load(void) {
 	names = library_artist_exceptions(&name_count);
 }
 
-static void name_layer_hide(void) { lv_obj_set_hidden(name_layer, true); }
+static void name_layer_hide(void) {
+	lv_obj_set_hidden(name_layer, true);
+	sx_mini_update_visibility(); // its keyboard goes with it
+}
 
 static void add_cb(lv_event_t *e) {
 	(void)e;
@@ -116,6 +122,7 @@ static void add_cb(lv_event_t *e) {
 	lv_obj_add_state(name_field, LV_STATE_FOCUSED);
 	lv_obj_send_event(name_field, LV_EVENT_FOCUSED, NULL);
 	lv_obj_set_hidden(name_layer, false);
+	sx_mini_update_visibility(); // its keyboard comes or goes with it
 	lv_obj_move_foreground(name_layer);
 }
 
@@ -255,10 +262,13 @@ void artistexceptions_init(gui_config_t *cfg, void (*changed)(void)) {
 	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_align(name_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
 	lv_obj_add_style(name_field, &theme_style_card, 0);
-	lv_obj_set_style_radius(name_field, 12, 0);
+	// The 2.0 input: a pill on the surface.
+	lv_obj_add_style(name_field, &sx_style_surface, 0);
+	lv_obj_set_style_radius(name_field, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_border_width(name_field, 0, 0);
 	lv_obj_set_style_shadow_width(name_field, 0, 0);
 	lv_obj_set_style_pad_all(name_field, 14, 0);
+	lv_obj_set_style_pad_hor(name_field, 22, 0);
 	lv_obj_set_style_text_font(name_field, &font_ui_24, 0);
 	keyboard_style_caret(name_field);
 

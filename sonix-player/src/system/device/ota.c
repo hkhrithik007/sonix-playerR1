@@ -2,6 +2,8 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,11 +43,8 @@ static long progress_done, progress_total;
 static bool cancel_requested;
 static http_stream_t *active_stream; // the download's stream, for ota_cancel() to wake
 
-static ota_release_t release = {.notes = ""};
+static ota_release_t release;
 static bool release_valid;
-// What release.notes points at when the release has a description: as long
-// as the description, so a long changelog is not cut at a fixed size.
-static char *notes_text;
 
 // Set on the interface thread when a check starts.
 static char repo[128];
@@ -144,34 +143,173 @@ const char *ota_installed_version(void) { return sysinfo_os_version(); }
 
 #define VERSION_PARTS 4
 
-// "1.0.2", "v1.0.2", "1.0.2-r1": up to four numbers, a leading v ignored,
-// anything after the numbers ignored. False when there is no number at all.
-static bool parse_version(const char *text, long out[VERSION_PARTS]) {
-	memset(out, 0, sizeof(long) * VERSION_PARTS);
+typedef struct {
+	long parts[VERSION_PARTS];
+	long ui;
+	int stage; // alpha, beta, rc, stable
+	long iteration;
+} ota_version_t;
+
+enum { VERSION_ALPHA, VERSION_BETA, VERSION_RC, VERSION_STABLE };
+
+static bool version_number(const char **text, long *out) {
+	if (!isdigit((unsigned char)**text)) {
+		return false;
+	}
+	char *end;
+	errno = 0;
+	long number = strtol(*text, &end, 10);
+	if (errno == ERANGE || number > INT_MAX) {
+		return false;
+	}
+	*text = end;
+	*out = number;
+	return true;
+}
+
+// Keep the UI generation and prerelease counter: alpha25 is not alpha24,
+// and an old unbranded 1.3.0 is not newer than 1.3.0-ui3-alpha25.
+static bool parse_version(const char *text, ota_version_t *out) {
+	memset(out, 0, sizeof(*out));
+	out->stage = VERSION_STABLE;
 	const char *p = text;
 	if (*p == 'v' || *p == 'V') {
 		p++;
 	}
-	if (!isdigit((unsigned char)*p)) {
-		return false;
-	}
-	for (int i = 0; i < VERSION_PARTS && isdigit((unsigned char)*p); i++) {
-		out[i] = strtol(p, (char **)&p, 10);
+	for (int i = 0; i < VERSION_PARTS; i++) {
+		if (!version_number(&p, &out->parts[i])) {
+			return false;
+		}
 		if (*p != '.') {
 			break;
 		}
 		p++;
-	}
-	return true;
-}
-
-static int version_cmp(const long a[VERSION_PARTS], const long b[VERSION_PARTS]) {
-	for (int i = 0; i < VERSION_PARTS; i++) {
-		if (a[i] != b[i]) {
-			return a[i] < b[i] ? -1 : 1;
+		if (i == VERSION_PARTS - 1) {
+			return false;
 		}
 	}
+	if (strncmp(p, "-ui", 3) == 0) {
+		p += 3;
+		if (!version_number(&p, &out->ui)) {
+			return false;
+		}
+	}
+	if (!*p || strcmp(p, "-r1") == 0 || strcmp(p, "-stable") == 0) {
+		return true;
+	}
+	static const char *const stages[] = {"-alpha", "-beta", "-rc"};
+	for (int stage = VERSION_ALPHA; stage < VERSION_STABLE; stage++) {
+		size_t length = strlen(stages[stage]);
+		if (strncmp(p, stages[stage], length) == 0) {
+			p += length;
+			if (*p == '.') {
+				p++;
+			}
+			out->stage = stage;
+			return version_number(&p, &out->iteration) && !*p;
+		}
+	}
+	return false;
+}
+
+static int version_cmp(const ota_version_t *a, const ota_version_t *b) {
+	for (int i = 0; i < VERSION_PARTS; i++) {
+		if (a->parts[i] != b->parts[i]) {
+			return a->parts[i] < b->parts[i] ? -1 : 1;
+		}
+	}
+	if (a->ui != b->ui) {
+		return a->ui < b->ui ? -1 : 1;
+	}
+	if (a->stage != b->stage) {
+		return a->stage < b->stage ? -1 : 1;
+	}
+	if (a->iteration != b->iteration) {
+		return a->iteration < b->iteration ? -1 : 1;
+	}
 	return 0;
+}
+
+// A release tag may be an editorial name such as "r2". An explicit version
+// in its body is authoritative; dates and marketing titles are not versions.
+// Only a whole line, or one whole HTML comment line, is accepted. Reject even
+// identical duplicate markers rather than guessing which one the author meant.
+static bool version_from_body(char *body, const char *tag, ota_version_t *out) {
+	bool found = false;
+	for (char *line = body; line && *line;) {
+		char *next = strchr(line, '\n');
+		if (next) {
+			*next++ = '\0';
+		}
+		while (isspace((unsigned char)*line)) {
+			line++;
+		}
+		bool hidden = strncmp(line, "<!--", 4) == 0;
+		if (hidden) {
+			line += 4;
+			while (*line == ' ' || *line == '\t') {
+				line++;
+			}
+		}
+		if (strncmp(line, "Sonix-Version:", 14) == 0) {
+			if (found) {
+				return false;
+			}
+			found = true;
+			line += 14;
+			while (*line == ' ' || *line == '\t') {
+				line++;
+			}
+			char *end = line + strlen(line);
+			while (end > line && isspace((unsigned char)end[-1])) {
+				*--end = '\0';
+			}
+			if (hidden) {
+				if (end - line < 3 || strcmp(end - 3, "-->") != 0) {
+					return false;
+				}
+				end -= 3;
+				while (end > line && isspace((unsigned char)end[-1])) {
+					end--;
+				}
+				*end = '\0';
+			}
+			if (!parse_version(line, out)) {
+				return false;
+			}
+		}
+		line = next;
+	}
+	if (found) {
+		return true;
+	}
+	return parse_version(tag, out);
+}
+
+static bool release_version(const json_doc_t *doc, int rel, ota_version_t *out) {
+	char tag[sizeof(release.tag)];
+	int token = json_get(doc, rel, "tag_name");
+	if (token < 0 || doc->toks[token].end - doc->toks[token].start >= (int)sizeof(tag) || !json_str(doc, token, tag, sizeof(tag)) || !tag[0]) {
+		return false;
+	}
+	int notes = json_get(doc, rel, "body");
+	if (notes < 0 || doc->toks[notes].type == JSON_NULL) {
+		return parse_version(tag, out);
+	}
+	int raw_length = doc->toks[notes].end - doc->toks[notes].start;
+	if (doc->toks[notes].type != JSON_STRING || raw_length < 0 || raw_length > LIST_LIMIT) {
+		return false;
+	}
+	// The UI preview can be truncated, but version markers and conflicts may
+	// be at the end of a long changelog. JSON unescaping never grows the raw
+	// token, and the same response budget bounds this one temporary copy.
+	char *body = malloc((size_t)raw_length + 1);
+	if (!body) {
+		return false;
+	}
+	bool valid = json_str(doc, notes, body, (size_t)raw_length + 1) && version_from_body(body, tag, out);
+	free(body);
+	return valid;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,72 +358,65 @@ static ota_result_t pick_release(const json_doc_t *doc) {
 		return OTA_CHECK_FAILED;
 	}
 
-	long installed[VERSION_PARTS];
-	if (!parse_version(ota_installed_version(), installed)) {
-		memset(installed, 0, sizeof(installed));
+	ota_version_t installed;
+	if (!parse_version(ota_installed_version(), &installed)) {
+		return OTA_CHECK_FAILED;
 	}
 
-	long best[VERSION_PARTS];
-	memcpy(best, installed, sizeof(best));
+	ota_version_t best = installed;
 	int best_rel = -1, best_asset = -1;
+	bool unversioned = false;
 
 	int count = json_len(doc, root);
 	for (int i = 0; i < count; i++) {
 		int rel = json_at(doc, root, i);
-		if (json_obj_bool(doc, rel, "draft", true) || json_obj_bool(doc, rel, "prerelease", true)) {
-			continue;
-		}
-		char tag[32];
-		long version[VERSION_PARTS];
-		if (!json_obj_str(doc, rel, "tag_name", tag, sizeof(tag)) || !parse_version(tag, version)) {
-			continue;
-		}
-		if (version_cmp(version, best) <= 0) {
+		int prerelease = json_get(doc, rel, "prerelease");
+		if (prerelease < 0 || doc->toks[prerelease].type != JSON_BOOL || json_obj_bool(doc, rel, "draft", true) || (json_obj_bool(doc, rel, "prerelease", true) && installed.stage == VERSION_STABLE)) {
 			continue;
 		}
 		int asset = find_asset(doc, rel);
 		if (asset < 0) {
-			printf("ota: %s has no %s.upt, skipped\n", tag, stem);
 			continue;
 		}
-		memcpy(best, version, sizeof(best));
+		ota_version_t version;
+		if (!release_version(doc, rel, &version)) {
+			unversioned = true;
+			continue;
+		}
+		if ((version.stage != VERSION_STABLE && installed.stage == VERSION_STABLE) || version_cmp(&version, &best) <= 0) {
+			continue;
+		}
+		best = version;
 		best_rel = rel;
 		best_asset = asset;
 	}
 
 	if (best_rel < 0) {
-		return OTA_UP_TO_DATE;
+		return unversioned ? OTA_CHECK_FAILED : OTA_UP_TO_DATE;
 	}
 
 	memset(&release, 0, sizeof(release));
-	release.notes = "";
-	free(notes_text);
-	notes_text = NULL;
 	json_obj_str(doc, best_rel, "tag_name", release.tag, sizeof(release.tag));
 	if (!json_obj_str(doc, best_rel, "name", release.name, sizeof(release.name)) || !release.name[0]) {
 		snprintf(release.name, sizeof(release.name), "%s", release.tag);
 	}
-	// Unescaped, the text is never longer than it is in the JSON.
-	int body = json_get(doc, best_rel, "body");
-	if (body >= 0 && doc->toks[body].type == JSON_STRING) {
-		size_t size = (size_t)(doc->toks[body].end - doc->toks[body].start) + 1;
-		if (size > OTA_NOTES_MAX) {
-			size = OTA_NOTES_MAX;
-		}
-		notes_text = malloc(size);
-		if (notes_text && json_str(doc, body, notes_text, size)) {
-			trim_partial_utf8(notes_text);
-			release.notes = notes_text;
-		}
-	}
+	json_obj_str(doc, best_rel, "body", release.notes, sizeof(release.notes));
+	trim_partial_utf8(release.notes);
 	release.size = json_obj_long(doc, best_asset, "size", 0);
 	json_obj_str(doc, best_asset, "browser_download_url", release.url, sizeof(release.url));
 
 	// "sha256:<64 hex>" on assets uploaded since mid-2025.
 	char digest[80];
-	if (json_obj_str(doc, best_asset, "digest", digest, sizeof(digest)) && strncmp(digest, "sha256:", 7) == 0 &&
-		strlen(digest + 7) == 64) {
-		snprintf(release.sha256, sizeof(release.sha256), "%s", digest + 7);
+	if (json_obj_str(doc, best_asset, "digest", digest, sizeof(digest)) && strncmp(digest, "sha256:", 7) == 0) {
+		if (strlen(digest + 7) != 64) {
+			return OTA_CHECK_FAILED;
+		}
+		for (const char *p = digest + 7; *p; p++) {
+			if (!isxdigit((unsigned char)*p)) {
+				return OTA_CHECK_FAILED;
+			}
+		}
+		memcpy(release.sha256, digest + 7, sizeof(release.sha256));
 	}
 
 	if (release.size <= 0 || strncmp(release.url, "https://", 8) != 0) {
@@ -351,7 +482,7 @@ bool ota_check_start(void) {
 
 	const char *r = sysinfo_ota_repo();
 	snprintf(repo, sizeof(repo), "%s", r[0] ? r : DEFAULT_REPO);
-	const char *s = firmware_update_stem();
+	const char *s = firmware_update_stem((char[128]){0}, 128);
 	snprintf(stem, sizeof(stem), "%s", s ? s : "");
 
 	pthread_t thread;

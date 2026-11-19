@@ -1,32 +1,42 @@
 #include "playlistpage.h"
+#include "src/gui/library/music.h"
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "src/gui/shell/gui.h"
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/icons.h"
-#include "src/gui/shell/keyboard.h"
+#include "src/gui/library/listacts.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/nowplaying/player.h"
-#include "src/gui/shell/popover.h"
 #include "src/gui/shell/confirm.h"
+#include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_frame.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_toast.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 #include "src/system/library/library.h"
 #include "src/system/library/playlists.h"
-#include "src/system/core/utils.h"
-#include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/qobuzsync.h"
-#include "src/system/streaming/tidalcache.h"
-#include "src/system/streaming/tidalsync.h"
+#include "src/system/streaming/podcastcache.h"
+#include "src/system/streaming/provider.h"
 
 lv_obj_t *playlistpage_screen;
 
@@ -39,6 +49,13 @@ lv_obj_t *playlistpage_screen;
 #define ROW_RADIUS 12
 #define PLAYLIST_NAME_MAX 200
 
+// How many of an account's playlists the picker lists: as many as the services'
+// mirrors keep.
+#define SERVICE_PLAYLISTS_MAX 60
+
+static void service_row_tap_cb(lv_obj_t *row, void *user);
+static void new_playlist_cb(lv_event_t *e);
+
 static gui_config_t *config;
 static lv_obj_t *list;
 static lv_obj_t *empty_label;
@@ -46,30 +63,270 @@ static lv_obj_t *title_label;
 
 // Picker mode: the track waiting for a playlist to be chosen.
 static bool picking;
+// A picker visit can reuse a screen already present deeper in history.
+static bool restore_browse_on_load;
 static char pending_track[512];
 
-// Service track id of the pending track, zero for a local file. It decides
-// everything that follows: which playlists are listed (the account's instead of
-// the card's) and where the track is written when one is tapped.
+// The streaming service the pending track comes from, NULL for a local file. It
+// decides everything that follows: which playlists are listed (the account's
+// instead of the card's) and where the track is written when one is tapped.
 //
 // A local playlist is not an option for a streamed track: the file being played
 // lives in the cache, which empties itself, so a local playlist holding it
 // would be a list of dead paths within an afternoon.
-static long pending_qobuz_id;
-static long pending_tidal_id;
+static const stream_provider_t *pending_service;
 
 // Picker mode for a set of tracks at once (the library lists' selection): the
 // paths waiting for a playlist, owned by this page. Always local files.
 static char **pending_many;
 static int pending_many_count;
+static bool pending_queue;
+static playlist_export_t pending_queue_source;
+static unsigned pending_queue_epoch;
 
 static void pending_many_free(void) {
+	pending_queue = false;
 	for (int i = 0; i < pending_many_count; i++) {
 		free(pending_many[i]);
 	}
 	free(pending_many);
 	pending_many = NULL;
 	pending_many_count = 0;
+}
+
+// The live queue belongs to the GUI. Only one bounded request can be in flight;
+// metadata and SQLite staging run on a worker without any live-queue/LVGL access.
+#define QUEUE_EXPORT_MAX 20000
+typedef struct {
+	atomic_uint refs;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	playlist_export_t source;
+	unsigned epoch, generation;
+	char name[PLAYLIST_NAME_MAX + 1];
+	library_playlist_publish_t mode;
+	int offset, raw_count, eligible;
+	playlist_export_item_t items[LIBRARY_PLAYLIST_STAGE_BATCH];
+	bool answered, valid, cancelled;
+} queue_export_job_t;
+static atomic_bool queue_export_running;
+static atomic_uint queue_export_callbacks;
+static unsigned queue_export_generation;
+static pthread_mutex_t queue_result_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	unsigned generation;
+	int result;
+	bool pending;
+	playlist_export_t source;
+	library_export_receipt_t receipt;
+} queue_result;
+
+static void queue_export_release(queue_export_job_t *job) {
+	if (atomic_fetch_sub(&job->refs, 1) == 1) {
+		pthread_cond_destroy(&job->ready);
+		pthread_mutex_destroy(&job->lock);
+		free(job);
+	}
+}
+
+static void queue_export_batch_gui(void *arg) {
+	queue_export_job_t *job = arg;
+	pthread_mutex_lock(&job->lock);
+	bool valid = !job->cancelled;
+	pthread_mutex_unlock(&job->lock);
+	playlist_export_item_t items[LIBRARY_PLAYLIST_STAGE_BATCH];
+	int raw_count = 0;
+	if (valid && gui_card_available() && library_database_epoch() == job->epoch) {
+		valid = playlist_export_batch(&job->source, job->offset, items, LIBRARY_PLAYLIST_STAGE_BATCH, &raw_count);
+	} else
+		valid = false;
+	pthread_mutex_lock(&job->lock);
+	job->valid = valid && !job->cancelled;
+	job->raw_count = raw_count;
+	if (job->valid)
+		memcpy(job->items, items, (size_t)raw_count * sizeof(items[0]));
+	job->answered = true;
+	pthread_cond_signal(&job->ready);
+	pthread_mutex_unlock(&job->lock);
+	atomic_fetch_sub(&queue_export_callbacks, 1);
+	queue_export_release(job);
+}
+
+static bool queue_export_request(queue_export_job_t *job) {
+	pthread_mutex_lock(&job->lock);
+	job->answered = false;
+	pthread_mutex_unlock(&job->lock);
+	atomic_fetch_add(&job->refs, 1);
+	atomic_fetch_add(&queue_export_callbacks, 1);
+	if (!gui_post(queue_export_batch_gui, job)) {
+		atomic_fetch_sub(&queue_export_callbacks, 1);
+		queue_export_release(job);
+		return false;
+	}
+	struct timespec deadline;
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += 15;
+	pthread_mutex_lock(&job->lock);
+	while (!job->answered) {
+		int rc = pthread_cond_timedwait(&job->ready, &job->lock, &deadline);
+		if (rc != 0) {
+			job->cancelled = true;
+			break;
+		}
+	}
+	bool ok = job->answered && !job->cancelled && job->valid;
+	pthread_mutex_unlock(&job->lock);
+	return ok;
+}
+
+static void queue_export_done_gui(void *unused) {
+	(void)unused;
+	pthread_mutex_lock(&queue_result_lock);
+	bool pending = queue_result.pending;
+	unsigned generation = queue_result.generation;
+	int result = queue_result.result;
+	playlist_export_t source = queue_result.source;
+	library_export_receipt_t receipt = queue_result.receipt;
+	queue_result.pending = false;
+	pthread_mutex_unlock(&queue_result_lock);
+	if (!pending || generation != queue_export_generation)
+		return;
+	if (result == 1)
+		playlist_export_ack(&source, &receipt);
+	toast_busy_end();
+	if (result == 1)
+		toast_success("playlist_tracks_added");
+	else if (result == 2)
+		gui_notify_popup("trackmenu_queue_nothing_to_save");
+	else
+		gui_notify_popup("playlist_queue_save_failed");
+}
+
+static void *queue_export_worker(void *arg) {
+	queue_export_job_t *job = arg;
+	thread_be_low_priority("queue save");
+	bool valid_count = job->source.count > 0 && job->source.count <= QUEUE_EXPORT_MAX;
+	const library_export_source_t *source = job->source.library_backed ? &job->source.source : NULL;
+	library_playlist_stage_t *stage = valid_count ? library_playlist_stage_begin(job->epoch, source) : NULL;
+	library_playlist_row_t *rows = calloc(LIBRARY_PLAYLIST_STAGE_BATCH, sizeof(*rows));
+	bool ok = stage && rows;
+	int added = 0;
+	library_export_receipt_t receipt = {0};
+	while (ok && job->offset < job->source.count) {
+		ok = queue_export_request(job);
+		if (!ok || job->raw_count <= 0) {
+			ok = false;
+			break;
+		}
+		char paths[LIBRARY_PLAYLIST_STAGE_BATCH][512], indexed[LIBRARY_PLAYLIST_STAGE_BATCH][512];
+		int32_t ids[LIBRARY_PLAYLIST_STAGE_BATCH];
+		int slots[LIBRARY_PLAYLIST_STAGE_BATCH], count = 0;
+		for (int i = 0; i < job->raw_count; i++) {
+			if (job->items[i].indexed) {
+				ids[count] = job->items[i].row_id;
+				slots[count++] = i;
+			} else
+				memcpy(paths[i], job->items[i].path, sizeof(paths[i]));
+		}
+		if (source)
+			ok = library_export_paths(source, ids, count, indexed);
+		for (int i = 0; ok && i < count; i++)
+			memcpy(paths[slots[i]], indexed[i], sizeof(paths[0]));
+		job->eligible = 0;
+		for (int i = 0; ok && i < job->raw_count; i++) {
+			if (stream_provider_owns(paths[i]) || podcastcache_owns(paths[i]))
+				continue;
+			ok = playlists_track_row(paths[i], &rows[job->eligible]);
+			if (ok)
+				job->eligible++;
+		}
+		if (ok && job->eligible)
+			ok = library_playlist_stage_rows(stage, rows, job->eligible);
+		if (ok) {
+			added += job->eligible;
+			job->offset += job->raw_count;
+		}
+	}
+	// One final GUI validation linearizes the completed capture. After it the
+	// staged paths are immutable; later queue edits cannot mix this result.
+	if (ok)
+		ok = queue_export_request(job);
+	if (ok && added)
+		ok = library_playlist_stage_publish_receipt(stage, job->name, job->mode, source, &receipt);
+	library_playlist_stage_discard(stage);
+	free(rows);
+	pthread_mutex_lock(&queue_result_lock);
+	queue_result.generation = job->generation;
+	queue_result.result = ok ? (added ? 1 : 2) : 0;
+	queue_result.source = job->source;
+	queue_result.receipt = receipt;
+	queue_result.pending = true;
+	pthread_mutex_unlock(&queue_result_lock);
+	atomic_store(&queue_export_running, false);
+	// The reserved channel carries only a static latest-state notification;
+	// no heap payload is lost if the ordinary post queue is full. On total
+	// refusal screen_loaded/add_queue also consume the pending result.
+	if (!gui_post_latest(queue_export_done_gui, NULL))
+		gui_post(queue_export_done_gui, NULL);
+	queue_export_release(job);
+	return NULL;
+}
+
+static bool queue_export_start(const char *name, library_playlist_publish_t mode) {
+	playlist_export_item_t check[LIBRARY_PLAYLIST_STAGE_BATCH];
+	int unused;
+	if (!pending_queue || !playlists_name_valid(name) || atomic_load(&queue_export_running) || atomic_load(&queue_export_callbacks) || !gui_card_available() || pending_queue_epoch != library_database_epoch() || !playlist_export_batch(&pending_queue_source, pending_queue_source.count, check, LIBRARY_PLAYLIST_STAGE_BATCH, &unused)) {
+		pending_queue = false;
+		gui_notify_popup("playlist_queue_save_failed");
+		return false;
+	}
+	queue_export_job_t *job = calloc(1, sizeof(*job));
+	if (!job) {
+		pending_queue = false;
+		gui_notify_popup("playlist_queue_save_failed");
+		return false;
+	}
+	atomic_init(&job->refs, 1);
+	if (pthread_mutex_init(&job->lock, NULL) != 0) {
+		free(job);
+		pending_queue = false;
+		gui_notify_popup("playlist_queue_save_failed");
+		return false;
+	}
+	pthread_condattr_t attr;
+	int rc = pthread_condattr_init(&attr);
+	bool attr_ready = rc == 0;
+	if (rc == 0)
+		rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+	if (rc == 0)
+		rc = pthread_cond_init(&job->ready, &attr);
+	if (attr_ready)
+		pthread_condattr_destroy(&attr);
+	if (rc != 0) {
+		pthread_mutex_destroy(&job->lock);
+		free(job);
+		pending_queue = false;
+		gui_notify_popup("playlist_queue_save_failed");
+		return false;
+	}
+	job->source = pending_queue_source;
+	job->epoch = pending_queue_epoch;
+	job->mode = mode;
+	job->generation = ++queue_export_generation;
+	snprintf(job->name, sizeof(job->name), "%s", name);
+	pending_queue = false;
+	atomic_store(&queue_export_running, true);
+	sx_toast_busy(tr("playlist_adding_tracks"), true);
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, queue_export_worker, job) != 0) {
+		atomic_store(&queue_export_running, false);
+		queue_export_release(job);
+		toast_busy_end();
+		gui_notify_popup("playlist_queue_save_failed");
+		return false;
+	}
+	pthread_detach(thread);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,18 +337,134 @@ static void pending_many_free(void) {
 // set at a time, under a card that says so and stays until it is done.
 // ---------------------------------------------------------------------------
 
+// Slots are reserved before a worker starts. Completed payloads remain owned
+// even if the best-effort GUI wake is refused; the main-loop hook consumes them.
+#define BATCH_RESULTS_MAX 4
+typedef struct {
+	void *payload;
+	void (*apply)(void *);
+	void (*dispose)(void *);
+	bool ready;
+} batch_result_t;
+static batch_result_t batch_results[BATCH_RESULTS_MAX];
+static pthread_mutex_t batch_results_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool batch_results_ready, batch_results_closing;
+static unsigned batch_result_next;
+
+static int batch_result_admit(void *payload, void (*apply)(void *), void (*dispose)(void *)) {
+	pthread_mutex_lock(&batch_results_lock);
+	int slot = -1;
+	if (!atomic_load(&batch_results_closing))
+		for (int i = 0; i < BATCH_RESULTS_MAX; i++)
+			if (!batch_results[i].payload) {
+				batch_results[i] = (batch_result_t){payload, apply, dispose, false};
+				slot = i;
+				break;
+			}
+	pthread_mutex_unlock(&batch_results_lock);
+	return slot;
+}
+
+static void batch_result_refuse(int slot) {
+	pthread_mutex_lock(&batch_results_lock);
+	batch_results[slot] = (batch_result_t){0};
+	pthread_mutex_unlock(&batch_results_lock);
+}
+
+static void batch_result_wakeup(void *unused) {
+	(void)unused;
+	playlistpage_service_completion();
+}
+
+static void batch_result_publish(int slot) {
+	pthread_mutex_lock(&batch_results_lock);
+	batch_result_t result = batch_results[slot];
+	bool closing = atomic_load(&batch_results_closing);
+	if (closing)
+		batch_results[slot] = (batch_result_t){0};
+	else {
+		batch_results[slot].ready = true;
+		atomic_store(&batch_results_ready, true);
+	}
+	pthread_mutex_unlock(&batch_results_lock);
+	if (closing)
+		result.dispose(result.payload);
+	else
+		(void)gui_post(batch_result_wakeup, NULL);
+}
+
+void playlistpage_service_completion(void) {
+	if (!atomic_load(&batch_results_ready) || atomic_load(&batch_results_closing))
+		return;
+	batch_result_t result = {0};
+	pthread_mutex_lock(&batch_results_lock);
+	for (unsigned n = 0; n < BATCH_RESULTS_MAX; n++) {
+		unsigned i = (batch_result_next + n) % BATCH_RESULTS_MAX;
+		if (batch_results[i].ready) {
+			result = batch_results[i];
+			batch_results[i] = (batch_result_t){0};
+			batch_result_next = (i + 1) % BATCH_RESULTS_MAX;
+			break;
+		}
+	}
+	bool pending = false;
+	for (unsigned i = 0; i < BATCH_RESULTS_MAX; i++)
+		pending |= batch_results[i].ready;
+	atomic_store(&batch_results_ready, pending);
+	pthread_mutex_unlock(&batch_results_lock);
+	if (result.payload)
+		result.apply(result.payload);
+}
+
+void playlistpage_shutdown_completions(void) {
+	batch_result_t discarded[BATCH_RESULTS_MAX];
+	unsigned count = 0;
+	pthread_mutex_lock(&batch_results_lock);
+	atomic_store(&batch_results_closing, true);
+	atomic_store(&batch_results_ready, false);
+	for (unsigned i = 0; i < BATCH_RESULTS_MAX; i++)
+		if (batch_results[i].ready) {
+			discarded[count++] = batch_results[i];
+			batch_results[i] = (batch_result_t){0};
+		}
+	pthread_mutex_unlock(&batch_results_lock);
+	for (unsigned i = 0; i < count; i++)
+		discarded[i].dispose(discarded[i].payload);
+	// Running jobs retain their slots and dispose when they publish.
+}
+
 typedef struct {
 	char name[PLAYLIST_NAME_MAX + 1];
 	char **paths;
 	int count;
 	int added;
+	int result_slot;
+	uint64_t toast_owner;
 } batch_t;
 
 static pthread_mutex_t batch_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void batch_paths_free(batch_t *b) {
+	if (b->paths) {
+		for (int i = 0; i < b->count; i++)
+			free(b->paths[i]);
+		free(b->paths);
+		b->paths = NULL;
+	}
+}
+
+static void batch_free(void *arg) {
+	batch_t *b = arg;
+	batch_paths_free(b);
+	free(b);
+}
+
 static void batch_done_cb(void *arg) {
 	batch_t *b = arg;
-	toast_busy_end();
+	if (!toast_busy_end_owned(b->toast_owner)) {
+		batch_free(b);
+		return;
+	}
 	if (b->added == b->count) {
 		toast_success("playlist_tracks_added");
 	} else if (b->added > 0) {
@@ -99,24 +472,21 @@ static void batch_done_cb(void *arg) {
 	} else {
 		gui_notify_popup("playlist_cannot_add_the_tracks");
 	}
-	for (int i = 0; i < b->count; i++) {
-		free(b->paths[i]);
-	}
-	free(b->paths);
-	free(b);
+	batch_free(b);
 }
 
 static void *batch_worker(void *arg) {
 	batch_t *b = arg;
 	thread_be_low_priority("playlistadd");
 	pthread_mutex_lock(&batch_lock);
-	for (int i = 0; i < b->count; i++) {
+	for (int i = 0; i < b->count && !atomic_load(&batch_results_closing); i++) {
 		if (playlists_add_track(b->name, b->paths[i])) {
 			b->added++;
 		}
 	}
 	pthread_mutex_unlock(&batch_lock);
-	gui_post(batch_done_cb, b);
+	batch_paths_free(b); // Large path sets are released off the UI thread.
+	batch_result_publish(b->result_slot);
 	return NULL;
 }
 
@@ -140,13 +510,20 @@ bool playlistpage_add_tracks_to(const char *name, const char *const *paths, int 
 	for (int i = 0; i < count; i++) {
 		b->paths[b->count] = strdup(paths[i] ? paths[i] : "");
 		if (!b->paths[b->count]) {
-			break;
+			batch_free(b);
+			return false;
 		}
 		b->count++;
 	}
-	toast_busy("playlist_adding_tracks");
+	b->result_slot = batch_result_admit(b, batch_done_cb, batch_free);
+	if (b->result_slot < 0) {
+		batch_free(b);
+		return false;
+	}
+	b->toast_owner = toast_busy_owned("playlist_adding_tracks");
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, batch_worker, b) != 0) {
+		batch_result_refuse(b->result_slot);
 		batch_done_cb(b);
 		return false;
 	}
@@ -168,9 +545,15 @@ static bool batch_start(const char *name) {
 	pending_many = NULL;
 	pending_many_count = 0;
 
-	toast_busy("playlist_adding_tracks");
+	b->result_slot = batch_result_admit(b, batch_done_cb, batch_free);
+	if (b->result_slot < 0) {
+		batch_free(b);
+		return false;
+	}
+	b->toast_owner = toast_busy_owned("playlist_adding_tracks");
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, batch_worker, b) != 0) {
+		batch_result_refuse(b->result_slot);
 		batch_done_cb(b);
 		return false;
 	}
@@ -193,11 +576,31 @@ typedef struct {
 	char **paths;
 	int count;
 	int starred;
+	int result_slot;
+	uint64_t toast_owner;
 } fav_batch_t;
+
+static void fav_paths_free(fav_batch_t *b) {
+	if (b->paths) {
+		for (int i = 0; i < b->count; i++)
+			free(b->paths[i]);
+		free(b->paths);
+		b->paths = NULL;
+	}
+}
+
+static void fav_free(void *arg) {
+	fav_batch_t *b = arg;
+	fav_paths_free(b);
+	free(b);
+}
 
 static void fav_done_cb(void *arg) {
 	fav_batch_t *b = arg;
-	toast_busy_end();
+	if (!toast_busy_end_owned(b->toast_owner)) {
+		fav_free(b);
+		return;
+	}
 	if (b->starred == b->count) {
 		toast_success("favourites_tracks_added");
 	} else if (b->starred > 0) {
@@ -205,11 +608,7 @@ static void fav_done_cb(void *arg) {
 	} else {
 		gui_notify_popup("favourites_cannot_add_the_tracks");
 	}
-	for (int i = 0; i < b->count; i++) {
-		free(b->paths[i]);
-	}
-	free(b->paths);
-	free(b);
+	fav_free(b);
 }
 
 static void *fav_worker(void *arg) {
@@ -217,11 +616,11 @@ static void *fav_worker(void *arg) {
 	thread_be_low_priority("favouritesadd");
 
 	library_fav_row_t *rows = malloc(FAV_CHUNK * sizeof(*rows));
-	char(*titles)[512] = malloc(FAV_CHUNK * sizeof(*titles));
-	char(*artists)[256] = malloc(FAV_CHUNK * sizeof(*artists));
+	char (*titles)[512] = malloc(FAV_CHUNK * sizeof(*titles));
+	char (*artists)[256] = malloc(FAV_CHUNK * sizeof(*artists));
 
 	pthread_mutex_lock(&batch_lock);
-	for (int first = 0; rows && titles && artists && first < b->count; first += FAV_CHUNK) {
+	for (int first = 0; rows && titles && artists && first < b->count && !atomic_load(&batch_results_closing); first += FAV_CHUNK) {
 		int n = b->count - first < FAV_CHUNK ? b->count - first : FAV_CHUNK;
 		for (int i = 0; i < n; i++) {
 			const char *path = b->paths[first + i];
@@ -235,7 +634,8 @@ static void *fav_worker(void *arg) {
 	free(rows);
 	free(titles);
 	free(artists);
-	gui_post(fav_done_cb, b);
+	fav_paths_free(b);
+	batch_result_publish(b->result_slot);
 	return NULL;
 }
 
@@ -255,14 +655,23 @@ void playlistpage_add_favourites(const char *const *paths, int count) {
 	for (int i = 0; i < count; i++) {
 		b->paths[b->count] = strdup(paths[i] ? paths[i] : "");
 		if (!b->paths[b->count]) {
-			break;
+			fav_free(b);
+			gui_notify_popup("favourites_cannot_add_the_tracks");
+			return;
 		}
 		b->count++;
 	}
 
-	toast_busy("favourites_adding_tracks");
+	b->result_slot = batch_result_admit(b, fav_done_cb, fav_free);
+	if (b->result_slot < 0) {
+		fav_free(b);
+		gui_notify_popup("favourites_cannot_add_the_tracks");
+		return;
+	}
+	b->toast_owner = toast_busy_owned("favourites_adding_tracks");
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, fav_worker, b) != 0) {
+		batch_result_refuse(b->result_slot);
 		fav_done_cb(b);
 		return;
 	}
@@ -275,8 +684,6 @@ static lv_obj_t *name_field;
 static keyboard_t *name_keyboard;
 
 static void rebuild_rows(void);
-static void qobuz_row_clicked_cb(lv_event_t *e);
-static void tidal_row_clicked_cb(lv_event_t *e);
 static void name_layer_show(const char *initial);
 
 // ---------------------------------------------------------------------------
@@ -301,18 +708,20 @@ static void open_playlist(const char *name) {
 	medialist_open(name, LIBRARY_LIST_PLAYLIST, LIBRARY_FILTER_NONE, name);
 }
 
-static void row_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return; // a swipe across the list, not a tap
-	}
-
-	const char *name = lv_event_get_user_data(e);
+static void row_tap_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	const char *name = user;
 	if (!name) {
 		return;
 	}
 
 	if (!picking) {
 		open_playlist(name);
+		return;
+	}
+	if (pending_queue) {
+		queue_export_start(name, LIBRARY_PLAYLIST_APPEND);
+		back_btn_cb(NULL);
 		return;
 	}
 
@@ -393,24 +802,66 @@ static void menu_backup_action(void *user) {
 	menu_name[0] = '\0';
 }
 
-static void menu_btn_cb(lv_event_t *e) {
-	lv_event_stop_bubbling(e);
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
+// A playlist's tracks as a handle, in its own order (NULL when it is empty).
+static library_index_t *playlist_tracks(const char *name) {
+	library_index_t *ix = library_index_open(LIBRARY_LIST_PLAYLIST, LIBRARY_FILTER_NONE, name, LIBRARY_ORDER_DEFAULT, false);
+	if (ix && library_index_count(ix) > 0) {
+		return ix;
 	}
+	library_index_close(ix);
+	gui_notify_popup("playlist_empty_playlist");
+	return NULL;
+}
 
-	const char *name = lv_event_get_user_data(e);
-	if (!name) {
+static void menu_play_action(void *user) {
+	if (menu_name[0]) {
+		listacts_play_index(playlist_tracks(menu_name), user != NULL, menu_name);
+	}
+}
+
+static void menu_queue_action(void *user) {
+	if (menu_name[0]) {
+		library_index_t *ix = playlist_tracks(menu_name);
+		if (ix) {
+			listacts_queue_index(ix, (playlist_queue_where_t)(intptr_t)user, menu_name);
+		}
+	}
+}
+
+// The handoff's matrix treats a playlist as it treats a record: pulled right
+// its tracks play next, pulled left they go to the end of the queue.
+static void row_next_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	if (user && !picking) {
+		snprintf(menu_name, sizeof(menu_name), "%s", (const char *)user);
+		menu_queue_action((void *)(intptr_t)PLAYLIST_QUEUE_NEXT);
+	}
+}
+
+static void row_end_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	if (user && !picking) {
+		snprintf(menu_name, sizeof(menu_name), "%s", (const char *)user);
+		menu_queue_action((void *)(intptr_t)PLAYLIST_QUEUE_END);
+	}
+}
+
+// Held: the playlist's sheet -- what its ellipsis menu had (rename, delete,
+// back up), with play, shuffle and the queue's two ends before them.
+static void row_hold_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	const char *name = user;
+	if (!name || picking) {
 		return;
 	}
 	snprintf(menu_name, sizeof(menu_name), "%s", name);
-
-	popover_item_t items[3] = {
-		{"rename", menu_rename_action, NULL},
-		{"delete", menu_delete_action, NULL},
-		{"playlist_backup", menu_backup_action, NULL},
+	sx_sheet_item_t items[] = {
+		{tr("medialist_play"), &icon_play_status, false, false, menu_play_action, NULL}, {tr("lists_shuffle"), &icon_shuffle, false, false, menu_play_action, (void *)(intptr_t)1}, {tr("queue_play_next"), &icon_list_start, false, false, menu_queue_action, (void *)(intptr_t)PLAYLIST_QUEUE_NEXT}, {tr("queue_add_to_end"), &icon_list_plus_small, false, false, menu_queue_action, (void *)(intptr_t)PLAYLIST_QUEUE_END}, {tr("rename"), &icon_file, false, false, menu_rename_action, NULL}, {tr("playlist_backup"), &icon_save_state, false, false, menu_backup_action, NULL}, {tr("delete"), &icon_trash, false, true, menu_delete_action, NULL},
 	};
-	popover_show(lv_event_get_current_target(e), items, 3);
+	char subtitle[48];
+	int tracks = playlists_count_tracks(menu_name);
+	snprintf(subtitle, sizeof(subtitle), tr(tracks == 1 ? "playlist_track_2" : "playlist_tracks"), tracks);
+	sx_sheet_menu(menu_name, subtitle, items, (int)(sizeof(items) / sizeof(items[0])));
 }
 
 // ---------------------------------------------------------------------------
@@ -421,104 +872,57 @@ static void menu_btn_cb(lv_event_t *e) {
 // needs no worker behind it.
 // ---------------------------------------------------------------------------
 
-// `tidal_uuid`, when present, is duplicated and freed with the row. Passing an
-// index into the playlist mirror and re-reading it on tap would be shorter, but
-// the mirror refreshes in the background: between drawing a row and tapping it
-// the index can shift, and the track would land in a different playlist from
-// the one on screen. A uuid attached to the row cannot slide.
+// `service_playlist`, when present, is an account playlist's id: duplicated and
+// freed with the row. Passing an index into the playlist mirror and re-reading
+// it on tap would be shorter, but the mirror refreshes in the background:
+// between drawing a row and tapping it the index can shift, and the track would
+// land in a different playlist from the one on screen. An id attached to the
+// row cannot slide.
 // Returns the subtitle label, for a caller that has to correct it later.
-static lv_obj_t *add_row(const char *name, const char *subtitle, const lv_image_dsc_t *glyph, long qobuz_id,
-						 const char *tidal_uuid) {
+static void add_row(const char *name, const char *subtitle, const char *service_playlist) {
 	char *owned = strdup(name);
 	if (!owned) {
-		return NULL;
+		return;
+	}
+	char *uuid = NULL;
+	if (service_playlist && service_playlist[0]) {
+		uuid = strdup(service_playlist);
+		if (!uuid) {
+			free(owned);
+			return;
+		}
 	}
 
-	lv_obj_t *row = lv_btn_create(list);
-	lv_obj_set_size(row, lv_pct(100), ROW_HEIGHT);
-	lv_obj_add_style(row, &theme_style_card, 0);
-	lv_obj_add_style(row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(row, ROW_RADIUS, 0);
-	lv_obj_set_style_border_width(row, 0, 0);
-	lv_obj_set_style_shadow_width(row, 0, 0);
-	lv_obj_set_style_pad_hor(row, 16, 0);
-	lv_obj_set_style_pad_ver(row, 10, 0);
-	lv_obj_set_style_pad_column(row, 14, 0);
-	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_event_bubble(row, true); // the player sheet drags from here too
-	char *uuid = NULL;
-	if (qobuz_id > 0) {
-		// An account playlist has no file to delete, so it carries no menu:
-		// tapping it is the only action.
-		lv_obj_add_event_cb(row, qobuz_row_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)qobuz_id);
-	} else if (tidal_uuid && tidal_uuid[0]) {
-		uuid = strdup(tidal_uuid);
-		if (!uuid) {
-			lv_obj_delete(row);
-			free(owned);
-			return NULL;
-		}
-		lv_obj_add_event_cb(row, tidal_row_clicked_cb, LV_EVENT_CLICKED, uuid);
+	// The 2.0 row (sx_row.h): a plaque with the name's first letter, the name,
+	// how many tracks, a chevron. A playlist on the card takes a record's
+	// gestures (tap, the queue's two swipes, its sheet held); an account's
+	// playlist, listed only to put a track in it, takes a tap and nothing else.
+	static const sx_row_handlers_t LOCAL = {
+		.on_tap = row_tap_cb,
+		.on_long_press = row_hold_cb,
+		.on_swipe_next = row_next_cb,
+		.on_swipe_end = row_end_cb,
+	};
+	static const sx_row_handlers_t SERVICE = {
+		.on_tap = service_row_tap_cb,
+	};
+	lv_obj_t *row = sx_row_create(list, uuid ? &SERVICE : &LOCAL, false);
+	sx_row_set_user(row, uuid ? uuid : owned);
+	if (uuid) {
 		lv_obj_add_event_cb(row, row_delete_cb, LV_EVENT_DELETE, uuid);
-	} else {
-		lv_obj_add_event_cb(row, row_clicked_cb, LV_EVENT_CLICKED, owned);
 	}
 	lv_obj_add_event_cb(row, row_delete_cb, LV_EVENT_DELETE, owned);
 
-	lv_obj_t *icon = lv_image_create(row);
-	lv_image_set_src(icon, glyph);
-	lv_obj_add_style(icon, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-
-	lv_obj_t *texts = lv_obj_create(row);
-	lv_obj_set_flex_grow(texts, 1);
-	lv_obj_set_height(texts, lv_pct(100));
-	lv_obj_set_style_bg_opa(texts, 0, 0);
-	lv_obj_set_style_border_width(texts, 0, 0);
-	lv_obj_set_style_pad_all(texts, 0, 0);
-	lv_obj_set_scrollable(texts, false);
-	lv_obj_set_event_bubble(texts, true);
-	lv_obj_set_flex_flow(texts, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(texts, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-
-	lv_obj_t *name_label = lv_label_create(texts);
-	lv_label_set_text(name_label, name);
-	lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
-	lv_obj_set_width(name_label, lv_pct(100));
-	// One line, cut with dots past it.
-	lv_obj_set_height(name_label, lv_font_get_line_height(&font_ui_24));
-	lv_obj_add_style(name_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(name_label, &font_ui_24, 0);
-
-	lv_obj_t *sub = NULL;
-	if (subtitle && subtitle[0]) {
-		sub = lv_label_create(texts);
-		lv_label_set_text(sub, subtitle);
-		lv_obj_add_style(sub, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(sub, &font_ui_16, 0);
-	}
-
-	if (qobuz_id > 0 || uuid) {
-		return sub; // no ellipsis: account playlists cannot be deleted from here
-	}
-
-	// The ellipsis on the right edge, as on every track row.
-	lv_obj_t *menu_btn = lv_btn_create(row);
-	lv_obj_set_size(menu_btn, 44, 44);
-	lv_obj_set_style_bg_opa(menu_btn, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_border_width(menu_btn, 0, 0);
-	lv_obj_set_style_shadow_width(menu_btn, 0, 0);
-	lv_obj_set_style_pad_all(menu_btn, 0, 0);
-	lv_obj_add_event_cb(menu_btn, menu_btn_cb, LV_EVENT_CLICKED, owned);
-
-	lv_obj_t *dots = lv_image_create(menu_btn);
-	lv_image_set_src(dots, &icon_ellipsis_vertical);
-	lv_obj_add_style(dots, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor_opa(dots, LV_OPA_COVER, 0);
-	lv_obj_center(dots);
-
-	return sub;
+	char letter[8];
+	listacts_first_letter(name, letter, sizeof(letter));
+	sx_row_set_letter(row, letter, listacts_name_tone(name), false);
+	sx_row_set_content(row, sx_palette_hue_of_name(name), false, false, 0);
+	sx_row_set_title(row, name);
+	sx_row_set_subtitle(row, subtitle ? subtitle : "", NULL, NULL);
+	// Choosing where a track goes, a row is a destination: no chevron, no
+	// swipes, no sheet.
+	sx_row_set_trail(row, picking ? SX_ROW_TRAIL_NONE : SX_ROW_TRAIL_CHEVRON);
+	sx_row_set_swipes(row, !picking, !picking);
 }
 
 // --- account playlists -----------------------------------------------------
@@ -541,55 +945,28 @@ static void sync_done_cb(bool ok, const char *error, void *user) {
 	// The fallback message names the service actually being written to: this
 	// callback serves both, and saying "Qobuz" while adding a track to a Tidal
 	// playlist sends the user looking in the wrong place.
-	snprintf(sync_error, sizeof(sync_error), "%s",
-			 ok ? ""
-				: (error && error[0]        ? error
-				   : pending_tidal_id > 0 ? tr("tidal_change_refused")
-										   : tr("qobuz_change_refused")));
+	snprintf(sync_error, sizeof(sync_error), "%s", ok ? "" : (error && error[0] ? error : tr(pending_service ? pending_service->change_refused_key : "")));
 	gui_post(sync_done_async, NULL);
 }
 
 // The playlist mirror arrived; redraw if it is still what the page is showing.
-static void qobuz_playlists_ready_async(void *user) {
+static void service_playlists_ready_async(void *user) {
 	(void)user;
-	if (picking && pending_qobuz_id > 0) {
+	if (picking && pending_service) {
 		rebuild_rows();
 	}
 }
 
-static void qobuz_playlists_changed(void) { gui_post(qobuz_playlists_ready_async, NULL); }
+static void service_playlists_changed(void) { gui_post(service_playlists_ready_async, NULL); }
 
-static void qobuz_row_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+static void service_row_tap_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	const char *playlist_id = user;
+	if (!playlist_id || !playlist_id[0] || !pending_service || !pending_service->playlist_add) {
 		return;
 	}
-	long playlist_id = (long)(intptr_t)lv_event_get_user_data(e);
-	if (playlist_id <= 0 || pending_qobuz_id <= 0) {
-		return;
-	}
-	qobuzsync_playlist_add(playlist_id, pending_qobuz_id, sync_done_cb, NULL);
+	pending_service->playlist_add(playlist_id, pending_track, sync_done_cb, NULL);
 }
-
-static void tidal_row_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-	const char *playlist_id = lv_event_get_user_data(e);
-	if (!playlist_id || !playlist_id[0] || pending_tidal_id <= 0) {
-		return;
-	}
-	tidalsync_playlist_add(playlist_id, pending_tidal_id, sync_done_cb, NULL);
-}
-
-// The Tidal playlist mirror arrived; redraw if it is still what is shown.
-static void tidal_playlists_ready_async(void *user) {
-	(void)user;
-	if (picking && pending_tidal_id > 0) {
-		rebuild_rows();
-	}
-}
-
-static void tidal_playlists_changed(void) { gui_post(tidal_playlists_ready_async, NULL); }
 
 static bool collect_row_cb(const char *name, void *user) {
 	int *count = user;
@@ -597,7 +974,7 @@ static bool collect_row_cb(const char *name, void *user) {
 	char subtitle[48];
 	int tracks = playlists_count_tracks(name);
 	snprintf(subtitle, sizeof(subtitle), tr(tracks == 1 ? "playlist_track_2" : "playlist_tracks"), tracks);
-	add_row(name, subtitle, &icon_list_music, 0, NULL);
+	add_row(name, subtitle, NULL);
 
 	(*count)++;
 	return true;
@@ -654,7 +1031,7 @@ typedef struct {
 // One playlist's outcome. The worker only counts; the words are put together
 // on the interface thread, where the report is drawn.
 typedef struct {
-	bool imported; // false: nothing in the file could be used
+	bool imported;				   // false: nothing in the file could be used
 	playlists_import_result_t got; // got.name is the file's name when !imported
 } import_entry_t;
 
@@ -958,6 +1335,7 @@ static void import_layer_hide(void) {
 	if (import_layer) {
 		lv_obj_set_hidden(import_layer, true);
 	}
+	sx_mini_input_overlay(playlistpage_screen, false);
 	back_btn_hide_on_screen(playlistpage_screen, false);
 	import_generation++;
 	import_count = 0;
@@ -974,7 +1352,7 @@ static void import_close_cb(lv_event_t *e) {
 	import_layer_hide();
 }
 
-char* get_playlist_location_tr(playlists_candidate_t candidate) {
+char *get_playlist_location_tr(playlists_candidate_t candidate) {
 	switch (candidate.playlist_location) {
 	case PLAYLIST_LOCATION_SD_ROOT:
 		return "playlist_in_the_root_of_the_card";
@@ -1028,7 +1406,7 @@ static void import_add_candidate_row(int index) {
 	lv_obj_set_style_text_font(name, &font_ui_24, 0);
 
 	lv_obj_t *where = lv_label_create(texts);
-	lv_label_set_text(where,tr(get_playlist_location_tr(import_candidates[index])));
+	lv_label_set_text(where, tr(get_playlist_location_tr(import_candidates[index])));
 	lv_obj_add_style(where, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(where, &font_ui_16, 0);
 
@@ -1071,6 +1449,7 @@ static void import_btn_cb(lv_event_t *e) {
 	lv_label_set_text(import_action_label, tr("playlist_import"));
 	lv_obj_set_hidden(import_action, false);
 	lv_obj_set_hidden(import_layer, false);
+	sx_mini_input_overlay(playlistpage_screen, true);
 	lv_obj_move_foreground(import_layer);
 	lv_obj_scroll_to_y(import_body, 0, LV_ANIM_OFF);
 	back_btn_hide_on_screen(playlistpage_screen, true);
@@ -1083,6 +1462,8 @@ static void import_btn_cb(lv_event_t *e) {
 static void name_layer_hide(void) {
 	if (name_layer) {
 		lv_obj_set_hidden(name_layer, true);
+		keyboard_refresh_caret(name_field);
+		sx_mini_update_visibility(); // its keyboard comes or goes with it
 	}
 	// A rename that was cancelled, or a dialog put away on the way into the
 	// page: either way there is no longer a playlist waiting to be renamed, and
@@ -1135,17 +1516,13 @@ static void name_accept_cb(lv_event_t *e) {
 		return;
 	}
 
-	// A Qobuz playlist is created on the account with the track in it, in one
-	// call. Nothing is written to the card.
-	if (picking && pending_qobuz_id > 0) {
+	// An account playlist is created on the account with the track in it, in
+	// one call. Nothing is written to the card.
+	if (picking && pending_service) {
 		name_layer_hide();
-		qobuzsync_playlist_create_with(name, pending_qobuz_id, sync_done_cb, NULL);
-		return;
-	}
-
-	if (picking && pending_tidal_id > 0) {
-		name_layer_hide();
-		tidalsync_playlist_create_with(name, pending_tidal_id, sync_done_cb, NULL);
+		if (pending_service->playlist_create_with) {
+			pending_service->playlist_create_with(name, pending_track, sync_done_cb, NULL);
+		}
 		return;
 	}
 
@@ -1154,6 +1531,12 @@ static void name_accept_cb(lv_event_t *e) {
 		return;
 	}
 
+	if (picking && pending_queue) {
+		name_layer_hide();
+		queue_export_start(name, LIBRARY_PLAYLIST_CREATE);
+		back_btn_cb(NULL);
+		return;
+	}
 	if (!playlists_create(name)) {
 		gui_notify_popup("playlist_cannot_create_the_playlist");
 		return;
@@ -1189,7 +1572,15 @@ static void name_layer_show(const char *initial) {
 	lv_obj_add_state(name_field, LV_STATE_FOCUSED);
 	lv_obj_send_event(name_field, LV_EVENT_FOCUSED, NULL);
 	lv_obj_set_hidden(name_layer, false);
+	keyboard_refresh_caret(name_field);
+	sx_mini_update_visibility(); // its keyboard comes or goes with it
 	lv_obj_move_foreground(name_layer);
+}
+
+static void new_playlist_tap_cb(lv_obj_t *row, void *user) {
+	(void)row;
+	(void)user;
+	new_playlist_cb(NULL);
 }
 
 static void new_playlist_cb(lv_event_t *e) {
@@ -1217,60 +1608,30 @@ static void rebuild_rows(void) {
 
 	// The "new playlist" row comes first in both modes: it is the only way the
 	// first playlist can be made.
-	lv_obj_t *new_row = lv_btn_create(list);
-	lv_obj_set_size(new_row, lv_pct(100), ROW_HEIGHT);
-	lv_obj_add_style(new_row, &theme_style_card, 0);
-	lv_obj_add_style(new_row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(new_row, ROW_RADIUS, 0);
-	lv_obj_set_style_border_width(new_row, 0, 0);
-	lv_obj_set_style_shadow_width(new_row, 0, 0);
-	lv_obj_set_style_pad_hor(new_row, 16, 0);
-	lv_obj_set_style_pad_column(new_row, 14, 0);
-	lv_obj_set_flex_flow(new_row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(new_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_event_bubble(new_row, true);
-	lv_obj_add_event_cb(new_row, new_playlist_cb, LV_EVENT_CLICKED, NULL);
-
-	lv_obj_t *new_icon = lv_image_create(new_row);
-	lv_image_set_src(new_icon, &icon_plus);
-	lv_obj_add_style(new_icon, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor(new_icon, theme()->accent, 0);
-	lv_obj_set_style_image_recolor_opa(new_icon, LV_OPA_COVER, 0);
-
-	lv_obj_t *new_label = lv_label_create(new_row);
-	lv_label_set_text(new_label, tr("playlist_new_playlist"));
-	lv_obj_add_style(new_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(new_label, &font_ui_24, 0);
-	lv_obj_set_style_text_color(new_label, theme()->accent, 0);
+	static const sx_row_handlers_t NEW_ROW = {.on_tap = new_playlist_tap_cb};
+	lv_obj_t *new_row = sx_row_create(list, &NEW_ROW, false);
+	sx_row_set_letter(new_row, "+", sx_pal()->accent, true);
+	sx_row_set_title(new_row, tr("playlist_new_playlist"));
+	sx_row_set_subtitle(new_row, "", NULL, NULL);
+	sx_row_set_trail(new_row, SX_ROW_TRAIL_NONE);
 
 	int count = 0;
-	if (picking && pending_qobuz_id > 0) {
-		qobuz_playlist_t got[QOBUZSYNC_PLAYLISTS_MAX];
-		int total = qobuzsync_playlists(got, QOBUZSYNC_PLAYLISTS_MAX);
+	if (picking && pending_service) {
+		// Borrowed for the drawing: sixty entries of a few hundred bytes are
+		// not worth keeping on the UI thread's stack.
+		stream_provider_playlist_t *got = malloc(sizeof(*got) * SERVICE_PLAYLISTS_MAX);
+		int total = got && pending_service->playlists ? pending_service->playlists(got, SERVICE_PLAYLISTS_MAX) : 0;
 		for (int i = 0; i < total; i++) {
 			char subtitle[48];
-			snprintf(subtitle, sizeof(subtitle), tr(got[i].track_count == 1 ? "playlist_track_2" : "playlist_tracks"),
-					 got[i].track_count);
-			add_row(got[i].name, subtitle, &icon_list_music, got[i].id, NULL);
+			snprintf(subtitle, sizeof(subtitle), tr(got[i].track_count == 1 ? "playlist_track_2" : "playlist_tracks"), got[i].track_count);
+			add_row(got[i].name, subtitle, got[i].id);
 			count++;
 		}
+		free(got);
 		// Nothing has arrived yet: ask for it, and the callback calls this
 		// function again once it does.
-		if (!qobuzsync_playlists_known()) {
-			qobuzsync_playlists_refresh(qobuz_playlists_changed);
-		}
-	} else if (picking && pending_tidal_id > 0) {
-		tidal_playlist_t got[TIDALSYNC_PLAYLISTS_MAX];
-		int total = tidalsync_playlists(got, TIDALSYNC_PLAYLISTS_MAX);
-		for (int i = 0; i < total; i++) {
-			char subtitle[48];
-			snprintf(subtitle, sizeof(subtitle), tr(got[i].track_count == 1 ? "playlist_track_2" : "playlist_tracks"),
-					 got[i].track_count);
-			add_row(got[i].name, subtitle, &icon_list_music, 0, got[i].id);
-			count++;
-		}
-		if (!tidalsync_playlists_known()) {
-			tidalsync_playlists_refresh(tidal_playlists_changed);
+		if (pending_service->playlists_known && !pending_service->playlists_known() && pending_service->playlists_refresh) {
+			pending_service->playlists_refresh(service_playlists_changed);
 		}
 	} else {
 		playlists_for_each(collect_row_cb, &count);
@@ -1283,17 +1644,21 @@ static void rebuild_rows(void) {
 	}
 }
 
-void playlistpage_open(void) {
+static void prepare_browse_mode(void) {
+	restore_browse_on_load = false;
 	picking = false;
 	pending_track[0] = '\0';
 	pending_many_free();
-	pending_qobuz_id = 0;
-	pending_tidal_id = 0;
+	pending_service = NULL;
 	lv_label_set_text(title_label, tr("playlists"));
 	name_layer_hide();
 	import_layer_hide();
 	lv_obj_set_hidden(import_btn, false);
 	rebuild_rows();
+}
+
+void playlistpage_open(void) {
+	prepare_browse_mode();
 	switch_screen(playlistpage_screen);
 }
 
@@ -1301,17 +1666,20 @@ void playlistpage_add_track(const char *track_path) {
 	if (!track_path || !track_path[0]) {
 		return;
 	}
+	restore_browse_on_load = false;
 	picking = true;
 	pending_many_free();
 	snprintf(pending_track, sizeof(pending_track), "%s", track_path);
-	pending_qobuz_id = qobuzcache_track_id(track_path);
-	pending_tidal_id = tidalcache_track_id(track_path);
+	// Only a service that can write playlists takes the track to the account;
+	// any other streamed track gets the card's playlists, as before.
+	pending_service = stream_provider_for_track(track_path);
+	if (pending_service && !pending_service->playlist_add) {
+		pending_service = NULL;
+	}
 	// The title states where the track is about to be written: an account or
-	// the card. The two caches live in different directories, so at most one of
-	// the two ids can be non-zero.
-	lv_label_set_text(title_label, pending_qobuz_id > 0   ? tr("playlist_qobuz_playlist")
-						   : pending_tidal_id > 0 ? tr("playlist_tidal_playlist")
-												  : tr("playlist_add_to_playlist_2"));
+	// the card. The caches live in different directories, so a path belongs to
+	// one service at most.
+	lv_label_set_text(title_label, pending_service ? tr(pending_service->playlist_title_key) : tr("playlist_add_to_playlist_2"));
 	name_layer_hide();
 	import_layer_hide();
 	// While the page is choosing where a track goes it is not somewhere to
@@ -1340,10 +1708,10 @@ void playlistpage_add_tracks(const char *const *paths, int count) {
 		pending_many_count++;
 	}
 
+	restore_browse_on_load = false;
 	picking = true;
 	pending_track[0] = '\0';
-	pending_qobuz_id = 0;
-	pending_tidal_id = 0;
+	pending_service = NULL;
 	lv_label_set_text(title_label, tr("playlist_add_to_playlist_2"));
 	name_layer_hide();
 	import_layer_hide();
@@ -1352,8 +1720,53 @@ void playlistpage_add_tracks(const char *const *paths, int count) {
 	switch_screen(playlistpage_screen);
 }
 
-static void screen_loaded_cb(lv_event_t *e) {
+void playlistpage_add_queue(void) {
+	queue_export_done_gui(NULL);
+	if (atomic_load(&queue_export_running) || atomic_load(&queue_export_callbacks)) {
+		gui_notify_popup("playlist_adding_tracks");
+		return;
+	}
+	pending_many_free();
+	if (!gui_card_available()) {
+		gui_notify_no_card();
+		return;
+	}
+	if (!playlist_export_begin(&pending_queue_source)) {
+		gui_notify_popup(pending_queue_source.count > 0 ? "playlist_queue_save_failed" : "trackmenu_queue_nothing_to_save");
+		return;
+	}
+	if (pending_queue_source.count > QUEUE_EXPORT_MAX) {
+		gui_notify_popup("playlist_queue_too_large");
+		return;
+	}
+	pending_queue_epoch = library_database_epoch();
+	pending_queue = true;
+	restore_browse_on_load = false;
+	picking = true;
+	pending_track[0] = '\0';
+	pending_service = NULL;
+	lv_label_set_text(title_label, tr("playlist_add_to_playlist_2"));
+	name_layer_hide();
+	import_layer_hide();
+	lv_obj_set_hidden(import_btn, true);
+	rebuild_rows();
+	switch_screen(playlistpage_screen);
+}
+
+static void screen_unload_start_cb(lv_event_t *e) {
+	// UNLOADED is deferred and could arrive after a newer picker request.
 	(void)e;
+	if (picking)
+		restore_browse_on_load = true;
+}
+
+static void screen_loaded_cb(lv_event_t *e) {
+	if (restore_browse_on_load)
+		prepare_browse_mode();
+	// The screen binding cannot see the naming layer's hidden flag.
+	keyboard_refresh_caret(name_field);
+	(void)e;
+	queue_export_done_gui(NULL);
 	if (rows_revision != library_revision(LIBRARY_LIST_PLAYLIST)) {
 		rebuild_rows();
 	}
@@ -1363,6 +1776,7 @@ void playlistpage_init(gui_config_t *cfg) {
 	config = cfg;
 
 	playlistpage_screen = lv_obj_create(NULL);
+	switcher_browse_bind("music", playlistpage_screen, music_screen);
 	lv_obj_add_style(playlistpage_screen, &theme_style_screen, 0);
 	title_label = settingsrow_title(playlistpage_screen, cfg, "playlists");
 
@@ -1376,7 +1790,7 @@ void playlistpage_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(list, 0, 0);
 	lv_obj_set_style_pad_hor(list, cfg->padding, 0);
 	lv_obj_set_style_pad_bottom(list, 12, 0);
-	lv_obj_set_style_pad_gap(list, ROW_GAP, 0);
+	lv_obj_set_style_pad_gap(list, SX_ROW_GAP, 0);
 	lv_obj_set_scroll_dir(list, LV_DIR_VER);
 	lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
 	lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
@@ -1403,17 +1817,11 @@ void playlistpage_init(gui_config_t *cfg) {
 	lv_obj_set_scrollable(name_layer, false);
 	lv_obj_set_hidden(name_layer, true);
 
-	lv_obj_t *heading = lv_label_create(name_layer);
-	lv_label_set_text(heading, tr("playlist_name"));
-	lv_obj_add_style(heading, &theme_style_text, 0);
-	lv_obj_set_style_text_font(heading, &font_ui_24, 0);
-	// Offset clear of the floating back chevron, which sits on top of this
-	// layer; the same offset every page title uses.
-	lv_obj_align(heading, LV_ALIGN_TOP_LEFT, cfg->padding + 56 + 14, cfg->padding + cfg->top_bar_height + 10);
+	settingsrow_title(name_layer, cfg, "playlist_name");
 
 	lv_obj_t *cancel = lv_btn_create(name_layer);
-	lv_obj_set_size(cancel, 56, 56);
-	lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, -cfg->padding, cfg->padding + cfg->top_bar_height);
+	lv_obj_set_size(cancel, SX_HEADER_BTN, SX_HEADER_H);
+	lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, 0, SX_STATUSBAR_H);
 	lv_obj_set_style_bg_opa(cancel, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(cancel, 0, 0);
 	lv_obj_set_style_shadow_width(cancel, 0, 0);
@@ -1425,19 +1833,7 @@ void playlistpage_init(gui_config_t *cfg) {
 	lv_obj_add_style(cancel_icon, &theme_style_icon, 0);
 	lv_obj_center(cancel_icon);
 
-	name_field = lv_textarea_create(name_layer);
-	lv_textarea_set_one_line(name_field, true);
-	lv_textarea_set_max_length(name_field, PLAYLIST_NAME_MAX);
-	lv_textarea_set_placeholder_text(name_field, tr("name"));
-	lv_obj_set_size(name_field, cfg->screen_width - 2 * cfg->padding, 62);
-	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);
-	lv_obj_align(name_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
-	lv_obj_add_style(name_field, &theme_style_card, 0);
-	lv_obj_set_style_radius(name_field, 12, 0);
-	lv_obj_set_style_border_width(name_field, 0, 0);
-	lv_obj_set_style_shadow_width(name_field, 0, 0);
-	lv_obj_set_style_pad_all(name_field, 14, 0);
-	lv_obj_set_style_text_font(name_field, &font_ui_24, 0);
+	name_field = settingsrow_name_field(name_layer, cfg, PLAYLIST_NAME_MAX);
 	keyboard_style_caret(name_field);
 
 	name_keyboard = keyboard_create(name_layer, cfg->screen_width, 316, name_field, NULL, "ok", name_accept_cb, NULL);
@@ -1497,7 +1893,8 @@ void playlistpage_init(gui_config_t *cfg) {
 	import_action = lv_btn_create(import_layer);
 	lv_obj_set_size(import_action, cfg->screen_width - 2 * cfg->padding, 62);
 	lv_obj_align(import_action, LV_ALIGN_BOTTOM_MID, 0, -cfg->padding);
-	lv_obj_set_style_bg_color(import_action, theme()->accent, 0);
+	// The accent and its own ink (white on a pale accent was barely there).
+	lv_obj_add_style(import_action, &sx_style_accent, 0);
 	lv_obj_set_style_border_width(import_action, 0, 0);
 	lv_obj_set_style_shadow_width(import_action, 0, 0);
 	lv_obj_set_style_radius(import_action, 12, 0);
@@ -1506,7 +1903,6 @@ void playlistpage_init(gui_config_t *cfg) {
 	import_action_label = lv_label_create(import_action);
 	lv_label_set_text(import_action_label, tr("playlist_import"));
 	lv_obj_set_style_text_font(import_action_label, &font_ui_24, 0);
-	lv_obj_set_style_text_color(import_action_label, lv_color_white(), 0);
 	lv_obj_center(import_action_label);
 
 	int import_top = content_top;
@@ -1524,6 +1920,7 @@ void playlistpage_init(gui_config_t *cfg) {
 	lv_obj_set_flex_flow(import_body, LV_FLEX_FLOW_COLUMN);
 
 	lv_obj_add_event_cb(playlistpage_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(playlistpage_screen, screen_unload_start_cb, LV_EVENT_SCREEN_UNLOAD_START, NULL);
 	switcher_attach_back_gesture(playlistpage_screen);
 	player_sheet_attach_drag(playlistpage_screen, true);
 }

@@ -70,9 +70,7 @@ void medialist_set_quality_badges(bool on);
 #define MEDIALIST_ARTIST_GENRES 4
 #define MEDIALIST_ARTIST_FAVOURITES 8
 #define MEDIALIST_ARTIST_PLAYLISTS 16
-#define MEDIALIST_ARTIST_ALL                                                                                       \
-	(MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES |   \
-	 MEDIALIST_ARTIST_PLAYLISTS)
+#define MEDIALIST_ARTIST_ALL (MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES | MEDIALIST_ARTIST_PLAYLISTS)
 bool medialist_show_artist(void);
 int medialist_artist_lists(void);
 void medialist_set_show_artist(bool on, int lists);
@@ -96,6 +94,7 @@ void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artis
 // Favourites, say -- takes the place of the one there, and the chevron brings
 // that one back, where it was scrolled to, before it leaves the page.
 void medialist_open(const char *title, library_list_t kind, library_filter_t filter, const char *filter_value);
+bool medialist_open_playback_place(void);
 
 // For the player's menu, right after its medialist_open(): true when the list
 // opened on the page already under the player -- in place of another list, or
@@ -107,6 +106,12 @@ bool medialist_step_back_to_player(void);
 // Opens one artist the way their disc button was last left: the records, or
 // the tracks strung out. What the search opens an artist with.
 void medialist_open_artist(const char *name);
+
+// "Show artist" for one track: opens the page of whoever the track is filed
+// under (library_track_artist_page()), as their records or their tracks the way
+// a tap on them in the Artists list would. False, with nothing opened, when the
+// track is not indexed or names no artist.
+bool medialist_open_track_artist(const char *path);
 
 // Re-reads what is playing and moves the accent mark to whichever rows now
 // carry it. Called from the player whenever the track changes; cheap enough
@@ -128,8 +133,7 @@ void medialist_refresh_visible(void);
 // list came from, or NULL when it came from somewhere else -- it is what makes
 // the ellipsis offer to take a track out of the list rather than add it to
 // another one.
-void medialist_open_paths(const char *title, const char *const *paths, const char *const *names,
-						  const char *const *artists, int count, const char *playlist);
+void medialist_open_paths(const char *title, const char *const *paths, const char *const *names, const char *const *artists, int count, const char *playlist);
 
 // A playlist was renamed while its track list was still open behind the
 // playlists page. The list keeps the name it was opened with, and would go on

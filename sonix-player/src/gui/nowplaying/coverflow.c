@@ -1,4 +1,9 @@
 #include "coverflow.h"
+#include "src/gui/shell/artview.h"
+
+#include "src/gui/shell/sx_frame.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_tokens.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -104,7 +109,7 @@
 // The grip at the top: how far down it sits and how big a target it is.
 #define CF_BAR_TOP 2
 #define CF_BAR_HIT_W 180
-#define CF_BAR_HIT_H 46
+#define CF_BAR_HIT_H 72
 
 // The slide, when the finger lets go part way.
 #define CF_SHEET_MS 260
@@ -116,7 +121,7 @@
 #define CF_BACK_BODY_W (CF_BACK_W - 2 * CF_BACK_PAD)
 #define CF_BACK_H_MIN 120
 #define CF_BACK_LIST_MAX 400
-#define CF_BACK_ROW_H 50
+#define CF_BACK_ROW_H SX_ROW_H
 #define CF_BACK_ROWS 64
 #define CF_BACK_RADIUS 16
 
@@ -518,7 +523,10 @@ static void face_draw_cover(uint16_t *face, const cover_image_t *cover) {
 	for (int y = y0; y < y1; y++) {
 		const uint16_t *srow = (const uint16_t *)cover->pixels + (size_t)y * stride;
 		uint16_t *drow = face + (size_t)(oy + y) * CF_MID_W + ox;
-		memcpy(drow + x0, srow + x0, (size_t)(x1 - x0) * 2);
+		if (theme_monochrome_covers())
+			sx_artview_copy_gray565(srow + x0, drow + x0, (size_t)(x1 - x0), 1, (size_t)(x1 - x0) * 2, (size_t)(x1 - x0) * 2);
+		else
+			memcpy(drow + x0, srow + x0, (size_t)(x1 - x0) * 2);
 	}
 }
 
@@ -536,13 +544,17 @@ static void face_paint(cf_slot_t *slot, const cover_image_t *cover) {
 }
 
 // The empty record: the card and the album glyph, and nothing else.
+static const cf_row_t *album_at(int index);
+
 static void face_reset(cf_slot_t *slot) {
 	if (!slot->face) {
 		return;
 	}
-	face_fill((uint16_t *)slot->face, theme()->surface);
-	face_draw_glyph((uint16_t *)slot->face, &icon_album_big, theme()->text_secondary, 90);
-	slot->tone = 0; // no sleeve, no colour: the glow falls back to the accent
+	const cf_row_t *album = album_at(slot->index);
+	lv_color_t tone = album ? sx_placeholder_name(album->name) : theme()->surface;
+	face_fill((uint16_t *)slot->face, tone);
+	face_draw_glyph((uint16_t *)slot->face, &icon_album_big, lv_color_white(), 230);
+	slot->tone = lv_color_to_u32(tone);
 	slot->has_cover = false;
 	slot->warp_h = -1; // the turned copy is out of date
 }
@@ -1173,7 +1185,7 @@ static bool track_fill_cb(const char *name, const char *path, const char *artist
 	lv_obj_set_width(num, 26);
 	lv_obj_set_style_text_align(num, LV_TEXT_ALIGN_RIGHT, 0);
 	lv_obj_add_style(num, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(num, &font_ui_18, 0);
+	lv_obj_set_style_text_font(num, &font_ui_20, 0);
 	lv_label_set_text_fmt(num, "%d", number);
 
 	lv_obj_t *label = lv_label_create(row);
@@ -1181,9 +1193,9 @@ static bool track_fill_cb(const char *name, const char *path, const char *artist
 	lv_obj_set_flex_grow(label, 1);
 	// One line, always. LV_LABEL_LONG_DOT wraps before it truncates, and a long
 	// title on two lines grows the row into the one under it.
-	lv_obj_set_height(label, lv_font_get_line_height(&font_ui_20));
+	lv_obj_set_height(label, lv_font_get_line_height(&font_ui_26_bold));
 	lv_obj_set_style_text_color(label, theme()->text_primary, 0);
-	lv_obj_set_style_text_font(label, &font_ui_20, 0);
+	lv_obj_set_style_text_font(label, &font_ui_26_bold, 0);
 	lv_label_set_text(label, name ? name : "");
 
 	// A hairline under every row but the last, drawn as a child of the row so it
@@ -1474,7 +1486,7 @@ static bool sheet_prepare(void) {
 	centre = 0;
 	if (!remembered_loaded) {
 		remembered_loaded = true;
-		snprintf(remembered, sizeof(remembered), "%s", config_get("library", "coverflow_album", ""));
+		snprintf(remembered, sizeof(remembered), "%s", config_get_copy("library", "coverflow_album", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 	}
 	int at = remembered[0] ? library_index_find_name(albums, remembered) : -1;
 	if (at > 0 && at < album_count) {
@@ -1587,11 +1599,20 @@ static void sheet_drag_end(void) {
 		return;
 	}
 	sheet_dragging = false;
+	// The release may arrive before the next draw frame. Commit the latest
+	// position before deciding whether the sheet crossed its closing threshold.
+#ifdef HOST_BUILD
+	int before_layout = lv_obj_get_y(sheet);
+#endif
+	lv_obj_update_layout(sheet);
 
 	// A quarter of the travel decides it, in whichever direction the gesture
 	// started: the same point of no return as the control centre.
 	int y = lv_obj_get_y(sheet);
 	int travel = y - drag_from_y;
+#ifdef HOST_BUILD
+	printf("coverflow: release y=%d (before layout %d), start=%d\n", y, before_layout, drag_from_y);
+#endif
 	bool open = drag_from_y == 0 ? travel < sheet_h / 4 : travel < -sheet_h / 4;
 
 	sheet_open = open;
@@ -1841,7 +1862,10 @@ static void edge_drag_cb(lv_event_t *e) {
 		return;
 	}
 	lv_event_code_t code = lv_event_get_code(e);
-	int band = (int)(uintptr_t)lv_event_get_user_data(e);
+	// Above the 2.0 bottom slot when something stands in it -- the mini
+	// player, or the "Shuffle all music" card while nothing has played: the
+	// bottom of the screen is theirs.
+	int band = (int)(uintptr_t)lv_event_get_user_data(e) - sx_frame_slot_height();
 
 	if (code == LV_EVENT_PRESSED) {
 		page_release();
@@ -1967,6 +1991,7 @@ void coverflow_init(gui_config_t *cfg) {
 	lv_obj_align(bar_hit, LV_ALIGN_TOP_MID, 0, cfg->top_bar_height + CF_BAR_TOP);
 	lv_obj_set_scrollable(bar_hit, false);
 	lv_obj_set_clickable(bar_hit, true);
+	lv_obj_set_press_lock(bar_hit, true);
 	lv_obj_add_event_cb(bar_hit, bar_drag_cb, LV_EVENT_PRESSED, NULL);
 	lv_obj_add_event_cb(bar_hit, bar_drag_cb, LV_EVENT_PRESSING, NULL);
 	lv_obj_add_event_cb(bar_hit, bar_drag_cb, LV_EVENT_RELEASED, NULL);
@@ -2046,7 +2071,7 @@ void coverflow_init(gui_config_t *cfg) {
 	title_label = lv_label_create(sheet);
 	lv_obj_set_width(title_label, cfg->screen_width - 2 * cfg->padding);
 	lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
-	lv_obj_set_style_text_font(title_label, &font_ui_24, 0);
+	lv_obj_set_style_text_font(title_label, &font_ui_24_bold, 0);
 	scrolltext_apply(title_label);
 	lv_obj_align(title_label, LV_ALIGN_BOTTOM_MID, 0, -34);
 
@@ -2119,7 +2144,7 @@ void coverflow_init(gui_config_t *cfg) {
 	lv_label_set_long_mode(back_sub, LV_LABEL_LONG_DOT);
 	lv_obj_set_width(back_sub, lv_pct(100));
 	lv_obj_add_style(back_sub, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(back_sub, &font_ui_18, 0);
+	lv_obj_set_style_text_font(back_sub, &font_ui_22, 0);
 	lv_obj_set_style_pad_top(back_sub, 2, 0);
 	lv_obj_set_style_pad_bottom(back_sub, 12, 0);
 

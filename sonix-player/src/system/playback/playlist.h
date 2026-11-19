@@ -52,20 +52,122 @@ void playlist_load_paths_ordered(const char *const *list, int count, int start_i
 // The queue becomes a custom one, because a folder queue can be rebuilt from
 // the directory at any moment and that would quietly throw the addition away.
 // Returns false only when the track could not be stored (out of memory).
+//
+// "Play next" is a promise that holds across a change of order: switching
+// shuffle on or off, or a rescan rebuilding a library queue, deals everything
+// else again but puts the tracks queued this way and not yet played back right
+// after the playing one, in the order they were queued. Repeat-one still
+// repeats the playing track: the queued ones come up when it is skipped.
 bool playlist_insert_next(const char *path);
 
-// "Add to queue" from the library, the search and the browser, where the
-// user's setting puts it (Music settings > Playback options, [player]
-// queue_add_end): right after the track playing, as playlist_insert_next(), or
-// at the end of the queue, after everything already in it. Several added one
-// after another keep the order they were added in either way. Returns false
-// only when the track could not be stored (out of memory).
-bool playlist_enqueue(const char *path);
+// Where queued tracks go.
+typedef enum {
+	PLAYLIST_QUEUE_NEXT, // "Play next": after the track playing, as above
+	PLAYLIST_QUEUE_END,	 // "Add to end of queue": after everything already there
+} playlist_queue_where_t;
 
-// Whether playlist_enqueue() adds at the end. Read and written through the
-// configuration, so the setting page and the queue agree without a cache.
+// Queues a set of tracks at once, in the order given: what the menus and the
+// selection bars use for an album, an artist or a chosen handful. One pass
+// over the queue for the whole set rather than one per track. NEXT behaves as
+// playlist_insert_next() for each in turn; END appends to the playback order --
+// under shuffle that is the end of the current deal, played last, and a deal
+// dealt afresh (shuffle switched on, shuffle-repeat coming round) mixes them
+// in with the rest, since they carry no promise. With nothing queued the set
+// simply becomes the queue. Returns how many went in.
+//
+// 2.0 (the handoff's queue rules): NEXT takes the same tracks out of what is
+// still to come before it puts them in, so "Play next" on a track that is
+// already further down the queue moves it up instead of playing it twice; the
+// track playing is never queued after itself. The history (what has played) is
+// left alone. On a queue that is a long library list (more than
+// PLAYLIST_DEDUP_IX_MAX rows) only the tracks added by hand are looked at --
+// finding a path among the library's rows would mean reading every one of them.
+int playlist_queue_paths(const char *const *paths, int count, playlist_queue_where_t where);
+
+#define PLAYLIST_DEDUP_IX_MAX 3000
+
+// Takes out everything after the playing track. The queue becomes a custom
+// list of paths, like after playlist_remove(). False when there was nothing
+// to take out.
+bool playlist_clear_upcoming(void);
+
+// Deals what is still to come in a random order, once, whatever the mode:
+// the queue page's "Shuffle what is left". The history and the playing track
+// stay where they are; the "play next" entries still to come are dealt with the
+// rest (the user asked for a shuffle of everything ahead). The mode does not
+// change, so a queue in order stays in order from here on -- this is a deal,
+// not the shuffle mode. False when fewer than two tracks are ahead.
+bool playlist_shuffle_upcoming(void);
+
+// Moves the entry at `index` (playback order) to play right after the one
+// playing, whether it is still to come or has played already (then playback
+// moves up a place with the entries behind it, and stays on its track): the
+// queue's "Move to next" (2.0). Marked as a "play next", like one queued so.
+// False on the playing entry itself, or an index out of range.
+bool playlist_move_next(int index);
+
+// ---------------------------------------------------------------------------
+// Snapshots, for "Undo"
+//
+// 2.0 (principle 6): every change to the queue is a toast with "Undo", and
+// undoing puts the queue back exactly as it was -- the entries, their order,
+// where playback is, the "play next" marks and the chain they form. A snapshot
+// is that, copied: the order (one word a track), the paths added by hand, and,
+// for a queue that is a library list, a second handle over the same rows
+// (library_index_clone: the row ids, four bytes a track, no query). "All
+// tracks" of a 20 000-track library costs about 160 KB while a snapshot is
+// held, which is why the toast that offers it is the only thing that keeps one
+// (see queueundo.h).
+//
+// Restoring consumes the snapshot. The playing track is not changed by a
+// restore: when the snapshot's current entry is not what is loaded now (the
+// track moved on while the toast was up), playback is found in the restored
+// queue by path and stays where it is -- or, failing that, the snapshot's own
+// position is kept and the loaded track simply plays out.
+//
+// UI thread, like everything else here.
+// ---------------------------------------------------------------------------
+typedef struct playlist_snapshot playlist_snapshot_t;
+
+// NULL when the queue is empty or memory is short.
+playlist_snapshot_t *playlist_snapshot_take(void);
+
+// Puts the queue back as `snap` had it and frees `snap`. `playing_path` is
+// the file loaded now (NULL: keep the snapshot's position). False, with the
+// queue untouched, when it could not be done (out of memory).
+bool playlist_snapshot_restore(playlist_snapshot_t *snap, const char *playing_path);
+
+void playlist_snapshot_free(playlist_snapshot_t *snap);
+
+// What the snapshot holds, in bytes (for the report and the log).
+size_t playlist_snapshot_bytes(const playlist_snapshot_t *snap);
+
+// Reading one without restoring it, in playback order: what the queue page
+// shows of the queue a book has parked (device_state_parked()).
+int playlist_snapshot_count(const playlist_snapshot_t *snap);
+int playlist_snapshot_position(const playlist_snapshot_t *snap);
+bool playlist_snapshot_path_at(const playlist_snapshot_t *snap, int index, char *out, size_t size);
+
+// Swaps the entry at `index` (playback order) with its neighbour above
+// (`delta` -1) or below (+1). Only entries still to come move, and only among
+// themselves. An in-memory change of order: a library-backed queue keeps its
+// query on the card, so after a restart such a queue is in its listed order
+// again, as a shuffled one is dealt again.
+bool playlist_move(int index, int delta);
+// Absolute drop position, only within the upcoming part of the queue.
+// Unlike the adjacent-move API, materializes a library-backed order for restart.
+bool playlist_move_to(int from, int to);
+
+// Whether the entry at `index` (playback order) is a "Play next" still waiting
+// to come up.
+bool playlist_is_queued_next(int index);
+
+// The generic menu action follows this preference; explicit swipe-next does not.
 bool playlist_enqueue_at_end(void);
+bool playlist_enqueue_ask(void);
+void playlist_set_enqueue_ask(void);
 void playlist_set_enqueue_at_end(bool at_end);
+bool playlist_enqueue(const char *path);
 
 // The same, but at a slot chosen by the caller rather than after the current
 // track. For putting a saved queue back exactly as it was left.
@@ -80,17 +182,20 @@ void playlist_set_enqueue_at_end(bool at_end);
 // stored (out of memory).
 bool playlist_insert_at(const char *path, int slot);
 
+// Gives every entry that is `old_path` the name `new_path` instead, in place:
+// the order, the position, the "play next" marks and the mode stay as they
+// are. For a streaming track whose file name was a guess until it came down
+// (the extension follows the codec): rebuilding the queue for a new name, as
+// the Yandex page did, lost what had been queued by hand and dealt shuffle
+// afresh. Only entries held as paths are looked at -- a library list's own
+// rows are the library's. The revision does not move (the queue's copy on
+// the card is not rewritten for a name). Returns how many were renamed.
+int playlist_replace_path(const char *old_path, const char *new_path);
+
 // Takes the entries at `indices` (positions in playback order) out of the
 // queue. The one playing is never taken out, and the others keep their order.
 // The queue becomes a custom list of paths. False when nothing was taken out.
 bool playlist_remove(const int *indices, int count);
-
-// Moves the entry at `from` to `to` (positions in playback order; `to` is
-// where it ends up). Playback stays on the track it is on, and the queue
-// becomes a custom list of paths, as with a removal. False when either
-// position is out of range, they are the same, or the library list under the
-// queue changed meanwhile and the positions no longer stand for the same tracks.
-bool playlist_move(int from, int to);
 
 // True while the queue is a custom list rather than a folder.
 bool playlist_is_custom(void);
@@ -157,6 +262,25 @@ void playlist_set_custom(bool custom);
 // survives a power cycle -- watches this to know when a full rewrite is due
 // rather than rewriting on every track change.
 unsigned playlist_revision(void);
+// A different queue source, not a next/previous step or an insertion/reorder.
+unsigned playlist_source_revision(void);
+
+// GUI-owned bounded export. No worker may read the live queue. A producer
+// fills one caller-owned batch; a changed order/query rejects the whole capture.
+typedef struct {
+	unsigned revision;
+	int count;
+	bool library_backed;
+	library_export_source_t source;
+} playlist_export_t;
+typedef struct {
+	bool indexed;
+	int32_t row_id;
+	char path[512];
+} playlist_export_item_t;
+bool playlist_export_begin(playlist_export_t *state);
+bool playlist_export_ack(const playlist_export_t *state, const library_export_receipt_t *receipt);
+bool playlist_export_batch(const playlist_export_t *state, int offset, playlist_export_item_t *items, int capacity, int *count);
 
 // A queue that IS a library list: the handle is taken over, and the queue holds
 // four bytes a track instead of a path each. Paths are read back from the
@@ -179,9 +303,8 @@ bool playlist_library_spec(library_index_spec_t *out);
 // will be dealt a fresh shuffle when it comes back: the position in the old
 // deal means nothing in the new one.
 //
-// It is also the number the now playing screen shows, for the same reason: a
-// place in the deal is a random number that happens to go up by one each track,
-// while a place in the list says where on the card the track came from.
+// This is a persistence identity, not the displayed queue position; the
+// player and queue UI both use playlist_current_index().
 size_t playlist_current_entry(void);
 
 // The entries added to a library-backed queue after it was built. They are not
@@ -244,5 +367,31 @@ playback_mode_t playlist_get_mode(void);
 // Advances to the next mode (NORMAL -> REPEAT_ALL -> REPEAT_ONE -> SHUFFLE ->
 // NORMAL) and returns the new mode.
 playback_mode_t playlist_cycle_mode(void);
+
+// ---------------------------------------------------------------------------
+// Undo (UI 2.0): every change to the queue made from a list comes with a toast
+// offering to take it back for a few seconds.
+//
+// playlist_queue_paths_undoable() is playlist_queue_paths() that also notes
+// what it did; playlist_queue_undo() takes exactly that addition out again
+// and puts the "play next" chain and the custom flag back as they were.
+// It refuses (false) once anything else has changed the queue since, once one
+// of the added tracks has come up, and for an addition that made the queue
+// out of nothing (there was no queue to go back to). UI thread, like the rest.
+// ---------------------------------------------------------------------------
+typedef struct {
+	bool valid;
+	bool was_empty;
+	bool custom;
+	bool chain_valid;
+	size_t first_new;
+	size_t added;
+	size_t chain_from;
+	size_t chain_slot;
+	unsigned revision;
+} playlist_queue_undo_t;
+
+int playlist_queue_paths_undoable(const char *const *paths, int count, playlist_queue_where_t where, playlist_queue_undo_t *undo);
+bool playlist_queue_undo(const playlist_queue_undo_t *undo);
 
 #endif // PLAYLIST_H

@@ -43,6 +43,9 @@
 
 static const char *const FONT_DEFAULT_FILES[] = FACE_FILES("default");
 static const char *const FONT_BOLD_FILES[] = FACE_FILES("bold");
+// Optional prototype faces are supplied by the local firmware build.
+static const char *const FONT_UI_REGULAR_FILES[] = FACE_FILES("ui-regular");
+static const char *const FONT_UI_SEMIBOLD_FILES[] = FACE_FILES("ui-semibold");
 
 // The scripts MiSans has no letters for, one face each, chained behind the
 // main face so they only answer for what it lacks. The bold file is optional:
@@ -96,16 +99,23 @@ static const char *first_present(const char *const *candidates) {
 
 lv_font_t font_ui_14;
 lv_font_t font_ui_16;
+lv_font_t font_ui_17;
 lv_font_t font_ui_18;
 lv_font_t font_ui_20;
 lv_font_t font_ui_20_bold;
+lv_font_t font_ui_21;
 lv_font_t font_ui_22;
 lv_font_t font_ui_22_bold;
 lv_font_t font_ui_24;
 lv_font_t font_ui_24_bold;
 lv_font_t font_ui_26;
+lv_font_t font_ui_26_bold;
 lv_font_t font_ui_28;
+lv_font_t font_ui_28_bold;
+lv_font_t font_ui_30_bold;
 lv_font_t font_ui_32;
+lv_font_t font_ui_32_bold;
+lv_font_t font_ui_34_bold;
 lv_font_t font_ui_36_bold;
 lv_font_t font_ui_64_bold;
 lv_font_t font_ui_72;
@@ -117,11 +127,31 @@ typedef struct {
 } ui_font_t;
 
 static const ui_font_t ui_fonts[] = {
-	{&font_ui_14, 14, false}, {&font_ui_16, 16, false}, {&font_ui_18, 18, false},
-	{&font_ui_20, 20, false}, {&font_ui_22, 22, false}, {&font_ui_24, 24, false},
-	{&font_ui_26, 26, false}, {&font_ui_28, 28, false}, {&font_ui_32, 32, false},
-	{&font_ui_72, 72, false}, {&font_ui_20_bold, 20, true}, {&font_ui_22_bold, 22, true}, {&font_ui_24_bold, 24, true}, {&font_ui_36_bold, 36, true},
+	{&font_ui_14, 14, false},
+	{&font_ui_16, 16, false},
+	{&font_ui_18, 18, false},
+	{&font_ui_20, 20, false},
+	{&font_ui_22, 22, false},
+	{&font_ui_24, 24, false},
+	{&font_ui_26, 26, false},
+	{&font_ui_28, 28, false},
+	{&font_ui_32, 32, false},
+	{&font_ui_72, 72, false},
+	{&font_ui_20_bold, 20, true},
+	{&font_ui_22_bold, 22, true},
+	{&font_ui_24_bold, 24, true},
+	{&font_ui_36_bold, 36, true},
 	{&font_ui_64_bold, 64, true},
+	// Sonix UI 2.0 (sx_tokens.h): the card subtitle (21) and its mono form
+	// (17), the sheet's title (26 bold), the album and player titles (28 bold),
+	// and the page title at its two sizes (34 bold, 30 bold past 12 letters).
+	{&font_ui_17, 17, false},
+	{&font_ui_21, 21, false},
+	{&font_ui_26_bold, 26, true},
+	{&font_ui_28_bold, 28, true},
+	{&font_ui_30_bold, 30, true},
+	{&font_ui_34_bold, 34, true},
+	{&font_ui_32_bold, 32, true},
 };
 
 #define UI_FONT_COUNT (sizeof(ui_fonts) / sizeof(ui_fonts[0]))
@@ -140,7 +170,7 @@ typedef struct {
 } text_step_t;
 
 static const text_step_t LARGE_STEPS[] = {
-	{14, 17}, {16, 19}, {18, 21}, {20, 23}, {22, 25}, {24, 26},
+	{14, 17}, {16, 19}, {17, 19}, {18, 21}, {20, 23}, {21, 23}, {22, 25}, {24, 26},
 };
 
 static bool large_text;
@@ -168,6 +198,8 @@ static bool set_built[2];
 
 static const char *regular_file;
 static const char *bold_file;
+static const char *ui_regular_file;
+static const char *ui_semibold_file;
 
 static lv_font_t *open_face(const char *path, int size) {
 	if (access(path, R_OK) != 0) {
@@ -238,7 +270,14 @@ static lv_font_t *open_chain(const ui_font_t *ui, int size) {
 	// file when the firmware has one; the regular stands in otherwise,
 	// which reads fine at heading sizes even if it is not actually heavier.
 	lv_font_t *head = NULL;
-	if (ui->bold && bold_file) {
+	if (ui->bold && ui_semibold_file) {
+		head = open_face(ui_semibold_file, size);
+	}
+	if (!head && ui_regular_file) {
+		head = open_face(ui_regular_file, size);
+	}
+	bool prototype_face = head != NULL;
+	if (!head && ui->bold && bold_file) {
 		head = open_face(bold_file, size);
 	}
 	if (!head) {
@@ -286,8 +325,8 @@ static lv_font_t *open_chain(const ui_font_t *ui, int size) {
 		}
 	}
 
-	// The main face again, answering everything: the kanji Rodin lacks.
-	if (rodin) {
+	// MiSans covers glyphs missing from the prototype face and Rodin.
+	if (prototype_face || rodin) {
 		lv_font_t *again = NULL;
 		if (ui->bold && bold_file) {
 			again = open_face(bold_file, size);
@@ -328,6 +367,8 @@ static bool build_set(bool large) {
 bool fonts_init(void) {
 	regular_file = first_present(FONT_DEFAULT_FILES);
 	bold_file = first_present(FONT_BOLD_FILES);
+	ui_regular_file = first_present(FONT_UI_REGULAR_FILES);
+	ui_semibold_file = first_present(FONT_UI_SEMIBOLD_FILES);
 	for (size_t i = 0; i < SCRIPT_COUNT; i++) {
 		scripts[i].regular = first_present(scripts[i].regular_files);
 		scripts[i].bold = first_present(scripts[i].bold_files);
@@ -354,6 +395,9 @@ bool fonts_init(void) {
 	// firmware ships.
 	int len = snprintf(summary, sizeof(summary), "%s%s%s", basename_of(regular_file), bold_file ? ", " : "",
 					   bold_file ? basename_of(bold_file) : "");
+	if (ui_regular_file) {
+		len = snprintf(summary, sizeof(summary), "%s, %s + MiSans", basename_of(ui_regular_file), ui_semibold_file ? basename_of(ui_semibold_file) : basename_of(ui_regular_file));
+	}
 	const char *sep = ", ";
 	if (japanese.used && len > 0 && (size_t)len < sizeof(summary)) {
 		len += snprintf(summary + len, sizeof(summary) - (size_t)len, "%s%s", sep, japanese.name);

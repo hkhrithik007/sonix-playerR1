@@ -9,7 +9,9 @@
 #include "src/system/core/base64.h"
 #include "src/system/core/config.h"
 #include "src/system/net/http.h"
+#include "src/system/streaming/streamerr.h"
 #include "src/system/core/json.h"
+#include "src/system/streaming/tidalsync.h"
 #include "src/system/streaming/streamkeys.h"
 #include "src/system/core/lang.h"
 
@@ -200,7 +202,7 @@ const char *tidal_expected_mime(void) {
 // place where things that survive a reboot live.
 static void session_path(char *out, size_t size) {
 	out[0] = '\0';
-	const char *cfg = config_path();
+	const char *cfg = config_path_copy((char[512]){0}, 512);
 	if (!cfg || !cfg[0]) {
 		return;
 	}
@@ -295,13 +297,18 @@ static void load_session(void) {
 }
 
 void tidal_init(void) {
-	snprintf(api_url, sizeof(api_url), "%s", config_get("tidal", "base_url", TIDAL_API_DEFAULT));
-	snprintf(auth_url, sizeof(auth_url), "%s", config_get("tidal", "auth_url", TIDAL_AUTH_DEFAULT));
+	// Into the provider registry first, whatever the keys say: the cache is
+	// the service's as soon as there is a card, and the exit paths must clear
+	// it even when Tidal is not configured.
+	tidalsync_register_provider();
+
+	snprintf(api_url, sizeof(api_url), "%s", config_get_copy("tidal", "base_url", TIDAL_API_DEFAULT, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
+	snprintf(auth_url, sizeof(auth_url), "%s", config_get_copy("tidal", "auth_url", TIDAL_AUTH_DEFAULT, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 
 	// Spaces become %20 here, once. Writing them as '+' in the form would be
 	// shorter and wrong: the '+' would itself be percent-encoded and end up
 	// inside the scope name.
-	http_url_encode(config_get("tidal", "scope", TIDAL_SCOPE_DEFAULT), scope_encoded, sizeof(scope_encoded));
+	http_url_encode(config_get_copy("tidal", "scope", TIDAL_SCOPE_DEFAULT, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), scope_encoded, sizeof(scope_encoded));
 
 	cover_px = (int)config_get_int("tidal", "cover_size", TIDAL_COVER_PX_DEFAULT);
 	// Only the sizes the CDN really serves: any other is a 403 on every cover.
@@ -327,18 +334,18 @@ void tidal_init(void) {
 	// A session left in device_config.ini is truncated and worthless, so it is
 	// cleared out rather than left to linger. Only the country and the name are
 	// kept, since those fit in 128 bytes.
-	if (config_get("tidal", "access_token", NULL)) {
+	if (config_get_copy("tidal", "access_token", NULL, (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE)) {
 		printf("tidal: found an old truncated session, dropping it\n");
 		config_set("tidal", "access_token", "");
 		config_set("tidal", "refresh_token", "");
 		if (!country_code[0]) {
-			snprintf(country_code, sizeof(country_code), "%s", config_get("tidal", "country", ""));
+			snprintf(country_code, sizeof(country_code), "%s", config_get_copy("tidal", "country", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 		}
 		if (!user_id[0]) {
-			snprintf(user_id, sizeof(user_id), "%s", config_get("tidal", "user_id", ""));
+			snprintf(user_id, sizeof(user_id), "%s", config_get_copy("tidal", "user_id", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 		}
 		if (!display_name[0]) {
-			snprintf(display_name, sizeof(display_name), "%s", config_get("tidal", "user", ""));
+			snprintf(display_name, sizeof(display_name), "%s", config_get_copy("tidal", "user", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 		}
 		config_save();
 	}
@@ -494,6 +501,9 @@ static bool token_refresh(void) {
 
 	if (status != 200 || !token[0]) {
 		note_api_error(&doc, status);
+		// Read before the document goes: see the refusal below.
+		char error[64] = "";
+		json_obj_str(&doc, root, "error", error, sizeof(error));
 		api_done(body, &doc);
 
 		// A rejected refresh is not a network error: the session is no longer
@@ -503,6 +513,9 @@ static bool token_refresh(void) {
 		if (status >= 400 && status < 500) {
 			printf("tidal: the refresh was refused, session closed\n");
 			tidal_logout();
+			// "invalid_client" is the firmware's application keys, not the
+			// account: signing in again with the same keys would fail too.
+			streamerr_hint(strcmp(error, "invalid_client") == 0 ? STREAM_ERR_KEYS : STREAM_ERR_SIGN_IN);
 		}
 		return false;
 	}
@@ -549,10 +562,12 @@ static bool api_call(const char *url, char **body, json_doc_t *doc) {
 
 	if (!tidal_configured()) {
 		set_error("%s", tr("api_keys_unavailable"));
+		streamerr_hint(STREAM_ERR_KEYS);
 		return false;
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return false;
 	}
 
@@ -599,6 +614,7 @@ static bool api_call(const char *url, char **body, json_doc_t *doc) {
 			}
 			if (!last_error[0]) {
 				set_error("%s", tr("tidal_session_expired"));
+				streamerr_hint(STREAM_ERR_SIGN_IN);
 			}
 			return false;
 		}
@@ -630,6 +646,7 @@ static bool api_write(const char *method, const char *url, const char *form) {
 
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return false;
 	}
 	if (!token_is_fresh() && !token_refresh()) {
@@ -665,6 +682,7 @@ static bool api_write(const char *method, const char *url, const char *form) {
 				continue;
 			}
 			set_error("%s", tr("tidal_session_expired"));
+			streamerr_hint(STREAM_ERR_SIGN_IN);
 			return false;
 		}
 
@@ -701,6 +719,7 @@ bool tidal_login_begin(tidal_login_t *out) {
 
 	if (!tidal_configured()) {
 		set_error("%s", tr("api_keys_unavailable"));
+		streamerr_hint(STREAM_ERR_KEYS);
 		return false;
 	}
 
@@ -1264,6 +1283,7 @@ static int favorites(const char *kind, int offset, reader_fn read, void *out, in
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return -1;
 	}
 
@@ -1291,6 +1311,7 @@ int tidal_user_playlists(int offset, tidal_playlist_t *out, int max) {
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return -1;
 	}
 
@@ -1684,6 +1705,7 @@ int tidal_favorite_track_ids(long *out, int max) {
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return -1;
 	}
 
@@ -1735,6 +1757,7 @@ bool tidal_playlist_delete(const char *playlist_id) {
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return false;
 	}
 
@@ -1753,6 +1776,7 @@ bool tidal_playlist_create(const char *name, char *out_id, size_t out_size) {
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return false;
 	}
 	if (!name || !*name) {
@@ -1840,6 +1864,7 @@ bool tidal_playlist_add_track(const char *playlist_id, long track_id) {
 	}
 	if (!tidal_logged_in()) {
 		set_error("%s", tr("tidal_not_signed_in"));
+		streamerr_hint(STREAM_ERR_SIGN_IN);
 		return false;
 	}
 	if (!token_is_fresh() && !token_refresh()) {

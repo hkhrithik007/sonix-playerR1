@@ -1,6 +1,9 @@
 #include "firmware.h"
+#include "src/system/device/recoveryprep.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,16 +13,15 @@
 #include <unistd.h>
 
 #include "src/system/audio/audio.h"
-#include "src/system/device/clock.h"
 #include "src/system/core/config.h"
-#include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/tidalcache.h"
-#include "src/system/remote/dlna.h"
+#include "src/system/device/clock.h"
 #include "src/system/device/power.h"
 #include "src/system/device/sysinfo.h"
 #include "src/system/device/system.h"
-
+#include "src/system/playback/device_state.h"
+#include "src/system/remote/dlna.h"
+#include "src/system/streaming/podcastcache.h"
+#include "src/system/streaming/provider.h"
 
 // The card is scanned once and every name compared case-insensitively,
 // rather than guessing at spellings: FAT is case-insensitive but exFAT and
@@ -56,7 +58,7 @@ static bool find_in_dir(const char *root, const char *stem, char *out, size_t ou
 	return found;
 }
 
-const char *firmware_update_stem(void) {
+const char *firmware_update_stem(char *buffer, size_t size) {
 	// ONLY the name of THIS model -- deliberately NOT the stock binary's
 	// "update.upt" fallback.
 	//
@@ -69,7 +71,7 @@ const char *firmware_update_stem(void) {
 	// An unrecognised player therefore gets no name at all: a fallback would
 	// hand an R1 the R3 Pro II's image. The config key is the way out for
 	// anyone who knows what they are doing.
-	const char *name = config_get("firmware", "name", "");
+	const char *name = config_get_copy("firmware", "name", "", buffer, size);
 	if (name && *name) {
 		return name;
 	}
@@ -94,18 +96,51 @@ bool firmware_update_file_find(char *out, size_t out_size) {
 		return false;
 	}
 
-	const char *name = firmware_update_stem();
+	const char *name = firmware_update_stem((char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if (!name) {
 		return false;
 	}
 	return find_in_dir(root, name, out, out_size);
 }
 
-void firmware_update_start(void) {
+#ifndef HOST_BUILD
+static bool set_bootmode(bool recovery) {
+	const char *command = recovery ? "/usr/bin/bootmode.sh Recovery" : "/usr/bin/bootmode.sh Normal";
+	if (system(command) != 0)
+		return false;
+	// Read the character device, not a cached block alias of the selector.
+	// A successful shell command alone does not prove what U-Boot will read.
+	int fd = open("/dev/mtd5", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	char data[256];
+	size_t got = 0;
+	while (got < sizeof(data)) {
+		ssize_t n = read(fd, data + got, sizeof(data) - got);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		got += (size_t)n;
+	}
+	bool ok = close(fd) == 0 && got == sizeof(data);
+	const char *wanted = recovery ? "ota:kernel2" : "ota:kernel";
+	size_t length = strlen(wanted);
+	ok = ok && memcmp(data, wanted, length) == 0;
+	for (size_t i = length; ok && i < sizeof(data); i++)
+		ok = data[i] == ' ';
+	return ok;
+}
+#endif
+
+firmware_update_result_t firmware_update_start(void) {
+	if (recovery_prep_active())
+		return FIRMWARE_UPDATE_PREPARE_FAILED;
 #ifdef HOST_BUILD
 	printf("firmware: (host build) would arm recovery and reboot\n");
+	return FIRMWARE_UPDATE_SIMULATED;
 #else
-	printf("firmware: arming recovery\n");
+	printf("firmware: preparing update\n");
 
 	// The screen fades out the way the power key puts it out, first: what
 	// follows holds this thread for seconds, and a frozen page reads as a
@@ -114,12 +149,12 @@ void firmware_update_start(void) {
 
 	// Playback down first: the card is about to be handed to the recovery
 	// kernel, and the decoder still has it open.
+	device_state_remember_flush();
 	audio_stop();
 
 	// The streaming caches (tracks and covers) survive no power cycle, the
 	// update's included.
-	qobuzcache_clear_on_exit();
-	tidalcache_clear_on_exit();
+	stream_provider_clear_on_exit_all();
 	podcastcache_clear_on_exit();
 	dlna_clear_on_exit();
 
@@ -129,22 +164,33 @@ void firmware_update_start(void) {
 	clock_shutdown();
 
 	// The recovery kernel reads the update off the card: it finds it clean.
-	storage_release_for_shutdown();
-	sync();
-	sleep(1);
+	if (!storage_prepare_for_update()) {
+		fprintf(stderr, "firmware: card preparation failed; no recovery arm or reboot\n");
+		power_screen_on();
+		return FIRMWARE_UPDATE_PREPARE_FAILED;
+	}
 
 	// Two commands: erase the first block of /dev/mtd5, write "ota:kernel2"
 	// into it. That is the whole of the stock firmware's bootmode.sh, and it
 	// is what U-Boot reads to decide which kernel to start.
-	int rc = system("/usr/bin/bootmode.sh Recovery");
-	if (rc != 0) {
-		printf("firmware: bootmode.sh Recovery failed (rc=%d)\n", rc);
+	if (!set_bootmode(true)) {
+		fprintf(stderr, "firmware: recovery selector not confirmed; restoring normal boot\n");
+		bool restored = set_bootmode(false);
+		if (restored)
+			storage_cancel_update();
+		else {
+			fprintf(stderr, "firmware: normal boot selector not confirmed; automatic reboot forbidden\n");
+			power_hold_screen_on(true);
+			power_set_auto_off(false, 0);
+		}
+		power_screen_on();
+		return restored ? FIRMWARE_UPDATE_PREPARE_FAILED : FIRMWARE_UPDATE_BOOTMODE_UNCERTAIN;
 	}
 
 	sync();
 	sleep(1);
 
-	rc = system("reboot");
+	int rc = system("reboot");
 	(void)rc;
 
 	// Spins here rather than returning, as the stock binary does: with recovery

@@ -15,9 +15,8 @@ void topbar_refresh_clock(void);
 // whatever just changed the level.
 void topbar_refresh_volume(int percent);
 
-// Repaints the play/pause indicator. The battery poll only comes round every
-// five seconds, so the player calls this the moment the transport state
-// changes rather than letting the glyph lag behind the button.
+// Refreshes the incoming AirPlay source indicator. Local play/pause and sleep
+// state belong to the player and timer controls, not to the status bar.
 void topbar_refresh_playback(void);
 
 // Repaints the two radio glyphs, left of the battery: bluetooth first, then
@@ -47,12 +46,6 @@ void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t 
 // is loaded.
 void topbar_page_shown(lv_obj_t *screen);
 
-// The control centre over the page: the bar is part of the sheet while it is
-// open, so it wears the theme's colours whatever the page under it is painted
-// in. Held from the moment the sheet starts coming down until it has gone, and
-// then the page's tint, if it has one, is back.
-void topbar_tint_hold(bool held);
-
 // Shows or hides the status bar. Pages that want the full screen height (the
 // player, with its artwork flush to the top) hide it on entry.
 void topbar_set_hidden(bool hidden);
@@ -62,12 +55,28 @@ void topbar_set_hidden(bool hidden);
 // the picture as it changes or slides; without, nothing at all is behind it.
 // Off gives it back the colours of the page underneath.
 void topbar_set_over_artwork(bool on, bool blur);
+
+// Holds that blur off, the darkening alone standing in for it, for as long as
+// what is under the bar is moving: the player sheet sliding in or being
+// dragged. A live backdrop blur is redone over the whole bar on every frame the
+// picture under it changes, and during a slide that is every frame -- the most
+// expensive thing drawn while the sheet moves, for a soft smear nobody can see
+// in a quarter of a second. Released, the blur comes back as it was. Cheap to
+// call on every frame: nothing is written while the hold does not change. UI
+// thread only, like the rest of this file.
+void topbar_hold_backdrop_blur(bool hold);
 bool topbar_is_hidden(void);
 
 // Draws the bar above everything else on the top layer. The control centre
 // asks for this on the way in: its sheet covers the whole screen, and the
 // clock, battery and volume have to stay readable over it.
 void topbar_bring_to_front(void);
+
+// Match the control centre while it is visible, then restore the page/artwork.
+void topbar_set_control_panel(bool shown);
+
+// Flat playback canvas, independent of an album page underneath the player.
+void topbar_set_playback(bool shown);
 
 // Shows or hides the charge percentage next to the battery shell (config
 // "screen"/"battery_percent", on by default). The shell itself always stays --

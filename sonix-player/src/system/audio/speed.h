@@ -41,9 +41,10 @@ void speed_reset(speed_t *s);
 //
 // Input is taken through `fill`, which must behave like a decoder read: write
 // up to `frames` interleaved frames into `dst` and return how many it wrote,
-// 0 at the end. `input_frames` receives how many input frames were consumed to
-// make this output -- which is what the position in the book advances by, and
-// is not the same as the number returned.
+// 0 at the end. `input_frames` receives the source advance represented by the
+// output returned in this call, excluding read-ahead and output still cached.
+// Partial output windows carry integer rounding across calls. This is what
+// the position in the book advances by, not necessarily the number returned.
 int speed_pull(speed_t *s, short *out, int want, int (*fill)(void *user, short *dst, int frames), void *user,
 			   uint64_t *input_frames);
 

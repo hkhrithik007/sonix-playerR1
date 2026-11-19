@@ -1,6 +1,7 @@
 #ifndef BTSTACK_H
 #define BTSTACK_H
 
+#include "bapcm.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -45,7 +46,7 @@ typedef struct {
 	char name[BT_DEV_NAME_MAX];
 	bool paired;
 	bool trusted;
-	bool connected; // the ACL link, not the audio profile
+	bool connected;	 // the ACL link, not the audio profile
 	bool audio_sink; // advertises the A2DP sink UUID: headphones, not a phone
 	unsigned cod;	 // class of device, 0 when bluez has none (every LE-only device)
 	int rssi;		 // 0 when bluez does not have one
@@ -73,12 +74,17 @@ bool btstack_wait_service(const char *name, int timeout_ms);
 // register with. Safe to call again -- an agent already registered stays.
 bool btstack_register_agent(void);
 
-// True while the socket is live. Goes false when dbus-daemon exits, which is
-// the signal to open again.
+// True while the socket and service incarnation remain usable. The worker
+// reopens after either socket death or an owner replacement.
 bool btstack_alive(void);
+// Cached indication only; the existing worker owns blocking rebind work.
+bool btstack_rebind_needed(void);
+// Read by the worker after retirement, before a new open resets provenance.
+bool btstack_bluez_rebind_needed(void);
 
 // Called on the D-Bus reader thread whenever bluez or bluealsa announced a
-// change. Record and return: it must not block and must not call back in here.
+// change. Cached invalidation queries are allowed; RPC/open/close must stay
+// on the worker. Record and return without blocking the reader.
 void btstack_set_change_cb(void (*cb)(void));
 
 // ---------------------------------------------------------------------------
@@ -179,6 +185,17 @@ bool btstack_audio_source(char *address_out, size_t size);
 // every change to any transport. From the signal cache: no call, any thread.
 int btstack_transport_sending(const char *address, unsigned *serial_out);
 
+// Moves on every export of an A2DP sink stream by bluealsa -- which is also
+// what a codec change, a rate change, a restart of the daemon and a reconnect
+// look like from here, since each builds a new stream object behind the same
+// path. Lets the caller tell "the same stream" from "a stream built again"
+// while the address stays the same. From the signal cache: any thread.
+unsigned btstack_sink_serial(void);
+
+// Encoded bitrate in bit/s from the current PCM's optional CodecBitrate
+// property, zero if unknown. Signal cache only: no RPC or worker wakeup.
+unsigned btstack_codec_bitrate(const char *address);
+
 // What bluealsa negotiated on one of the two streams, in parts rather than as
 // one line: the receiver page prints the codec and the rate on their own.
 // `receiving` picks the direction -- false for the headphones this device
@@ -188,6 +205,7 @@ typedef struct {
 	unsigned rate; // Hz, 0 when bluealsa has not said
 	unsigned channels;
 	unsigned bits; // 0 for a format word this build does not name
+	unsigned bitrate; // encoded codec bit/s, 0 when the daemon does not report it
 } btstack_stream_t;
 
 bool btstack_stream_info(const char *address, bool receiving, btstack_stream_t *out);
@@ -247,6 +265,16 @@ void btstack_refresh_media_status(const char *address);
 // last track is not what is playing.
 void btstack_forget_media(void);
 
+// A headset's own battery, 0..100, or -1 when it has not said -- which is
+// always the case unless bluealsa runs as a hands-free audio gateway (see
+// bluetooth_headset_battery_enabled()). From the signal cache: any thread.
+// `serial_out`, when given, moves on every change to any headset's level.
+int btstack_headset_battery(const char *address, unsigned *serial_out);
+
+// Asks bluealsa for that level outright, for the moment a headset connects and
+// before any signal: one Properties.Get on its RFCOMM object. Worker only.
+void btstack_read_headset_battery(const char *address);
+
 // Records a status without asking anyone. For the instant after a command is
 // sent: the signal that confirms it is a round trip away, and a second press
 // arriving in the meantime must not send the same command twice.
@@ -261,16 +289,27 @@ int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, 
 
 // The same two, either way round. `receiving` picks the a2dpsnk/source PCM --
 // what a phone is sending to this player -- instead of the a2dpsrc/sink one.
-int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected,
-					   size_t selected_size);
+int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size);
 bool btstack_select_codec_dir(const char *address, bool receiving, const char *codec);
 
-// The PCM's volume word, both channels and their mute bits together. Carried
+// The PCM's channel levels and their mute bits together. Carried
 // whole across a codec change: the new PCM starts at bluealsa's default and
 // nothing resends what the other end had already set.
-bool btstack_pcm_volume_get(const char *address, bool receiving, int *out);
-bool btstack_pcm_volume_set(const char *address, bool receiving, int volume);
+bool btstack_pcm_volume_get(const char *address, bool receiving, bapcm_volume_t *out);
+bool btstack_pcm_volume_set(const char *address, bool receiving, const bapcm_volume_t *volume);
 bool btstack_select_codec(const char *address, const char *codec);
+
+// The sampling rates `codec` can run at between this player and the
+// headphones at `address` (bluealsa 4.3's SupportedSampling, already the
+// overlap of both ends), up to `max` of them. 0 when bluealsa does not say.
+int btstack_codec_rates(const char *address, const char *codec, unsigned *out, int max);
+
+// The same codec, or another, at one given rate: SelectCodec with a
+// "Sampling" property, and for LDAC also the configuration blob older daemons
+// need (btrate.h). A rebuild of the transport like any codec change, without
+// restarting bluealsa. False when bluealsa or the headphones refuse it; the
+// stream then stays as it was.
+bool btstack_select_codec_rate(const char *address, const char *codec, unsigned rate);
 
 // One line describing the audio path bluealsa has actually built: the codec it
 // negotiated, and the rate, channel count and sample width it is encoding from.

@@ -5,13 +5,32 @@
 #include "src/gui/shell/gui.h"
 
 void switch_screen(lv_obj_t *target_screen);
-void screen_history_reset(void); // forget the back-stack (back goes to the menu)
+void screen_history_reset(void);						// forget the back-stack (back goes to the menu)
 void switch_screen_no_history(lv_obj_t *target_screen); // load without recording
-void switch_screen_return_to(lv_obj_t *target_screen); // discard newer history and load
+void switch_screen_return_to(lv_obj_t *target_screen);	// discard newer history and load
 
-// Attach the interactive swipe-back to a page surface (a screen or scrollable
-// list/container that swallows presses). It starts at the left edge; the page
-// follows the finger rightward and shows the previous page underneath.
+// Session-only browsing context, separate from the confirmed playback source.
+// Bind long-lived catalog pages; restores their existing state and Back path.
+// No worker, timer, retained media response or persistent write.
+void switcher_browse_bind(const char *source, lv_obj_t *screen, lv_obj_t *root);
+bool switcher_browse_open(const char *source);
+// Start a content deep link at its catalog root, not at the player's opener.
+bool switcher_browse_begin(const char *source);
+void switcher_browse_forget(const char *source);
+// True for a remembered page, optionally replacing the default subtitle.
+bool switcher_browse_description(const char *source, char *out, size_t size);
+
+// The swipe back (2.0): a rightward drag that starts in the SX_EDGE_BACK_W
+// strip along the left edge of any page follows the finger over a snapshot of
+// the page below and goes back when let go past SX_EDGE_BACK_PX. Read from
+// the touch panel itself: main.c hands the pointer device over once, and no
+// page has to do anything. A tap in the strip is still a tap on what is there.
+void switcher_edge_back_attach(lv_indev_t *indev);
+
+// Before 2.0 this gave a page surface the swipe back, which started anywhere
+// on it; the edge strip now covers every page, and the content's own sideways
+// drags (a list row's queue actions) are left to the content. Kept, and still
+// makes `obj` clickable, so that no page has to change.
 void switcher_attach_back_gesture(lv_obj_t *screen);
 
 // True during (and for the tap at the end of) a swipe-back drag. Click
@@ -19,7 +38,17 @@ void switcher_attach_back_gesture(lv_obj_t *screen);
 // or button it happens to land on -- the same contract as
 // player_sheet_drag_active().
 bool switcher_back_drag_active(void);
+
+// True while a page slides in (SX_ANIM_NAV_MS after switch_screen() or a step
+// back): both pages are drawn and no touch is read. Page changes slide
+// forward from the right and back from the left; lv_screen_active() is the
+// new page from the moment the call returns, and the old page hears
+// LV_EVENT_SCREEN_UNLOADED only once it is off screen.
+bool switcher_nav_anim_running(void);
 void back_btn_cb(lv_event_t *e);
+// Ordinary tap goes Back; a stationary hold goes Home outside the player.
+// Uses the same guarded handler for the global and album chevrons.
+void switcher_bind_back_button(lv_obj_t *button);
 void switch_screen_cb(lv_event_t *e);
 void back_btn_init(gui_config_t *cfg);
 
@@ -57,9 +86,12 @@ void back_btn_over_cover(bool over_cover);
 void back_btn_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t color);
 
 // Horizontal offset for the chevron, so it can ride whatever is being
-// dragged (the player sheet's slide uses it; the page swipe-back does its
-// own). 0 puts it back in place.
+// dragged (the page swipe-back does its own). 0 puts it back in place.
 void back_btn_translate(int32_t x);
+
+// The same downwards: the player sheet's chevron rides the sheet as it is
+// pulled down and put away.
+void back_btn_translate_y(int32_t y);
 
 // Where the chevron's middle sits while the player is open, from the top of the
 // screen. For a page that wants to put something of its own on the same line as
@@ -84,6 +116,13 @@ void back_btn_force_hidden(bool hidden);
 // chevron. Pass false with the same screen to put it back; a call naming a
 // different screen than the one recorded leaves the record alone.
 void back_btn_hide_on_screen(lv_obj_t *screen, bool hidden);
+
+// Hides the chevron while `screen` is the page on screen, for a page that
+// draws a back button of its own (the album page's floating one over its
+// gradient). Unlike back_btn_hide_on_screen() the page still has the way back
+// the chevron stands for, so the swipe from the left edge goes back there as
+// on any page. Pass false with the same screen to put the chevron back.
+void back_btn_own_on_screen(lv_obj_t *screen, bool own);
 
 // Suspends the drag-to-go-back gesture. For a page that owns the whole panel
 // and needs horizontal touch for itself: a Lua app running full screen, where

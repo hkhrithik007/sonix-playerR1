@@ -36,7 +36,7 @@
 // The name of this model's update file without ".upt": [firmware] name in
 // the config when set, otherwise the model table's update_stem ("r3proii",
 // "r1"). NULL when system-info.json names no model this build knows.
-const char *firmware_update_stem(void);
+const char *firmware_update_stem(char *buffer, size_t size);
 
 // Looks for the update file on the card. Returns true and fills `out` with its
 // full path when one is there. The name must be the device's own --
@@ -44,7 +44,16 @@ const char *firmware_update_stem(void);
 // accepted, "update.upt" included.
 bool firmware_update_file_find(char *out, size_t out_size);
 
-// Arms recovery and reboots into it. Does not return on the device.
+typedef enum {
+	FIRMWARE_UPDATE_SIMULATED,
+	FIRMWARE_UPDATE_PREPARE_FAILED,
+	FIRMWARE_UPDATE_BOOTMODE_UNCERTAIN,
+} firmware_update_result_t;
+
+// Arms recovery only after checked card release. Returns on a preparation
+// failure (restoring card services), or on the host without changing anything.
+// An uncertain selector failure must not trigger any automatic reboot.
+// Recovery repair is optional; ordinary updates neither inspect nor patch it.
 //
 // Stops playback and flushes the filesystems first: the card is about to be
 // read by the recovery kernel, and an unflushed write on it is how a good
@@ -52,6 +61,6 @@ bool firmware_update_file_find(char *out, size_t out_size);
 //
 // A no-op that only logs on the host build -- writing to /dev/mtd5 on the
 // developer's own machine is not a mistake worth being able to make.
-void firmware_update_start(void);
+firmware_update_result_t firmware_update_start(void);
 
 #endif /* FIRMWARE_H */

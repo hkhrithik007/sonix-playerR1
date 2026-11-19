@@ -2,12 +2,12 @@
 #define EQ_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // A 10-band graphic equalizer applied in software to the decoded PCM, the
 // same shape as the stock player's "geq_band_gain" (10 bands): peaking
-// biquads at the standard octave centres, +/-12 dB per band in half-dB steps,
-// of one of three widths.
+// biquads at the standard octave centres, +/-12 dB per band.
 //
 // The UI thread sets gains; the audio thread calls eq_process() on every
 // buffer and quietly rebuilds its filter state when something changed.
@@ -15,10 +15,6 @@
 #define EQ_BANDS 10
 #define EQ_GAIN_MIN_DB (-12)
 #define EQ_GAIN_MAX_DB 12
-#define EQ_STEP_TENTHS 5
-
-// How wide each band reaches into its neighbours. [eq] width.
-enum { EQ_WIDTH_WIDE, EQ_WIDTH_NORMAL, EQ_WIDTH_NARROW, EQ_WIDTHS };
 
 // Loads enabled + band gains from the config. Call once at boot, before
 // playback can start.
@@ -27,21 +23,10 @@ void eq_init(void);
 void eq_set_enabled(bool enabled); // saved to config
 bool eq_get_enabled(void);
 
-void eq_set_band(int band, int gain_db); // whole dB, clamped, saved to config
-
-// Tenths of a dB, clamped and rounded to EQ_STEP_TENTHS. The setter does not
-// write the file: eq_save() does, when a finger lifts.
-void eq_set_band_tenths(int band, int tenths);
-int eq_get_band_tenths(int band);
-void eq_save(void);
-
-void eq_set_width(int width); // saved to config
-int eq_get_width(void);
-
-// The graphic equaliser's response at each of `count` frequencies in `freqs`
-// (Hz), into `out_tenths` in tenths of a dB, as the engine builds it at
-// `sample_rate`: the curve the page draws.
-void eq_response_curve(const int *freqs, int count, int sample_rate, int *out_tenths);
+// Dragging updates DSP and RAM immediately; release commits config once.
+void eq_adjust_band(int band, int gain_db);
+void eq_set_band(int band, int gain_db); // clamped, saved to config
+int eq_get_band(int band);
 
 // Every band back to 0 dB.
 void eq_reset(void);
@@ -143,6 +128,13 @@ void peq_reset(void);
 // pre-gain is left alone -- it belongs to the chain, not to the band.
 void peq_reset_band(int index);
 
+// The preset the PEQ bands were last loaded from or saved as, or "" once they
+// have been edited by hand since. Kept across restarts. UI thread.
+const char *peq_current_preset(void);
+// For a preset that reached the card under another name (the AutoEq download
+// is loaded from a staging file and then renamed).
+void peq_set_preset_name(const char *name);
+
 // Parametric presets: Equalizer APO text files, the ParametricEQ.txt AutoEq
 // publishes for every headphone, one per name in <card>/PEQ. A preset saved
 // here is written in the same form, so it opens in APO too. Setting the
@@ -157,6 +149,15 @@ void peq_reset_band(int index);
 void peq_presets_set_dir(const char *sd_root);
 bool peq_preset_save(const char *name);
 bool peq_preset_load(const char *name, int *ignored);
+typedef struct {
+	peq_band_t bands[PEQ_BANDS];
+	int preamp_tenths, ignored;
+} peq_preset_data_t;
+// Pure bounded-text parse; assigns out only on success. No live settings or I/O.
+bool peq_preset_parse_text(const char *text, size_t length, peq_preset_data_t *out);
+// GUI-only application, without reopening a preset path. Config-save failures
+// retain applied RAM settings and dirty-config retry semantics as normal load.
+bool peq_preset_apply_parsed(const char *name, const peq_preset_data_t *data, bool enabled);
 bool peq_preset_delete(const char *name);
 typedef bool (*peq_preset_name_cb_t)(const char *name, void *user);
 int peq_preset_for_each(peq_preset_name_cb_t cb, void *user);

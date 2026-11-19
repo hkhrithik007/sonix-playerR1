@@ -20,7 +20,42 @@ typedef struct {
 #define VOLUME_WARN_PERCENT 55
 #define VOLUME_WARN_COLOR lv_color_make(224, 60, 50)
 
-void gui_init(gui_config_t *cfg);
+// Builds the interface. UI thread, once.
+//
+// With `split`, only what the first frame shows is built -- the theme, the
+// status bar, the home screen -- and true is returned: the caller paints that
+// frame and then calls gui_init_rest() for the hundred-odd other pages, before
+// entering the main loop. False means everything was built here, which is what
+// happens without `split` and on a first boot (whose first frame is the
+// greeting, built last).
+bool gui_init(gui_config_t *cfg, bool split);
+
+// Builds whatever gui_init() left for after the first frame; nothing when that
+// is done. Also called, as a safety net, by navigation and by the gui_post
+// drain, so no page is ever shown or updated before it exists.
+void gui_init_rest(void);
+
+// Pages built on first use. UI thread only, like everything that touches LVGL.
+//
+// A page that is rarely opened -- a settings sub-page, the process list, the
+// radio directory -- does not have to hold its few hundred objects from boot
+// on. Its module's *_init() then only creates (or is handed) its empty screen
+// and registers `build` here against it; the screen pointer is valid from the
+// start, so every row, tile and back-stack entry that points at it keeps
+// working, and the switcher calls gui_page_ensure() on every screen it is about
+// to load, which runs `build` the first time and is a short scan after that.
+//
+// What a deferred page must NOT have: anything outside it that reaches into
+// its widgets (a refresh called from another module, a gui_post callback, a
+// timer or a theme_register_refresh() callback set up before the build) --
+// those would find NULL; the page sets them up in `build` instead. Code of the page's
+// own that has to touch a widget outside a navigation (an *_open() that fills
+// a field and then switches) calls gui_page_ensure() itself first.
+void gui_page_defer(lv_obj_t *screen, void (*build)(gui_config_t *cfg));
+
+// Builds `screen`'s page now if it was deferred and is not built yet; nothing
+// otherwise (NULL included).
+void gui_page_ensure(lv_obj_t *screen);
 
 // The bridge from any thread to the UI thread: `cb(user)` runs on the UI
 // thread within a few tens of milliseconds.
@@ -32,6 +67,11 @@ void gui_init(gui_config_t *cfg);
 // False when the queue was full and the message dropped -- a caller that
 // passed heap memory owns it again and has to free it.
 bool gui_post(void (*cb)(void *), void *user);
+// Consumes a plain malloc payload: callback owns it on success, free on refusal.
+bool gui_post_or_free(void (*cb)(void *), void *user);
+// Reserved, bounded latest-state slots; no owned payloads. Repeated posts to
+// the same callback replace its argument. For completion and volume only.
+bool gui_post_latest(void (*cb)(void *), void *user);
 
 // The descriptor the main loop waits on instead of sleeping on a timer: it
 // becomes readable as soon as something is posted. -1 when it could not be
@@ -45,6 +85,16 @@ int gui_post_wake_fd(void);
 // the queue-draining timer ready so posted work runs on the next pass instead
 // of waiting for its period to elapse.
 void gui_post_service(void);
+
+// GUI thread, once per existing main-loop pass before LVGL/wait. Services the
+// module-owned terminal slots even with full message queues or a blank
+// panel; does not build lazy pages, wake the LCD, or add a timer/worker.
+void gui_service_completions(void);
+
+// GUI thread, idempotent normal process-exit hook. Closes admission and cancels
+// pending module completions without joining disk/network work. This alone
+// does not permit live-process LVGL teardown while detached workers remain.
+void gui_shutdown_completions(void);
 
 void gui_notify_popup(const char *text);
 
@@ -103,6 +153,11 @@ typedef enum {
 	GUI_KEY_PLAY_PAUSE,
 	GUI_KEY_NEXT,
 	GUI_KEY_PREV,
+	// What a remapped side button can also do (keymap.h). Never sent by a
+	// remote: they act on the local player only.
+	GUI_KEY_FAVOURITE,
+	GUI_KEY_NEXT_ALBUM,
+	GUI_KEY_CYCLE_MODE,
 } gui_key_t;
 
 void gui_notify_key(gui_key_t key);

@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <time.h>
 
+#include "src/system/bluetooth/btrate.h"
 #include "src/system/bluetooth/dbuslite.h"
 
 #define BLUEZ_SERVICE "org.bluez"
@@ -24,6 +25,7 @@
 #define BALSA_PCM_IFACE "org.bluealsa.PCM1"
 #define BALSA_MANAGER_PATH "/org/bluealsa"
 #define BALSA_MANAGER_IFACE "org.bluealsa.Manager1"
+#define BALSA_RFCOMM_IFACE "org.bluealsa.RFCOMM1"
 
 #define PROPS_IFACE "org.freedesktop.DBus.Properties"
 #define OBJMAN_IFACE "org.freedesktop.DBus.ObjectManager"
@@ -39,11 +41,13 @@
 #define UUID_A2DP_SINK "0000110b-0000-1000-8000-00805f9b34fb"
 #define UUID_A2DP_SOURCE "0000110a-0000-1000-8000-00805f9b34fb"
 
-#define CALL_MS 8000		// anything that is not pairing or connecting
+#define CALL_MS 8000 // anything that is not pairing or connecting
 #define OBJECT_PATH_MAX 160
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static dbus_conn_t *conn;
+static bool service_changed; // sticky until the worker installs a new connection
+static bool bluez_changed;	 // retain ACL provenance across retirement
 static void (*change_cb)(void);
 
 // The addresses bluealsa currently has an A2DP source PCM for. More than one
@@ -51,6 +55,15 @@ static void (*change_cb)(void);
 #define MAX_PCMS 4
 static char pcm_addr[MAX_PCMS][BT_ADDR_MAX];
 static int pcm_count;
+
+// Live encoded rates, not negotiated PCM rates or configured quality presets.
+// The signal reader owns updates; UI readers only copy these bounded entries.
+static struct {
+	char address[BT_ADDR_MAX];
+	unsigned bitrate;
+} pcm_bitrates[MAX_PCMS];
+static int pcm_bitrate_count;
+static unsigned pcm_bitrate_serial;
 
 // The same list for the other direction: devices streaming into this one.
 static char rx_addr[MAX_PCMS][BT_ADDR_MAX];
@@ -70,12 +83,88 @@ static transport_t transports[MAX_TRANSPORTS];
 static int transport_count;
 static unsigned transport_serial;
 
+// Moves every time bluealsa exports an A2DP sink stream object: a new
+// connection, the stream coming back after a restart of the daemon or after a
+// wake, and every codec or rate change (bluealsa makes those by building a new
+// transport). Under `lock`.
+static unsigned sink_serial;
+
+// The headsets' own battery levels, as bluealsa's RFCOMM objects carry them:
+//
+//     /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/rfcomm   org.bluealsa.RFCOMM1
+//
+// Such an object exists only with bluealsa started as a hands-free audio
+// gateway (-p hfp-ag, the opt-in "headphone battery" setting), and its Battery
+// property only means something once the headset has said: through Apple's
+// +IPHONEACCEV after an AT+XAPL, which most headsets send whatever phone they
+// are paired with. Until then bluealsa holds -1 there, which arrives as the
+// byte 255. Filled from signals and from one Get at connection; -1 = unknown.
+typedef struct {
+	char address[BT_ADDR_MAX];
+	int percent;
+} headset_battery_t;
+static headset_battery_t headset_batteries[MAX_PCMS];
+static int headset_battery_count;
+static unsigned headset_battery_serial;
+
 // What the remote player last said it was doing: "playing", "paused",
 // "stopped", or empty when nothing has said. Written both by the signal and by
 // the worker's own reading of the property.
 static char media_status[32];
 static btstack_track_t media_track;
 static unsigned media_track_serial;
+
+// Paths belong to the worker, unlike the caches the reader updates below.
+static char media_player_path[OBJECT_PATH_MAX];
+static char media_player_address[BT_ADDR_MAX];
+
+// The caller holds lock. No callback, RPC or disconnect is allowed here.
+static void invalidate_caches_locked(void) {
+	pcm_count = rx_count = transport_count = headset_battery_count = 0;
+	pcm_bitrate_count = 0;
+	pcm_bitrate_serial++;
+	sink_serial++;
+	transport_serial++;
+	headset_battery_serial++;
+	media_status[0] = '\0';
+	memset(&media_track, 0, sizeof(media_track));
+	media_track_serial++;
+}
+
+static dbus_conn_t *current_connection(void) {
+	pthread_mutex_lock(&lock);
+	dbus_conn_t *c = service_changed ? NULL : conn;
+	pthread_mutex_unlock(&lock);
+	return c;
+}
+
+static bool connection_current(dbus_conn_t *c) {
+	pthread_mutex_lock(&lock);
+	bool current = c && c == conn && !service_changed;
+	pthread_mutex_unlock(&lock);
+	return current;
+}
+
+// Always send/finish the existing call so dbuslite releases its write lock.
+// A reply from the retired service cannot become a successful new operation.
+static bool stack_call_send(dbus_conn_t *c, int timeout, char *error, size_t error_size) {
+	bool ok = dbus_call_send(c, timeout, error, error_size);
+	if (!connection_current(c)) {
+		if (error && error_size)
+			snprintf(error, error_size, "org.freedesktop.DBus.Error.Disconnected");
+		return false;
+	}
+	return ok;
+}
+
+// Returns with lock held only for the current incarnation.
+static bool lock_current(dbus_conn_t *c) {
+	pthread_mutex_lock(&lock);
+	if (c && c == conn && !service_changed)
+		return true;
+	pthread_mutex_unlock(&lock);
+	return false;
+}
 
 // One a{sv} of AVRCP track metadata into `out`. Every key the player does not
 // use is stepped over by signature, the way the device properties are read.
@@ -111,6 +200,16 @@ static void read_track_props(dbus_reader_t *r, btstack_track_t *out) {
 // moved every time would have the page redrawing for nothing.
 static void store_track(const btstack_track_t *fresh) {
 	pthread_mutex_lock(&lock);
+	if (memcmp(&media_track, fresh, sizeof(media_track)) != 0) {
+		media_track = *fresh;
+		media_track_serial++;
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+static void store_track_current(dbus_conn_t *c, const btstack_track_t *fresh) {
+	if (!lock_current(c))
+		return;
 	if (memcmp(&media_track, fresh, sizeof(media_track)) != 0) {
 		media_track = *fresh;
 		media_track_serial++;
@@ -178,9 +277,7 @@ static bool pcm_path_dir(const char *address, bool receiving, char *out, size_t 
 	return true;
 }
 
-static bool pcm_path(const char *address, char *out, size_t size) {
-	return pcm_path_dir(address, false, out, size);
-}
+static bool pcm_path(const char *address, char *out, size_t size) { return pcm_path_dir(address, false, out, size); }
 
 // ..../dev_AA_BB_CC_DD_EE_FF/.... -> AA:BB:CC:DD:EE:FF
 static bool address_from_path(const char *path, char *out, size_t size) {
@@ -208,9 +305,7 @@ static bool address_from_path(const char *path, char *out, size_t size) {
 	return true;
 }
 
-static bool path_is_transport(const char *path) {
-	return strncmp(path, "/org/bluez/", 11) == 0 && strstr(path, "/dev_") != NULL && strstr(path, "/fd") != NULL;
-}
+static bool path_is_transport(const char *path) { return strncmp(path, "/org/bluez/", 11) == 0 && strstr(path, "/dev_") != NULL && strstr(path, "/fd") != NULL; }
 
 // Under `lock`.
 static void transport_note(const char *path, const char *state) {
@@ -244,6 +339,13 @@ static void transport_forget(const char *path) {
 			return;
 		}
 	}
+}
+
+unsigned btstack_sink_serial(void) {
+	pthread_mutex_lock(&lock);
+	unsigned serial = sink_serial;
+	pthread_mutex_unlock(&lock);
+	return serial;
 }
 
 int btstack_transport_sending(const char *address, unsigned *serial_out) {
@@ -317,12 +419,236 @@ static bool read_transport_state(dbus_reader_t *r, char *state, size_t size) {
 // the cache of bluealsa PCM objects
 // ---------------------------------------------------------------------------
 
-static bool path_is_a2dp_sink(const char *path) {
-	return strncmp(path, "/org/bluealsa/", 14) == 0 && strstr(path, "/a2dpsrc/sink") != NULL;
+static bool path_is_a2dp_sink(const char *path) { return strncmp(path, "/org/bluealsa/", 14) == 0 && strstr(path, "/a2dpsrc/sink") != NULL; }
+
+static bool path_is_a2dp_source(const char *path) { return strncmp(path, "/org/bluealsa/", 14) == 0 && strstr(path, "/a2dpsnk/source") != NULL; }
+
+// Caller holds lock. A reset also invalidates in-flight property snapshots.
+static bool pcm_bitrate_registered(const char *address) {
+	for (int i = 0; address && i < pcm_count; i++) {
+		if (!strcasecmp(pcm_addr[i], address))
+			return true;
+	}
+	return false;
 }
 
-static bool path_is_a2dp_source(const char *path) {
-	return strncmp(path, "/org/bluealsa/", 14) == 0 && strstr(path, "/a2dpsnk/source") != NULL;
+static void pcm_bitrate_note(const char *address, unsigned bitrate) {
+	if (!pcm_bitrate_registered(address))
+		return;
+	int i = 0;
+	while (i < pcm_bitrate_count && strcasecmp(pcm_bitrates[i].address, address))
+		i++;
+	if (i == pcm_bitrate_count) {
+		if (pcm_bitrate_count == MAX_PCMS)
+			return;
+		snprintf(pcm_bitrates[i].address, BT_ADDR_MAX, "%s", address);
+		pcm_bitrate_count++;
+	}
+	pcm_bitrates[i].bitrate = bitrate;
+	pcm_bitrate_serial++;
+}
+
+static void pcm_bitrate_forget(const char *address) {
+	for (int i = 0; i < pcm_bitrate_count; i++) {
+		if (!strcasecmp(pcm_bitrates[i].address, address)) {
+			memmove(&pcm_bitrates[i], &pcm_bitrates[i + 1],
+					sizeof(pcm_bitrates[0]) * (size_t)(pcm_bitrate_count - i - 1));
+			pcm_bitrate_count--;
+			break;
+		}
+	}
+	pcm_bitrate_serial++;
+}
+
+unsigned btstack_codec_bitrate(const char *address) {
+	unsigned bitrate = 0;
+	pthread_mutex_lock(&lock);
+	if (conn && !service_changed && pcm_bitrate_registered(address)) {
+		for (int i = 0; i < pcm_bitrate_count; i++) {
+			if (!strcasecmp(pcm_bitrates[i].address, address)) {
+				bitrate = pcm_bitrates[i].bitrate;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return bitrate;
+}
+
+// Consume a PCM PropertiesChanged body after its interface name. Telemetry
+// alone must not wake the routing worker or cause another D-Bus request.
+static bool read_pcm_bitrate(dbus_reader_t *r, unsigned *bitrate, bool *other) {
+	bool found = false;
+	*other = false;
+	dbus_array_iter_t props;
+	if (!dbus_r_array_begin(r, "{sv}", &props))
+		return false;
+	while (dbus_r_array_more(r, &props)) {
+		char key[64], sig[16];
+		if (!dbus_r_string(r, key, sizeof(key)) || !dbus_r_signature(r, sig, sizeof(sig)))
+			return false;
+		if (!strcmp(key, "CodecBitrate") && !strcmp(sig, "u")) {
+			uint32_t value;
+			if (!dbus_r_u32(r, &value))
+				return false;
+			*bitrate = value;
+			found = true;
+		} else {
+			*other = true;
+			if (!dbus_r_skip(r, sig))
+				return false;
+		}
+	}
+	dbus_array_iter_t invalid;
+	if (!dbus_r_array_begin(r, "s", &invalid))
+		return false;
+	while (dbus_r_array_more(r, &invalid)) {
+		char key[64];
+		if (!dbus_r_string(r, key, sizeof(key)))
+			return false;
+		if (!strcmp(key, "CodecBitrate")) {
+			*bitrate = 0;
+			found = true;
+		} else {
+			*other = true;
+		}
+	}
+	return found && !r->bad;
+}
+
+// ---------------------------------------------------------------------------
+// the headsets' battery (see headset_batteries above)
+// ---------------------------------------------------------------------------
+
+static bool path_is_rfcomm(const char *path) {
+	if (strncmp(path, "/org/bluealsa/", 14) != 0) {
+		return false;
+	}
+	size_t length = strlen(path);
+	return length > 7 && strcmp(path + length - 7, "/rfcomm") == 0;
+}
+
+// Under `lock`. -1 forgets the address. Bumps the serial only on a change, so
+// a page polling it redraws when there is something new to draw.
+static void headset_battery_note(const char *address, int percent) {
+	int at = -1;
+	for (int i = 0; i < headset_battery_count && i < MAX_PCMS && at < 0; i++) {
+		if (strcasecmp(headset_batteries[i].address, address) == 0) {
+			at = i;
+		}
+	}
+	if (percent < 0) {
+		if (at >= 0) {
+			headset_batteries[at] = headset_batteries[--headset_battery_count];
+			headset_battery_serial++;
+		}
+		return;
+	}
+	if (at < 0) {
+		if (headset_battery_count >= MAX_PCMS) {
+			at = 0; // four headsets at once is not a case; the oldest makes room
+		} else {
+			at = headset_battery_count++;
+		}
+		snprintf(headset_batteries[at].address, BT_ADDR_MAX, "%s", address);
+		headset_batteries[at].percent = -1;
+	}
+	if (headset_batteries[at].percent != percent) {
+		headset_batteries[at].percent = percent;
+		headset_battery_serial++;
+	}
+}
+
+// One Battery value of signature `sig`. bluealsa 4.3 sends a byte; the wider
+// integer types are taken as well rather than trusted never to appear. Anything
+// outside 0..100 is "not said yet" -- the -1 bluealsa starts from arrives as 255.
+static bool read_battery_value(dbus_reader_t *r, const char *sig, int *percent) {
+	long value = -1;
+	if (strcmp(sig, "y") == 0) {
+		uint8_t b;
+		if (!dbus_r_byte(r, &b)) {
+			return false;
+		}
+		value = b;
+	} else if (strcmp(sig, "n") == 0 || strcmp(sig, "q") == 0) {
+		uint16_t v;
+		if (!dbus_r_u16(r, &v)) {
+			return false;
+		}
+		value = sig[0] == 'n' ? (int16_t)v : v;
+	} else if (strcmp(sig, "i") == 0 || strcmp(sig, "u") == 0) {
+		uint32_t v;
+		if (!dbus_r_u32(r, &v)) {
+			return false;
+		}
+		value = sig[0] == 'i' ? (int32_t)v : (long)v;
+	} else {
+		dbus_r_skip(r, sig);
+		return false;
+	}
+	*percent = value >= 0 && value <= 100 ? (int)value : -1;
+	return true;
+}
+
+// The Battery inside one a{sv} of RFCOMM1 properties. False when it is not
+// there, which is not the same as there and unknown (true, -1).
+static bool read_rfcomm_props(dbus_reader_t *r, int *percent) {
+	bool found = false;
+	dbus_array_iter_t props;
+	if (!dbus_r_array_begin(r, "{sv}", &props)) {
+		return false;
+	}
+	while (dbus_r_array_more(r, &props)) {
+		char key[64], sig[16];
+		if (!dbus_r_string(r, key, sizeof(key)) || !dbus_r_signature(r, sig, sizeof(sig))) {
+			return found;
+		}
+		if (strcmp(key, "Battery") == 0) {
+			found = read_battery_value(r, sig, percent);
+		} else if (!dbus_r_skip(r, sig)) {
+			return found;
+		}
+	}
+	return found;
+}
+
+// The same out of an interfaces dictionary, a{sa{sv}}, as InterfacesAdded and
+// GetManagedObjects carry it.
+static bool read_rfcomm_added(dbus_reader_t *r, int *percent) {
+	bool found = false;
+	dbus_array_iter_t interfaces;
+	if (!dbus_r_array_begin(r, "{sa{sv}}", &interfaces)) {
+		return false;
+	}
+	while (dbus_r_array_more(r, &interfaces)) {
+		char iface[96];
+		if (!dbus_r_string(r, iface, sizeof(iface))) {
+			return found;
+		}
+		if (strcmp(iface, BALSA_RFCOMM_IFACE) == 0) {
+			found = read_rfcomm_props(r, percent) || found;
+		} else if (!dbus_r_skip(r, "a{sv}")) {
+			return found;
+		}
+	}
+	return found;
+}
+
+int btstack_headset_battery(const char *address, unsigned *serial_out) {
+	int percent = -1;
+	pthread_mutex_lock(&lock);
+	// Bounded by the array as well as the count: the compiler cannot see that
+	// the count never passes it, and warns about a read beyond the end.
+	for (int i = 0; address && i < headset_battery_count && i < MAX_PCMS; i++) {
+		if (strcasecmp(headset_batteries[i].address, address) == 0) {
+			percent = headset_batteries[i].percent;
+		}
+	}
+	if (serial_out) {
+		*serial_out = headset_battery_serial;
+	}
+	pthread_mutex_unlock(&lock);
+	return percent;
 }
 
 // Under `lock`.
@@ -453,8 +779,30 @@ static void note_change(void) {
 }
 
 static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
-	(void)c;
 	(void)user;
+
+	if (strcmp(m->member, "NameOwnerChanged") == 0) {
+		if (m->type != DBUS_TYPE_SIGNAL || strcmp(m->sender, "org.freedesktop.DBus") != 0 || strcmp(m->path, "/org/freedesktop/DBus") != 0 || strcmp(m->interface, "org.freedesktop.DBus") != 0 || strcmp(m->signature, "sss") != 0)
+			return;
+		dbus_reader_t r;
+		dbus_reader_init(&r, m);
+		char service[DBUS_NAME_MAX], old_owner[DBUS_NAME_MAX], new_owner[DBUS_NAME_MAX];
+		if (!dbus_r_string(&r, service, sizeof(service)) || !dbus_r_string(&r, old_owner, sizeof(old_owner)) || !dbus_r_string(&r, new_owner, sizeof(new_owner)) || strcmp(old_owner, new_owner) == 0 || (strcmp(service, BLUEZ_SERVICE) != 0 && strcmp(service, BALSA_SERVICE) != 0))
+			return;
+		pthread_mutex_lock(&lock);
+		if (!c || c != conn) {
+			pthread_mutex_unlock(&lock);
+			return;
+		}
+		service_changed = true;
+		bluez_changed |= strcmp(service, BLUEZ_SERVICE) == 0;
+		invalidate_caches_locked();
+		pthread_mutex_unlock(&lock);
+		note_change(); // The reader never waits for its own RPC or joins itself.
+		return;
+	}
+	if (!connection_current(c))
+		return;
 
 	if (strcmp(m->interface, OBJMAN_IFACE) == 0 && strcmp(m->member, "InterfacesAdded") == 0) {
 		dbus_reader_t r;
@@ -466,7 +814,8 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 		if (path_is_transport(path)) {
 			char state[32];
 			if (read_transport_state(&r, state, sizeof(state))) {
-				pthread_mutex_lock(&lock);
+				if (!lock_current(c))
+					return;
 				transport_note(path, state);
 				pthread_mutex_unlock(&lock);
 				const char *leaf = strrchr(path, '/');
@@ -476,13 +825,26 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 			return;
 		}
 		char address[BT_ADDR_MAX];
-		if (path_is_a2dp_sink(path) && address_from_path(path, address, sizeof(address))) {
-			pthread_mutex_lock(&lock);
+		if (path_is_rfcomm(path) && address_from_path(path, address, sizeof(address))) {
+			int percent = -1;
+			if (read_rfcomm_added(&r, &percent)) {
+				if (!lock_current(c))
+					return;
+				headset_battery_note(address, percent);
+				pthread_mutex_unlock(&lock);
+			}
+			fprintf(stderr, "btstack: hands-free link to %s is up (battery %d%%)\n", address, percent);
+		} else if (path_is_a2dp_sink(path) && address_from_path(path, address, sizeof(address))) {
+			if (!lock_current(c))
+				return;
+			pcm_bitrate_forget(address);
 			pcm_add(pcm_addr, &pcm_count, address);
+			sink_serial++;
 			pthread_mutex_unlock(&lock);
 			fprintf(stderr, "btstack: the A2DP sink on %s is ready\n", address);
 		} else if (path_is_a2dp_source(path) && address_from_path(path, address, sizeof(address))) {
-			pthread_mutex_lock(&lock);
+			if (!lock_current(c))
+				return;
 			pcm_add(rx_addr, &rx_count, address);
 			pthread_mutex_unlock(&lock);
 			fprintf(stderr, "btstack: %s is streaming to this device\n", address);
@@ -499,20 +861,29 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 			return;
 		}
 		if (path_is_transport(path)) {
-			pthread_mutex_lock(&lock);
+			if (!lock_current(c))
+				return;
 			transport_forget(path);
 			pthread_mutex_unlock(&lock);
 			note_change();
 			return;
 		}
 		char address[BT_ADDR_MAX];
-		if (path_is_a2dp_sink(path) && address_from_path(path, address, sizeof(address))) {
-			pthread_mutex_lock(&lock);
+		if (path_is_rfcomm(path) && address_from_path(path, address, sizeof(address))) {
+			if (!lock_current(c))
+				return;
+			headset_battery_note(address, -1);
+			pthread_mutex_unlock(&lock);
+		} else if (path_is_a2dp_sink(path) && address_from_path(path, address, sizeof(address))) {
+			if (!lock_current(c))
+				return;
+			pcm_bitrate_forget(address);
 			pcm_remove(pcm_addr, &pcm_count, address);
 			pthread_mutex_unlock(&lock);
 			fprintf(stderr, "btstack: the A2DP sink on %s is gone\n", address);
 		} else if (path_is_a2dp_source(path) && address_from_path(path, address, sizeof(address))) {
-			pthread_mutex_lock(&lock);
+			if (!lock_current(c))
+				return;
 			pcm_remove(rx_addr, &rx_count, address);
 			pthread_mutex_unlock(&lock);
 			fprintf(stderr, "btstack: %s has stopped streaming to this device\n", address);
@@ -536,6 +907,19 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 		if (!dbus_r_string(&r, iface, sizeof(iface))) {
 			return;
 		}
+		if (!strcmp(iface, BALSA_PCM_IFACE) && path_is_a2dp_sink(m->path)) {
+			char address[BT_ADDR_MAX];
+			unsigned bitrate = 0;
+			bool other;
+			if (address_from_path(m->path, address, sizeof(address)) && read_pcm_bitrate(&r, &bitrate, &other)) {
+				if (!lock_current(c))
+					return;
+				pcm_bitrate_note(address, bitrate);
+				pthread_mutex_unlock(&lock);
+				if (!other)
+					return;
+			}
+		}
 
 		if (strcmp(iface, BLUEZ_TRANSPORT_IFACE) == 0) {
 			dbus_array_iter_t props;
@@ -548,7 +932,8 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 					if (strcmp(key, "State") == 0 && strcmp(sig, "s") == 0) {
 						char state[32];
 						if (dbus_r_string(&r, state, sizeof(state))) {
-							pthread_mutex_lock(&lock);
+							if (!lock_current(c))
+								return;
 							transport_note(m->path, state);
 							pthread_mutex_unlock(&lock);
 							const char *leaf = strrchr(m->path, '/');
@@ -558,6 +943,21 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 						break;
 					}
 				}
+			}
+		}
+
+		// A headset's battery, from bluealsa's hands-free side: the level
+		// moves a step at a time while the music plays, and each step is one
+		// of these.
+		char address[BT_ADDR_MAX];
+		if (strcmp(iface, BALSA_RFCOMM_IFACE) == 0 && path_is_rfcomm(m->path) && address_from_path(m->path, address, sizeof(address))) {
+			int percent = -1;
+			if (read_rfcomm_props(&r, &percent)) {
+				if (!lock_current(c))
+					return;
+				headset_battery_note(address, percent);
+				pthread_mutex_unlock(&lock);
+				fprintf(stderr, "btstack: %s battery %d%%\n", address, percent);
 			}
 		}
 
@@ -577,7 +977,8 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 					if (strcmp(key, "Status") == 0 && strcmp(sig, "s") == 0) {
 						char status[32];
 						if (dbus_r_string(&r, status, sizeof(status))) {
-							pthread_mutex_lock(&lock);
+							if (!lock_current(c))
+								return;
 							snprintf(media_status, sizeof(media_status), "%s", status);
 							pthread_mutex_unlock(&lock);
 							fprintf(stderr, "btstack: the remote player is %s\n", status);
@@ -589,7 +990,7 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 						btstack_track_t fresh;
 						memset(&fresh, 0, sizeof(fresh));
 						read_track_props(&r, &fresh);
-						store_track(&fresh);
+						store_track_current(c, &fresh);
 					} else if (!dbus_r_skip(&r, sig)) {
 						break;
 					}
@@ -629,9 +1030,7 @@ static void on_call(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 
 	// Everything that is answered by simply agreeing. An empty reply is what
 	// bluez reads as "accepted".
-	if (strcmp(m->member, "Release") == 0 || strcmp(m->member, "Cancel") == 0 ||
-		strcmp(m->member, "RequestConfirmation") == 0 || strcmp(m->member, "RequestAuthorization") == 0 ||
-		strcmp(m->member, "DisplayPasskey") == 0 || strcmp(m->member, "DisplayPinCode") == 0) {
+	if (strcmp(m->member, "Release") == 0 || strcmp(m->member, "Cancel") == 0 || strcmp(m->member, "RequestConfirmation") == 0 || strcmp(m->member, "RequestAuthorization") == 0 || strcmp(m->member, "DisplayPasskey") == 0 || strcmp(m->member, "DisplayPinCode") == 0) {
 		fprintf(stderr, "btstack: agent %s -> accepted\n", m->member);
 		dbus_reply_begin(c, m, "");
 		dbus_reply_send(c);
@@ -672,20 +1071,17 @@ static void on_call(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 
 // A call with no arguments. The error, when there is one, is logged here and
 // also handed back in `err_out` (empty for a call that got no reply at all).
-static bool call_ok_why(const char *destination, const char *path, const char *interface, const char *member,
-						int timeout_ms, char *err_out, size_t err_size) {
+static bool call_ok_why(const char *destination, const char *path, const char *interface, const char *member, int timeout_ms, char *err_out, size_t err_size) {
 	if (err_out && err_size) {
 		err_out[0] = '\0';
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
 	dbus_call_begin(c, destination, path, interface, member, "");
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, timeout_ms, err, sizeof(err));
+	bool ok = stack_call_send(c, timeout_ms, err, sizeof(err));
 	if (!ok) {
 		fprintf(stderr, "btstack: %s.%s -> %s\n", interface, member, err[0] ? err : "no reply");
 		if (err_out && err_size) {
@@ -695,33 +1091,27 @@ static bool call_ok_why(const char *destination, const char *path, const char *i
 	return ok;
 }
 
-static bool call_ok(const char *destination, const char *path, const char *interface, const char *member,
-					int timeout_ms) {
-	return call_ok_why(destination, path, interface, member, timeout_ms, NULL, 0);
-}
+static bool call_ok(const char *destination, const char *path, const char *interface, const char *member, int timeout_ms) { return call_ok_why(destination, path, interface, member, timeout_ms, NULL, 0); }
 
 bool btstack_service_ready(const char *name) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !name) {
 		return false;
 	}
-	dbus_writer_t *w =
-		dbus_call_begin(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s");
+	dbus_writer_t *w = dbus_call_begin(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s");
 	dbus_w_string(w, name);
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 	dbus_reader_t r;
 	dbus_reply_reader(c, &r);
 	bool owned = false;
-	return dbus_r_bool(&r, &owned) && owned;
+	return dbus_r_bool(&r, &owned) && owned && connection_current(c);
 }
 
 bool btstack_wait_service(const char *name, int timeout_ms) {
 	for (int waited = 0;; waited += 100) {
-		if (btstack_service_ready(name)) {
+		if (btstack_open() && btstack_service_ready(name)) {
 			return true;
 		}
 		if (waited >= timeout_ms) {
@@ -736,7 +1126,7 @@ static bool register_agent(dbus_conn_t *c) {
 	dbus_w_path(w, AGENT_PATH);
 	dbus_w_string(w, AGENT_CAPABILITY);
 	char err[DBUS_NAME_MAX];
-	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
 		// AlreadyExists is not a failure: a previous run of this player left the
 		// registration behind and it is still ours.
 		if (strstr(err, "AlreadyExists") == NULL) {
@@ -745,34 +1135,31 @@ static bool register_agent(dbus_conn_t *c) {
 		}
 	}
 
+	if (!connection_current(c))
+		return false;
 	w = dbus_call_begin(c, BLUEZ_SERVICE, BLUEZ_ROOT, BLUEZ_AGENT_MANAGER_IFACE, "RequestDefaultAgent", "o");
 	dbus_w_path(w, AGENT_PATH);
-	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
 		fprintf(stderr, "btstack: RequestDefaultAgent refused: %s\n", err[0] ? err : "no reply");
 		return false;
 	}
 
 	fprintf(stderr, "btstack: agent registered at %s\n", AGENT_PATH);
-	return true;
+	return connection_current(c);
 }
 
 bool btstack_register_agent(void) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	return c && register_agent(c);
 }
 
 static const char *const MATCHES[] = {
-	"type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'",
-	"type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
-	"type='signal',sender='org.bluealsa',interface='org.freedesktop.DBus.ObjectManager'",
-	"type='signal',sender='org.bluealsa',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+	"type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'", "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluealsa'", "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'", "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'", "type='signal',sender='org.bluealsa',interface='org.freedesktop.DBus.ObjectManager'", "type='signal',sender='org.bluealsa',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
 };
 
 bool btstack_open(void) {
 	pthread_mutex_lock(&lock);
-	bool already = conn && dbus_alive(conn);
+	bool already = conn && !service_changed && dbus_alive(conn);
 	pthread_mutex_unlock(&lock);
 	if (already) {
 		return true;
@@ -783,16 +1170,25 @@ bool btstack_open(void) {
 	if (!c) {
 		return false;
 	}
-	dbus_set_signal_handler(c, on_signal, NULL);
-	for (size_t i = 0; i < sizeof(MATCHES) / sizeof(MATCHES[0]); i++) {
-		// A rule naming a service that is not on the bus yet is still accepted:
-		// dbus-daemon matches on the name, not on who owns it today.
-		dbus_add_match(c, MATCHES[i]);
-	}
-
+	// Publish before subscriptions: a loss during AddMatch must remain sticky.
 	pthread_mutex_lock(&lock);
 	conn = c;
+	service_changed = false;
+	bluez_changed = false;
 	pthread_mutex_unlock(&lock);
+	dbus_set_signal_handler(c, on_signal, NULL);
+	for (size_t i = 0; i < sizeof(MATCHES) / sizeof(MATCHES[0]); i++) {
+		if (!dbus_add_match(c, MATCHES[i]) || !connection_current(c)) {
+			pthread_mutex_lock(&lock);
+			if (conn == c) {
+				service_changed = true;
+				invalidate_caches_locked();
+			}
+			pthread_mutex_unlock(&lock);
+			return false;
+		}
+	}
+
 	return true;
 }
 
@@ -800,16 +1196,34 @@ void btstack_close(void) {
 	pthread_mutex_lock(&lock);
 	dbus_conn_t *c = conn;
 	conn = NULL;
-	pcm_count = 0;
+	if (c && !dbus_alive(c))
+		bluez_changed = true; // A dead bus has no valid ACL snapshot.
+	service_changed = true;
+	invalidate_caches_locked();
 	pthread_mutex_unlock(&lock);
-	if (c) {
-		dbus_disconnect(c);
-	}
+	if (c)
+		dbus_disconnect(c); // Worker only; joins the old reader before reuse.
+	media_player_path[0] = '\0';
+	media_player_address[0] = '\0';
+}
+
+bool btstack_rebind_needed(void) {
+	pthread_mutex_lock(&lock);
+	bool needed = service_changed; // Includes a reader callback still retiring during close/join.
+	pthread_mutex_unlock(&lock);
+	return needed;
+}
+
+bool btstack_bluez_rebind_needed(void) {
+	pthread_mutex_lock(&lock);
+	bool changed = bluez_changed || (conn && !dbus_alive(conn));
+	pthread_mutex_unlock(&lock);
+	return changed;
 }
 
 bool btstack_alive(void) {
 	pthread_mutex_lock(&lock);
-	bool live = conn && dbus_alive(conn);
+	bool live = conn && !service_changed && dbus_alive(conn);
 	pthread_mutex_unlock(&lock);
 	return live;
 }
@@ -825,9 +1239,7 @@ void btstack_set_change_cb(void (*cb)(void)) {
 // ---------------------------------------------------------------------------
 
 static bool set_bool_property(const char *path, const char *interface, const char *name, bool value) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
@@ -836,18 +1248,15 @@ static bool set_bool_property(const char *path, const char *interface, const cha
 	dbus_w_string(w, name);
 	dbus_w_variant_bool(w, value);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, CALL_MS, err, sizeof(err));
+	bool ok = stack_call_send(c, CALL_MS, err, sizeof(err));
 	if (!ok) {
-		fprintf(stderr, "btstack: %s = %s refused: %s\n", name, value ? "true" : "false",
-				err[0] ? err : "no reply");
+		fprintf(stderr, "btstack: %s = %s refused: %s\n", name, value ? "true" : "false", err[0] ? err : "no reply");
 	}
 	return ok;
 }
 
 static bool set_u32_property(const char *path, const char *interface, const char *name, uint32_t value) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
@@ -856,7 +1265,7 @@ static bool set_u32_property(const char *path, const char *interface, const char
 	dbus_w_string(w, name);
 	dbus_w_variant_u32(w, value);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, CALL_MS, err, sizeof(err));
+	bool ok = stack_call_send(c, CALL_MS, err, sizeof(err));
 	if (!ok) {
 		fprintf(stderr, "btstack: %s = %u refused: %s\n", name, value, err[0] ? err : "no reply");
 	}
@@ -864,16 +1273,14 @@ static bool set_u32_property(const char *path, const char *interface, const char
 }
 
 static bool get_bool_property(const char *path, const char *interface, const char *name, bool *out) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
 	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, PROPS_IFACE, "Get", "ss");
 	dbus_w_string(w, interface);
 	dbus_w_string(w, name);
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 	dbus_reader_t r;
@@ -882,7 +1289,7 @@ static bool get_bool_property(const char *path, const char *interface, const cha
 	if (!dbus_r_signature(&r, sig, sizeof(sig)) || strcmp(sig, "b") != 0) {
 		return false;
 	}
-	return dbus_r_bool(&r, out);
+	return dbus_r_bool(&r, out) && connection_current(c);
 }
 
 bool btstack_adapter_ready(void) {
@@ -894,7 +1301,7 @@ bool btstack_adapter_ready(void) {
 
 bool btstack_wait_adapter(int timeout_ms) {
 	for (int waited = 0;; waited += 200) {
-		if (btstack_adapter_ready()) {
+		if (btstack_open() && btstack_adapter_ready()) {
 			return true;
 		}
 		if (waited >= timeout_ms) {
@@ -904,33 +1311,21 @@ bool btstack_wait_adapter(int timeout_ms) {
 	}
 }
 
-bool btstack_set_powered(bool on) {
-	return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Powered", on);
-}
+bool btstack_set_powered(bool on) { return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Powered", on); }
 
-bool btstack_get_powered(bool *out) {
-	return get_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Powered", out);
-}
+bool btstack_get_powered(bool *out) { return get_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Powered", out); }
 
-bool btstack_set_discoverable(bool on) {
-	return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Discoverable", on);
-}
+bool btstack_set_discoverable(bool on) { return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Discoverable", on); }
 
 // Seconds, and 0 means "until told otherwise". bluez defaults to 180 and turns
 // visibility off by itself when they run out, which from the outside looks like
 // the player disappearing in the middle of a search.
-bool btstack_set_discoverable_timeout(unsigned seconds) {
-	return set_u32_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "DiscoverableTimeout", seconds);
-}
+bool btstack_set_discoverable_timeout(unsigned seconds) { return set_u32_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "DiscoverableTimeout", seconds); }
 
-bool btstack_set_pairable(bool on) {
-	return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Pairable", on);
-}
+bool btstack_set_pairable(bool on) { return set_bool_property(BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "Pairable", on); }
 
 bool btstack_set_alias(const char *alias) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !alias || !alias[0]) {
 		return false;
 	}
@@ -938,20 +1333,17 @@ bool btstack_set_alias(const char *alias) {
 	dbus_w_string(w, BLUEZ_ADAPTER_IFACE);
 	dbus_w_string(w, "Alias");
 	dbus_w_variant_string(w, alias);
-	return dbus_call_send(c, CALL_MS, NULL, 0);
+	return stack_call_send(c, CALL_MS, NULL, 0);
 }
 
 bool btstack_discovery(bool on) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
-	dbus_call_begin(c, BLUEZ_SERVICE, BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, on ? "StartDiscovery" : "StopDiscovery",
-					"");
+	dbus_call_begin(c, BLUEZ_SERVICE, BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, on ? "StartDiscovery" : "StopDiscovery", "");
 	char err[DBUS_NAME_MAX];
-	if (dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (stack_call_send(c, CALL_MS, err, sizeof(err))) {
 		return true;
 	}
 	// Already discovering, or already stopped. Both mean the caller has what it
@@ -970,16 +1362,14 @@ bool btstack_discovery(bool on) {
 // ---------------------------------------------------------------------------
 
 int btstack_devices(btstack_device_t *out, int max) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !out || max <= 0) {
 		return 0;
 	}
 
 	dbus_call_begin(c, BLUEZ_SERVICE, "/", OBJMAN_IFACE, "GetManagedObjects", "");
 	char err[DBUS_NAME_MAX];
-	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
 		fprintf(stderr, "btstack: GetManagedObjects -> %s\n", err[0] ? err : "no reply");
 		return 0;
 	}
@@ -1039,11 +1429,10 @@ int btstack_devices(btstack_device_t *out, int max) {
 	if (r.bad) {
 		fprintf(stderr, "btstack: the GetManagedObjects reply stopped parsing after %d devices\n", count);
 	}
-	return count;
+	return connection_current(c) ? count : 0;
 }
 
-static bool device_call_why(const char *address, const char *member, int timeout_ms, char *err_out,
-							size_t err_size) {
+static bool device_call_why(const char *address, const char *member, int timeout_ms, char *err_out, size_t err_size) {
 	if (err_out && err_size) {
 		err_out[0] = '\0';
 	}
@@ -1055,15 +1444,11 @@ static bool device_call_why(const char *address, const char *member, int timeout
 	return call_ok_why(BLUEZ_SERVICE, path, BLUEZ_DEVICE_IFACE, member, timeout_ms, err_out, err_size);
 }
 
-static bool device_call(const char *address, const char *member, int timeout_ms) {
-	return device_call_why(address, member, timeout_ms, NULL, 0);
-}
+static bool device_call(const char *address, const char *member, int timeout_ms) { return device_call_why(address, member, timeout_ms, NULL, 0); }
 
 bool btstack_pair(const char *address, int timeout_ms) { return device_call(address, "Pair", timeout_ms); }
 
-bool btstack_connect(const char *address, int timeout_ms, char *err_out, size_t err_size) {
-	return device_call_why(address, "Connect", timeout_ms, err_out, err_size);
-}
+bool btstack_connect(const char *address, int timeout_ms, char *err_out, size_t err_size) { return device_call_why(address, "Connect", timeout_ms, err_out, err_size); }
 
 bool btstack_disconnect(const char *address) { return device_call(address, "Disconnect", CALL_MS); }
 
@@ -1072,16 +1457,14 @@ bool btstack_connect_a2dp(const char *address, int timeout_ms) {
 	if (!device_path(address, path, sizeof(path))) {
 		return false;
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
 	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, BLUEZ_DEVICE_IFACE, "ConnectProfile", "s");
 	dbus_w_string(w, UUID_A2DP_SINK);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, timeout_ms, err, sizeof(err));
+	bool ok = stack_call_send(c, timeout_ms, err, sizeof(err));
 	if (!ok) {
 		fprintf(stderr, "btstack: ConnectProfile(A2DP sink) on %s -> %s\n", address, err[0] ? err : "no reply");
 	}
@@ -1093,16 +1476,14 @@ bool btstack_connect_a2dp_source(const char *address, int timeout_ms) {
 	if (!device_path(address, path, sizeof(path))) {
 		return false;
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return false;
 	}
 	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, BLUEZ_DEVICE_IFACE, "ConnectProfile", "s");
 	dbus_w_string(w, UUID_A2DP_SOURCE);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, timeout_ms, err, sizeof(err));
+	bool ok = stack_call_send(c, timeout_ms, err, sizeof(err));
 	if (!ok) {
 		fprintf(stderr, "btstack: ConnectProfile(A2DP source) on %s -> %s\n", address, err[0] ? err : "no reply");
 	}
@@ -1118,9 +1499,7 @@ bool btstack_trust(const char *address, bool on) {
 }
 
 bool btstack_set_device_alias(const char *address, const char *alias) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	char path[OBJECT_PATH_MAX];
 	if (!c || !alias || !device_path(address, path, sizeof(path))) {
 		return false;
@@ -1130,7 +1509,7 @@ bool btstack_set_device_alias(const char *address, const char *alias) {
 	dbus_w_string(w, "Alias");
 	dbus_w_variant_string(w, alias);
 	char err[DBUS_NAME_MAX];
-	if (dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (stack_call_send(c, CALL_MS, err, sizeof(err))) {
 		return true;
 	}
 	fprintf(stderr, "btstack: alias of %s -> %s\n", address, err[0] ? err : "no reply");
@@ -1138,9 +1517,7 @@ bool btstack_set_device_alias(const char *address, const char *alias) {
 }
 
 bool btstack_remove(const char *address) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	char path[OBJECT_PATH_MAX];
 	if (!c || !device_path(address, path, sizeof(path))) {
 		return false;
@@ -1148,7 +1525,7 @@ bool btstack_remove(const char *address) {
 	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, BLUEZ_ADAPTER_PATH, BLUEZ_ADAPTER_IFACE, "RemoveDevice", "o");
 	dbus_w_path(w, path);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, CALL_MS, err, sizeof(err));
+	bool ok = stack_call_send(c, CALL_MS, err, sizeof(err));
 	if (!ok) {
 		// A device bluez does not have is a device that has been forgotten,
 		// which is what the caller wanted.
@@ -1165,20 +1542,21 @@ bool btstack_remove(const char *address) {
 // ---------------------------------------------------------------------------
 
 void btstack_refresh_audio(void) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c) {
 		return;
 	}
 
-	dbus_call_begin(c, BALSA_SERVICE, "/", OBJMAN_IFACE, "GetManagedObjects", "");
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	dbus_call_begin(c, BALSA_SERVICE, BALSA_MANAGER_PATH, OBJMAN_IFACE, "GetManagedObjects", "");
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		// bluealsa not on the bus yet: no PCM can exist, which is exactly what
 		// an empty list says.
-		pthread_mutex_lock(&lock);
+		if (!lock_current(c))
+			return;
 		pcm_count = 0;
 		rx_count = 0;
+		pcm_bitrate_count = 0;
+		pcm_bitrate_serial++;
 		pthread_mutex_unlock(&lock);
 		return;
 	}
@@ -1201,19 +1579,27 @@ void btstack_refresh_audio(void) {
 			char address[BT_ADDR_MAX];
 			if (path_is_a2dp_sink(path) && address_from_path(path, address, sizeof(address)) && count < MAX_PCMS) {
 				snprintf(found[count++], BT_ADDR_MAX, "%s", address);
-			} else if (path_is_a2dp_source(path) && address_from_path(path, address, sizeof(address)) &&
-					   count_rx < MAX_PCMS) {
+			} else if (path_is_a2dp_source(path) && address_from_path(path, address, sizeof(address)) && count_rx < MAX_PCMS) {
 				snprintf(found_rx[count_rx++], BT_ADDR_MAX, "%s", address);
 			}
 		}
 	}
 
-	pthread_mutex_lock(&lock);
+	if (!lock_current(c))
+		return;
 	// %.*s: the compiler cannot see that each row of found[] is terminated,
 	// and warns that an address could run on into the next one.
 	pcm_count = count;
 	for (int i = 0; i < count; i++) {
 		snprintf(pcm_addr[i], BT_ADDR_MAX, "%.*s", BT_ADDR_MAX - 1, found[i]);
+	}
+	// A rescan can discover a removal whose signal was missed. Do not let
+	// obsolete peers occupy the bounded telemetry cache indefinitely.
+	for (int i = 0; i < pcm_bitrate_count;) {
+		if (!pcm_bitrate_registered(pcm_bitrates[i].address))
+			pcm_bitrate_forget(pcm_bitrates[i].address);
+		else
+			i++;
 	}
 	rx_count = count_rx;
 	for (int i = 0; i < count_rx; i++) {
@@ -1222,14 +1608,11 @@ void btstack_refresh_audio(void) {
 	pthread_mutex_unlock(&lock);
 }
 
-int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected,
-					   size_t selected_size) {
+int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size) {
 	if (selected && selected_size) {
 		selected[0] = '\0';
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 
 	char path[OBJECT_PATH_MAX];
 	if (!c || !pcm_path_dir(address, receiving, path, sizeof(path))) {
@@ -1243,7 +1626,7 @@ int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_
 		dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Get", "ss");
 		dbus_w_string(w, BALSA_PCM_IFACE);
 		dbus_w_string(w, "Codec");
-		if (dbus_call_send(c, CALL_MS, NULL, 0)) {
+		if (stack_call_send(c, CALL_MS, NULL, 0)) {
 			dbus_reader_t r;
 			dbus_reply_reader(c, &r);
 			char sig[16];
@@ -1259,7 +1642,9 @@ int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_
 
 	dbus_call_begin(c, BALSA_SERVICE, path, BALSA_PCM_IFACE, "GetCodecs", "");
 	char err[DBUS_NAME_MAX];
-	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
+		if (!connection_current(c) && selected && selected_size)
+			selected[0] = 0;
 		fprintf(stderr, "btstack: GetCodecs on %s -> %s\n", address, err[0] ? err : "no reply");
 		return 0;
 	}
@@ -1281,6 +1666,11 @@ int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_
 				snprintf(out[count++], BT_CODEC_NAME_MAX, "%s", name);
 			}
 		}
+	}
+	if (!connection_current(c)) {
+		if (selected && selected_size)
+			selected[0] = 0;
+		return 0;
 	}
 	return count;
 }
@@ -1309,9 +1699,7 @@ bool btstack_audio_info(const char *address, char *out, size_t size) {
 	if (out && size) {
 		out[0] = '\0';
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 
 	char path[OBJECT_PATH_MAX];
 	if (!c || !out || !size || !pcm_path(address, path, sizeof(path))) {
@@ -1320,7 +1708,7 @@ bool btstack_audio_info(const char *address, char *out, size_t size) {
 
 	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "GetAll", "s");
 	dbus_w_string(w, BALSA_PCM_IFACE);
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
@@ -1343,7 +1731,7 @@ bool btstack_audio_info(const char *address, char *out, size_t size) {
 		}
 		if (strcmp(key, "Codec") == 0 && strcmp(sig, "s") == 0) {
 			dbus_r_string(&r, codec, sizeof(codec));
-		} else if (strcmp(key, "Sampling") == 0 && strcmp(sig, "u") == 0) {
+		} else if ((strcmp(key, "Sampling") == 0 || strcmp(key, "Rate") == 0) && strcmp(sig, "u") == 0) {
 			dbus_r_u32(&r, &rate);
 		} else if (strcmp(key, "Channels") == 0 && strcmp(sig, "y") == 0) {
 			dbus_r_byte(&r, &channels);
@@ -1355,7 +1743,7 @@ bool btstack_audio_info(const char *address, char *out, size_t size) {
 	}
 
 	snprintf(out, size, "%s, %u Hz, %u ch, %s", codec, (unsigned)rate, (unsigned)channels, format_name(format));
-	return !r.bad;
+	return !r.bad && connection_current(c);
 }
 
 // The low byte of the format word is the width; the two the daemon spells with
@@ -1371,18 +1759,19 @@ bool btstack_stream_info(const char *address, bool receiving, btstack_stream_t *
 	}
 	memset(out, 0, sizeof(*out));
 
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 
 	char path[OBJECT_PATH_MAX];
 	if (!c || !pcm_path_dir(address, receiving, path, sizeof(path))) {
 		return false;
 	}
+	pthread_mutex_lock(&lock);
+	unsigned bitrate_serial = pcm_bitrate_serial;
+	pthread_mutex_unlock(&lock);
 
 	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "GetAll", "s");
 	dbus_w_string(w, BALSA_PCM_IFACE);
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
@@ -1404,8 +1793,12 @@ bool btstack_stream_info(const char *address, bool receiving, btstack_stream_t *
 		}
 		if (strcmp(key, "Codec") == 0 && strcmp(sig, "s") == 0) {
 			dbus_r_string(&r, out->codec, sizeof(out->codec));
-		} else if (strcmp(key, "Sampling") == 0 && strcmp(sig, "u") == 0) {
+		} else if ((strcmp(key, "Sampling") == 0 || strcmp(key, "Rate") == 0) && strcmp(sig, "u") == 0) {
 			dbus_r_u32(&r, &rate);
+		} else if (!strcmp(key, "CodecBitrate") && !strcmp(sig, "u")) {
+			uint32_t bitrate;
+			if (dbus_r_u32(&r, &bitrate))
+				out->bitrate = bitrate;
 		} else if (strcmp(key, "Channels") == 0 && strcmp(sig, "y") == 0) {
 			dbus_r_byte(&r, &channels);
 		} else if (strcmp(key, "Format") == 0 && strcmp(sig, "q") == 0) {
@@ -1418,7 +1811,12 @@ bool btstack_stream_info(const char *address, bool receiving, btstack_stream_t *
 	out->rate = (unsigned)rate;
 	out->channels = (unsigned)channels;
 	out->bits = format_bits(format);
-	return !r.bad;
+	if (!r.bad && !receiving && address && lock_current(c)) {
+		if (bitrate_serial == pcm_bitrate_serial)
+			pcm_bitrate_note(address, out->bitrate);
+		pthread_mutex_unlock(&lock);
+	}
+	return !r.bad && connection_current(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,7 +1834,7 @@ static bool remote_player_path(dbus_conn_t *c, const char *address, char *out, s
 	size_t prefix_len = strlen(prefix);
 
 	dbus_call_begin(c, BLUEZ_SERVICE, "/", OBJMAN_IFACE, "GetManagedObjects", "");
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
@@ -1471,7 +1869,7 @@ static bool remote_player_path(dbus_conn_t *c, const char *address, char *out, s
 
 		if (is_player && strncmp(path, prefix, prefix_len) == 0 && path[prefix_len] == '/') {
 			snprintf(out, size, "%s", path);
-			return true;
+			return connection_current(c);
 		}
 	}
 	return false;
@@ -1509,27 +1907,24 @@ bool btstack_media_status(char *out, size_t size) {
 // property of each -- and this is asked once a second while a device is
 // streaming. The path is only worth what the Get on it answers, so a Get that
 // fails throws it away and the next poll looks it up again.
-static char media_player_path[OBJECT_PATH_MAX];
-static char media_player_address[BT_ADDR_MAX];
 
-static bool player_property(dbus_conn_t *c, const char *path, const char *name, const char *expect,
-							dbus_reader_t *out) {
+static bool player_property(dbus_conn_t *c, const char *path, const char *name, const char *expect, dbus_reader_t *out) {
+	if (!connection_current(c))
+		return false;
 	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, PROPS_IFACE, "Get", "ss");
 	dbus_w_string(w, BLUEZ_MEDIA_PLAYER_IFACE);
 	dbus_w_string(w, name);
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
 	dbus_reply_reader(c, out);
 	char sig[16];
-	return dbus_r_signature(out, sig, sizeof(sig)) && strcmp(sig, expect) == 0;
+	return dbus_r_signature(out, sig, sizeof(sig)) && strcmp(sig, expect) == 0 && connection_current(c);
 }
 
 void btstack_refresh_media_status(const char *address) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !address || !address[0]) {
 		return;
 	}
@@ -1575,11 +1970,12 @@ void btstack_refresh_media_status(const char *address) {
 	// a moment earlier. What empties the caches is the sender going away, which
 	// btstack_forget_media() is for.
 	if (answered_track) {
-		store_track(&track);
+		store_track_current(c, &track);
 	}
 
 	if (answered_status) {
-		pthread_mutex_lock(&lock);
+		if (!lock_current(c))
+			return;
 		snprintf(media_status, sizeof(media_status), "%s", status);
 		pthread_mutex_unlock(&lock);
 	}
@@ -1605,9 +2001,7 @@ void btstack_note_media_status(const char *status) {
 }
 
 bool btstack_media_command(const char *address, const char *member) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !member) {
 		return false;
 	}
@@ -1643,9 +2037,7 @@ bool btstack_a2dp_streams(const char *address, char *out, size_t size) {
 	if (out && size) {
 		out[0] = '\0';
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 
 	char dev[OBJECT_PATH_MAX];
 	if (!c || !out || !size || !device_path(address, dev, sizeof(dev))) {
@@ -1654,7 +2046,7 @@ bool btstack_a2dp_streams(const char *address, char *out, size_t size) {
 	size_t dev_len = strlen(dev);
 
 	dbus_call_begin(c, BLUEZ_SERVICE, "/", OBJMAN_IFACE, "GetManagedObjects", "");
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
@@ -1731,9 +2123,7 @@ bool btstack_bluealsa_version(char *out, size_t size) {
 	if (out && size) {
 		out[0] = '\0';
 	}
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 	if (!c || !out || !size) {
 		return false;
 	}
@@ -1741,7 +2131,7 @@ bool btstack_bluealsa_version(char *out, size_t size) {
 	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, BALSA_MANAGER_PATH, PROPS_IFACE, "Get", "ss");
 	dbus_w_string(w, BALSA_MANAGER_IFACE);
 	dbus_w_string(w, "Version");
-	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+	if (!stack_call_send(c, CALL_MS, NULL, 0)) {
 		return false;
 	}
 
@@ -1758,13 +2148,47 @@ bool btstack_bluealsa_version(char *out, size_t size) {
 	// bluealsa spells it "v4.3.1"; hand back the number so the caller decides
 	// how to print it.
 	snprintf(out, size, "%s", raw[0] == 'v' ? raw + 1 : raw);
-	return out[0] != '\0';
+	return out[0] != '\0' && connection_current(c);
+}
+
+void btstack_read_headset_battery(const char *address) {
+	dbus_conn_t *c = current_connection();
+	char path[OBJECT_PATH_MAX];
+	if (!c || !address || !pcm_path_dir(address, false, path, sizeof(path))) {
+		return;
+	}
+	// pcm_path_dir() gives ".../dev_X/a2dpsrc/sink"; the RFCOMM object is the
+	// device's own "/rfcomm" next to it.
+	char *tail = strstr(path, "/a2dpsrc/");
+	if (!tail) {
+		return;
+	}
+	snprintf(tail, sizeof(path) - (size_t)(tail - path), "/rfcomm");
+
+	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Get", "ss");
+	dbus_w_string(w, BALSA_RFCOMM_IFACE);
+	dbus_w_string(w, "Battery");
+	char err[DBUS_NAME_MAX];
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
+		// No hands-free link to this headset (yet, or at all: a speaker
+		// without HFP). The signals fill the level in if one comes up.
+		return;
+	}
+	dbus_reader_t r;
+	dbus_reply_reader(c, &r);
+	char sig[16];
+	int percent = -1;
+	if (dbus_r_signature(&r, sig, sizeof(sig)) && read_battery_value(&r, sig, &percent)) {
+		if (!lock_current(c))
+			return;
+		headset_battery_note(address, percent);
+		pthread_mutex_unlock(&lock);
+		fprintf(stderr, "btstack: %s battery %d%% (read)\n", address, percent);
+	}
 }
 
 bool btstack_select_codec_dir(const char *address, bool receiving, const char *codec) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
+	dbus_conn_t *c = current_connection();
 
 	char path[OBJECT_PATH_MAX];
 	if (!c || !codec || !codec[0] || !pcm_path_dir(address, receiving, path, sizeof(path))) {
@@ -1780,9 +2204,125 @@ bool btstack_select_codec_dir(const char *address, bool receiving, const char *c
 	char err[DBUS_NAME_MAX];
 	// Renegotiating the codec tears the stream down and builds it again, which
 	// the headphones take a moment to follow.
-	bool ok = dbus_call_send(c, 15000, err, sizeof(err));
-	fprintf(stderr, "btstack: codec %s on %s (%s) -> %s\n", codec, address, receiving ? "sink" : "source",
-			ok ? "ok" : (err[0] ? err : "no reply"));
+	bool ok = stack_call_send(c, 15000, err, sizeof(err));
+	fprintf(stderr, "btstack: codec %s on %s (%s) -> %s\n", codec, address, receiving ? "sink" : "source", ok ? "ok" : (err[0] ? err : "no reply"));
+	return ok;
+}
+
+int btstack_codec_rates(const char *address, const char *codec, unsigned *out, int max) {
+	dbus_conn_t *c = current_connection();
+
+	char path[OBJECT_PATH_MAX];
+	if (!c || !codec || !codec[0] || !out || max <= 0 || !pcm_path(address, path, sizeof(path))) {
+		return 0;
+	}
+
+	dbus_call_begin(c, BALSA_SERVICE, path, BALSA_PCM_IFACE, "GetCodecs", "");
+	char err[DBUS_NAME_MAX];
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err))) {
+		fprintf(stderr, "btstack: GetCodecs on %s -> %s\n", address, err[0] ? err : "no reply");
+		return 0;
+	}
+
+	dbus_reader_t r;
+	dbus_reply_reader(c, &r);
+
+	// a{sa{sv}}: this time the properties of one codec are the point. bluealsa
+	// 4.3 lists SupportedSampling there, already narrowed to what both ends
+	// can do (the headphones' capabilities against its own).
+	int count = 0;
+	dbus_array_iter_t codecs;
+	if (!dbus_r_array_begin(&r, "{sa{sv}}", &codecs)) {
+		return 0;
+	}
+	while (dbus_r_array_more(&r, &codecs)) {
+		char name[BT_CODEC_NAME_MAX];
+		if (!dbus_r_string(&r, name, sizeof(name))) {
+			return 0;
+		}
+		if (strcasecmp(name, codec) != 0) {
+			if (!dbus_r_skip(&r, "a{sv}")) {
+				return 0;
+			}
+			continue;
+		}
+		dbus_array_iter_t props;
+		if (!dbus_r_array_begin(&r, "{sv}", &props)) {
+			return 0;
+		}
+		while (dbus_r_array_more(&r, &props)) {
+			char key[64], sig[16];
+			if (!dbus_r_string(&r, key, sizeof(key)) || !dbus_r_signature(&r, sig, sizeof(sig))) {
+				return connection_current(c) ? count : 0;
+			}
+			if ((strcmp(key, "SupportedSampling") == 0 || strcmp(key, "Rates") == 0) && strcmp(sig, "au") == 0) {
+				dbus_array_iter_t rates;
+				if (!dbus_r_array_begin(&r, "u", &rates)) {
+					return connection_current(c) ? count : 0;
+				}
+				while (dbus_r_array_more(&r, &rates)) {
+					uint32_t rate = 0;
+					if (!dbus_r_u32(&r, &rate)) {
+						return connection_current(c) ? count : 0;
+					}
+					if (rate && count < max) {
+						out[count++] = (unsigned)rate;
+					}
+				}
+			} else if (!dbus_r_skip(&r, sig)) {
+				return connection_current(c) ? count : 0;
+			}
+		}
+		return connection_current(c) ? count : 0;
+	}
+	return 0;
+}
+
+bool btstack_select_codec_rate(const char *address, const char *codec, unsigned rate) {
+	dbus_conn_t *c = current_connection();
+
+	char path[OBJECT_PATH_MAX];
+	if (!c || !codec || !codec[0] || !rate || !pcm_path(address, path, sizeof(path))) {
+		return false;
+	}
+
+	// Two ways of saying the same rate, for two generations of bluealsa.
+	// "Sampling" is the 4.3 one: bluealsa starts from its own capabilities,
+	// narrows them to the headphones' and to this rate, and picks the rest
+	// itself. Older daemons only read a whole configuration blob -- for LDAC,
+	// the one built in btrate.c -- and ignore keys they do not know. Given
+	// both, 4.3 starts from the blob instead of its own capabilities, narrows
+	// it the same way and checks the result, so the two agree. Either way a
+	// rate the headphones do not have is refused with an error rather than
+	// sent to them.
+	uint8_t blob[BTRATE_LDAC_CONFIG_SIZE];
+	size_t blob_size = strcasecmp(codec, "LDAC") == 0 ? btrate_ldac_config(rate, blob) : 0;
+
+	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, BALSA_PCM_IFACE, "SelectCodec", "sa{sv}");
+	dbus_w_string(w, codec);
+	dbus_array_t props;
+	dbus_w_array_begin(w, "{sv}", &props);
+	dbus_w_dict_variant_begin(w, "Sampling", "u");
+	dbus_w_u32(w, (uint32_t)rate);
+	// BlueALSA 5 renamed Sampling to Rate; each version ignores the other key.
+	dbus_w_dict_variant_begin(w, "Rate", "u");
+	dbus_w_u32(w, (uint32_t)rate);
+	if (blob_size) {
+		dbus_w_dict_variant_begin(w, "Configuration", "ay");
+		dbus_array_t bytes;
+		dbus_w_array_begin(w, "y", &bytes);
+		for (size_t i = 0; i < blob_size; i++) {
+			dbus_w_byte(w, blob[i]);
+		}
+		dbus_w_array_end(w, &bytes);
+	}
+	dbus_w_array_end(w, &props);
+
+	char err[DBUS_NAME_MAX];
+	// The same teardown and rebuild as any codec change; a little less time
+	// is given than there, because a track is waiting on the answer.
+	bool ok = stack_call_send(c, 10000, err, sizeof(err));
+	fprintf(stderr, "btstack: codec %s at %u Hz on %s%s -> %s\n", codec, rate, address, blob_size ? " (with an LDAC configuration)" : "", ok ? "ok" : (err[0] ? err : "no reply"));
 	return ok;
 }
 
@@ -1793,68 +2333,50 @@ bool btstack_select_codec_dir(const char *address, bool receiving, const char *c
 // PCM, and the new one starts at bluealsa's default: the phone does not resend
 // what it had already set, so without carrying the level across, the phone's
 // volume keys appear to stop working after a codec change.
-bool btstack_pcm_volume_get(const char *address, bool receiving, int *out) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
-
-	char path[OBJECT_PATH_MAX];
-	if (!c || !out || !pcm_path_dir(address, receiving, path, sizeof(path))) {
-		return false;
-	}
-
+static bool pcm_volume_read(dbus_conn_t *c, const char *path, bapcm_volume_t *out) {
 	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Get", "ss");
 	dbus_w_string(w, BALSA_PCM_IFACE);
 	dbus_w_string(w, "Volume");
-
 	char err[DBUS_NAME_MAX];
-	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+	if (!stack_call_send(c, CALL_MS, err, sizeof(err)))
 		return false;
-	}
-
 	dbus_reader_t r;
 	dbus_reply_reader(c, &r);
 	char sig[16];
-	uint16_t both = 0;
-	if (!dbus_r_signature(&r, sig, sizeof(sig)) || sig[0] != 'q' || !dbus_r_u16(&r, &both)) {
-		return false;
-	}
-	// Two channels in one word, and the top bit of each byte is its mute
-	// switch. The word is carried whole rather than taken apart: writing back
-	// exactly what was read cannot get the mute or the balance wrong.
-	*out = (int)both;
-	return true;
+	return dbus_r_signature(&r, sig, sizeof(sig)) && bapcm_volume_read(&r, sig, out) && connection_current(c);
 }
 
-bool btstack_pcm_volume_set(const char *address, bool receiving, int volume) {
-	pthread_mutex_lock(&lock);
-	dbus_conn_t *c = conn;
-	pthread_mutex_unlock(&lock);
-
+bool btstack_pcm_volume_get(const char *address, bool receiving, bapcm_volume_t *out) {
+	dbus_conn_t *c = current_connection();
 	char path[OBJECT_PATH_MAX];
-	if (!c || volume < 0 || !pcm_path_dir(address, receiving, path, sizeof(path))) {
-		return false;
-	}
+	return c && out && pcm_path_dir(address, receiving, path, sizeof(path)) && pcm_volume_read(c, path, out);
+}
 
+bool btstack_pcm_volume_set(const char *address, bool receiving, const bapcm_volume_t *volume) {
+	dbus_conn_t *c = current_connection();
+	char path[OBJECT_PATH_MAX];
+	bapcm_volume_t current;
+	if (!c || !volume || !pcm_path_dir(address, receiving, path, sizeof(path)) || !pcm_volume_read(c, path, &current))
+		return false;
+	// Discover the NEW endpoint after a codec change. Retain raw mute/balance
+	// bytes, but encode them with the format that this endpoint actually uses.
+	if (current.count != volume->count)
+		return false;
+	bapcm_volume_t restored = *volume;
+	restored.array = current.array;
 	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Set", "ssv");
 	dbus_w_string(w, BALSA_PCM_IFACE);
 	dbus_w_string(w, "Volume");
-	dbus_w_variant_u16(w, (uint16_t)volume);
-
+	bapcm_volume_write(w, &restored);
 	char err[DBUS_NAME_MAX];
-	bool ok = dbus_call_send(c, CALL_MS, err, sizeof(err));
-	if (!ok) {
+	bool ok = stack_call_send(c, CALL_MS, err, sizeof(err));
+	if (!ok)
 		fprintf(stderr, "btstack: volume not restored on %s: %s\n", path, err[0] ? err : "no reply");
-	}
 	return ok;
 }
 
 // The headphone direction, which is what everything but the receiver page asks
 // about.
-int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size) {
-	return btstack_codecs_dir(address, false, out, max, selected, selected_size);
-}
+int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size) { return btstack_codecs_dir(address, false, out, max, selected, selected_size); }
 
-bool btstack_select_codec(const char *address, const char *codec) {
-	return btstack_select_codec_dir(address, false, codec);
-}
+bool btstack_select_codec(const char *address, const char *codec) { return btstack_select_codec_dir(address, false, codec); }

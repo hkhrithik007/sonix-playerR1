@@ -18,5 +18,6 @@
 extern lv_obj_t *morepage_screen;
 
 void morepage_init(gui_config_t *cfg);
+void morepage_rebuild(void);
 
 #endif /* GUI_MOREPAGE_H */

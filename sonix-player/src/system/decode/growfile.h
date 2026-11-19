@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Reading a file while someone else is still writing it.
 //
@@ -36,6 +37,7 @@
 
 // `total` is the final size when the server stated it, 0 when it did not.
 void growfile_announce(const char *path, long total);
+void growfile_set_duration(const char *path, uint32_t duration_ms);
 void growfile_progress(const char *path, long done);
 
 // End of the download: `ok` false means it died halfway, and waiting readers
@@ -49,6 +51,16 @@ bool growfile_is_growing(const char *path);
 // sweeps the directory: deleting the file being downloaded (or its cover, or
 // its tags) while it is playing is the fastest way to break everything.
 bool growfile_prefix_is_growing(const char *prefix);
+
+// What is being written right now, for a page that shows the downloads: up to
+// `max` entries copied out, their number returned. A snapshot under the lock,
+// nothing waited for: cheap enough for a once-a-second poll.
+typedef struct {
+	char path[512];
+	long done;
+	long total; // 0 when the server did not say
+} growfile_info_t;
+int growfile_list(growfile_info_t *out, int max);
 
 // --- reader side ----------------------------------------------------------
 
@@ -77,8 +89,19 @@ size_t growfile_read(growfile_t *g, void *out, size_t bytes);
 // the destination has not arrived yet. False when it cannot be reached.
 bool growfile_seek(growfile_t *g, long offset, int origin);
 
+// Waits until at least `need` bytes of the file at `path` are on disk, for a
+// reader that does its own pread()s (the MP4 reader, which jumps between a
+// fragment's header and its samples). Returns how many bytes there are when it
+// stops waiting -- fewer than `need` when the download ended, stalled or a
+// command is pending -- and -1 when nobody is writing that file.
+long growfile_wait_path(const char *path, long need);
+
 // The current position, for decoders that ask for it.
 long growfile_tell(growfile_t *g);
+
+// Contiguous bytes present now, including after the writer has finished.
+long growfile_available(growfile_t *g);
+uint32_t growfile_duration(growfile_t *g);
 
 // True (once: reading clears it) if since the last call a read had to wait for
 // a piece not yet downloaded. This is how playback discovers it has reached the

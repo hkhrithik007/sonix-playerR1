@@ -33,8 +33,8 @@ bool chargescreen_mark(int mark) {
 
 #include "src/system/core/config.h"
 #include "src/system/core/respath.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/system/device/axpcharge.h"
-#include "src/system/device/bootlogo.h"
 #include "src/system/device/power.h"
 
 #define AXP_REG_STATUS1 0x00
@@ -144,7 +144,7 @@ static int battery_percent(int fallback) {
 		}
 		snprintf(path, sizeof(path), SUPPLY_DIR "/%s/capacity", de->d_name);
 		int value = read_int(path, -1);
-		if (value > 0 && percent <= 0) {
+		if (value > 0 && value <= 100 && percent <= 0) {
 			percent = value;
 		} else if (value == 0 && percent < 0) {
 			percent = 0;
@@ -154,7 +154,7 @@ static int battery_percent(int fallback) {
 	if (percent < 0) {
 		return fallback;
 	}
-	return percent > 100 ? 100 : percent;
+	return percent;
 }
 
 static bool vbus_good(bool *known) {
@@ -166,30 +166,37 @@ static bool vbus_good(bool *known) {
 // The PMIC's VBUS-good bit, which answers from the first moment, or any supply
 // that is not a battery and says it is online. Both, because on the R3 Pro II
 // the cable reaches the MP2731 charger and not necessarily the PMIC's input.
-static bool cable_in(void) {
+static int cable_state(void) {
 	bool known;
-	if (vbus_good(&known)) {
-		return true;
-	}
+	if (vbus_good(&known))
+		return 1;
+	bool observed = known && axpcharge_applies();
 	DIR *dir = opendir(SUPPLY_DIR);
-	if (!dir) {
-		return true; // cannot tell: not a reason to power off
-	}
+	if (!dir)
+		return observed ? 0 : -1;
 	bool in = false;
 	struct dirent *de;
 	while ((de = readdir(dir)) != NULL) {
-		if (de->d_name[0] == '.') {
+		if (de->d_name[0] == '.')
 			continue;
-		}
-		char path[320];
+		char path[320], type[32];
+		snprintf(path, sizeof(path), SUPPLY_DIR "/%s/type", de->d_name);
+		if (!read_line(path, type, sizeof(type)) || strcmp(type, "Battery") == 0)
+			continue;
 		snprintf(path, sizeof(path), SUPPLY_DIR "/%s/online", de->d_name);
-		if (read_int(path, 0) == 1) {
+		int online = read_int(path, -1);
+		// Only the actual charger can establish absence on the R3 Pro II.
+		if (online == 0 && (axpcharge_applies() || strcmp(de->d_name, "mp2731-charger") == 0))
+			observed = true;
+		if (online == 1)
 			in = true;
-		}
 	}
 	closedir(dir);
-	return in;
+	return in ? 1 : observed ? 0 : -1;
 }
+
+// Unknown input is not cable removal during an active charging session.
+static bool cable_in(void) { return cable_state() != 0; }
 
 static void led(charge_led_t state) {
 	switch (state) {
@@ -220,11 +227,9 @@ static long now_ms(void) {
 // ---------------------------------------------------------------------------
 // Drawing
 //
-// assets/icons/battery-device-off.svg standing in the middle of the screen,
-// green from the bottom to the level, the bolt of zap-device-off.svg in yellow
-// over it, and the percentage under it in the interface's bold font. Both
-// icons are drawn here from their geometry, in their own 24-unit boxes, with
-// antialiased edges; every size is scaled from a 480-pixel-wide screen.
+// Graphite 2's neutral dark canvas and typography, without starting LVGL or
+// reading the card. The static icon is drawn only when the level changes or
+// the power key wakes the display. Sizes scale from the 480-pixel-wide R1.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -238,14 +243,19 @@ typedef struct {
 	uint8_t r, g, b;
 } rgb_t;
 
-static const rgb_t OUTLINE = {255, 255, 255};
-static const rgb_t FILL = {1, 219, 17};
-static const rgb_t BOLT = {255, 204, 0};
-static const rgb_t TEXT = {255, 255, 255};
+#define CHARGE_RGB(hex) {(hex >> 16) & 255, (hex >> 8) & 255, hex & 255}
+static const rgb_t BACKGROUND = CHARGE_RGB(SX_D_BG);
+static const rgb_t SURFACE = CHARGE_RGB(SX_D_SURFACE);
+static const rgb_t OUTLINE = CHARGE_RGB(SX_D_TEXT2);
+static const rgb_t FILL = CHARGE_RGB(SX_D_ACCENT);
+static const rgb_t LOW_FILL = CHARGE_RGB(SX_DANGER_BG);
+static const rgb_t BOLT = CHARGE_RGB(SX_D_TEXT);
+static const rgb_t TEXT = CHARGE_RGB(SX_D_TEXT);
+#undef CHARGE_RGB
 
 // Pixels per icon unit for the battery on a 480-pixel-wide screen, and the
 // bolt's height as a share of the body's.
-#define BATTERY_UNIT_PX 14.0f
+#define BATTERY_UNIT_PX 11.0f
 #define BOLT_SCALE 0.42f
 
 // The bolt's outline, from tools/charge_zap.py. The icon strokes it 2 units
@@ -422,28 +432,26 @@ static void draw_text(const canvas_t *cv, const char *text, int px, int cx, int 
 
 static void draw_page(const canvas_t *cv, int percent) {
 	for (int y = 0; y < cv->h; y++) {
-		memset(cv->mem + (size_t)y * cv->stride, 0, (size_t)cv->w * (cv->bpp / 8));
-		if (cv->bpp == 32) {
-			for (int x = 0; x < cv->w; x++) {
-				cv->mem[(size_t)y * cv->stride + (size_t)x * 4 + 3] = 0xFF;
-			}
-		}
+		for (int x = 0; x < cv->w; x++)
+			blend(cv, x, y, BACKGROUND, 255);
 	}
+	if (percent > 100)
+		percent = 100;
 
 	float u = (float)cv->w / 480.0f;
 	float k = BATTERY_UNIT_PX * u;
 	float cx = (float)cv->w / 2.0f;
-	float cy = (float)cv->h * 0.42f; // where the body's centre goes
+	float cy = (float)cv->h * 0.40f;
 
-	// The icon's box is 24 x 24 units with the body's centre at (12, 14): a
-	// 12 x 16 rectangle at (6, 6) with corners of 2, stroked 2 wide, and the
-	// cap, the line from (10, 2) to (14, 2) stroked 2 wide with round ends.
+	// A slim rounded battery, with the same 4px outline and quiet surfaces
+	// used by Graphite controls. The cap retains the original icon geometry.
 	float ox = cx - 12 * k, oy = cy - 14 * k;
 	rrect_t body = {ox + 12 * k, oy + 14 * k, 7 * k, 9 * k, 3 * k};
-	rrect_t hollow = {body.cx, body.cy, 5 * k, 7 * k, 1 * k};
+	rrect_t hollow = {body.cx, body.cy, body.hw - 4 * u, body.hh - 4 * u, body.r - 4 * u};
 	rrect_t cap = {ox + 12 * k, oy + 2 * k, 3 * k, 1 * k, 1 * k};
-	rrect_t inside = {body.cx, body.cy, hollow.hw - 0.9f * k, hollow.hh - 0.9f * k, 0.4f * k};
+	rrect_t inside = {body.cx, body.cy, hollow.hw - 8 * u, hollow.hh - 8 * u, hollow.r - 8 * u};
 
+	fill_rrect(cv, &hollow, SURFACE);
 	fill_rrect(cv, &cap, OUTLINE);
 	stroke_rrect(cv, &body, &hollow, OUTLINE);
 
@@ -452,17 +460,21 @@ static void draw_page(const canvas_t *cv, int percent) {
 		if (level < 3 * u) {
 			level = 3 * u;
 		}
-		fill_rrect_below(cv, &inside, inside.cy + inside.hh - level, FILL);
+		fill_rrect_below(cv, &inside, inside.cy + inside.hh - level, percent <= 5 ? LOW_FILL : FILL);
 	}
 
 	// The bolt's box centred on the body; the bolt is 22 of its 24 units tall.
 	float kz = body.hh * 2.0f * BOLT_SCALE / 22.0f;
 	draw_zap(cv, body.cx - 12 * kz, body.cy - 12 * kz, kz, BOLT);
 
-	char text[8];
-	snprintf(text, sizeof(text), "%d%%", percent);
-	int px = (int)(56 * u);
-	draw_text(cv, text, px, (int)cx, (int)(body.cy + body.hh + 34 * u + (float)px * 0.75f), TEXT);
+	char text[16];
+	if (percent < 0)
+		snprintf(text, sizeof(text), "--%%");
+	else
+		snprintf(text, sizeof(text), "%d%%", percent);
+	int px = (int)(72 * u);
+	draw_text(cv, text, px, (int)cx, (int)(body.cy + body.hh + 40 * u + (float)px * 0.75f), TEXT);
+	draw_text(cv, "REKKOD MOD", (int)(20 * u), (int)cx, cv->h - (int)(48 * u), OUTLINE);
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +586,7 @@ static void show_boot_logo(int percent) {
 	if (!was_on) {
 		unblank();
 	}
-	if (!bootlogo_show_now(config_get_bool("ui", "dark_theme", true), (int)config_get_int("ui", "accent", 0))) {
+	if (system("/usr/bin/cmd_jpeg_display /etc/logo.jpeg >/dev/null 2>&1") != 0) {
 		show_battery(percent);
 	}
 	if (!was_on) {
@@ -589,8 +601,10 @@ static void dark(void) {
 }
 
 static void font_open(void) {
-	// The interface's bold face, MiSans Bold, under either name fonts.c takes.
+	// Prefer the same Segoe semibold face as Graphite; retain legacy fallbacks.
 	static const char *const FILES[] = {
+		SONIX_RESOURCE_DIR "/fonts/ui-semibold.ttf",
+		SONIX_RESOURCE_DIR "/fonts/ui-semibold.otf",
 		SONIX_RESOURCE_DIR "/fonts/bold.ttf",
 		SONIX_RESOURCE_DIR "/fonts/bold.otf",
 	};
@@ -719,6 +733,10 @@ static bool wanted_mp2731(uint8_t source, bool cable) {
 }
 
 static bool wanted(void) {
+	int initial_cable = cable_state();
+	if (initial_cable < 0)
+		return false;
+	bool cable = initial_cable == 1;
 	uint8_t mark, source;
 	if (!axpcharge_reg_read(AXP_REG_MARK, &mark)) {
 		return false;
@@ -726,7 +744,6 @@ static bool wanted(void) {
 	// Powered off with the cable in. A request outlives a restart that never
 	// came, so it holds only while the cable is still there.
 	if (mark == CHARGESCREEN_MARK_REQUESTED) {
-		bool cable = cable_in();
 		printf("charge: powered off with the cable in, %s\n", cable ? "still in" : "now out");
 		if (!cable) {
 			chargescreen_mark(CHARGESCREEN_MARK_NONE);
@@ -736,7 +753,6 @@ static bool wanted(void) {
 	if (mark != CHARGESCREEN_MARK_NONE || !axpcharge_reg_read(AXP_REG_PWRON_STATUS, &source)) {
 		return false;
 	}
-	bool cable = cable_in();
 	if (!axpcharge_applies()) {
 		return wanted_mp2731(source, cable);
 	}
@@ -753,6 +769,8 @@ void chargescreen_run_if_wanted(void) {
 
 	if (!fb_open()) {
 		fprintf(stderr, "charge: no usable framebuffer\n");
+		fb_close();
+		return;
 	}
 	font_open();
 	brightness = configured_brightness();
@@ -760,7 +778,12 @@ void chargescreen_run_if_wanted(void) {
 	apply_charge_limit();
 
 	int keys = open_keys();
-	int percent = battery_percent(0);
+	if (keys < 0) {
+		fb_close();
+		font_close();
+		return;
+	}
+	int percent = battery_percent(-1);
 	int shown_percent = percent;
 	screen_on = false;
 	light(percent);

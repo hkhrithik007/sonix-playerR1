@@ -41,4 +41,15 @@
 // locking to negotiate.
 #define SQLITE_DEFAULT_FILE_PERMISSIONS 0666
 
+// The omitted SQLite features leave unused locals and no-op macros in the
+// upstream amalgamation. Suppress only those diagnostics inside that file.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wunused-value"
+#endif
 #include "sqlite3_amalgamation.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif

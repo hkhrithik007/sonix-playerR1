@@ -1,98 +1,133 @@
 #include "gui.h"
+#include "src/gui/shell/lowbattery.h"
 
 #include <pthread.h>
 #include <stdint.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "src/gui/library/browser.h"
-#include "src/gui/nowplaying/coverflow.h"
-#include "src/gui/settings/ccsettings.h"
-#include "src/gui/nowplaying/chapters.h"
-#include "src/gui/nowplaying/lyricsearch.h"
-#include "src/gui/wireless/airplay.h"
+#include "src/gui/audio/dacpage.h"
+#include "src/gui/audio/eqsettings.h"
+#include "src/gui/audio/metronomepage.h"
+#include "src/gui/audio/msebsettings.h"
+#include "src/gui/audio/peqautoeq.h"
+#include "src/gui/audio/peqsettings.h"
 #include "src/gui/bluetooth/airpodspage.h"
-#include "src/gui/settings/appearance.h"
 #include "src/gui/bluetooth/btaudio.h"
+#include "src/gui/bluetooth/btreceiverpage.h"
 #include "src/gui/bluetooth/btsettings.h"
-#include "src/gui/shell/confirm.h"
-#include "src/gui/shell/corners.h"
-#include "src/gui/settings/bootlogopage.h"
-#include "src/gui/settings/kblayoutpage.h"
-#include "src/gui/settings/screensaver.h"
-#include "src/gui/library/audiobookextras.h"
-#include "src/gui/library/audiobooks.h"
-#include "src/gui/settings/devoptions.h"
+#include "src/gui/ebook/ebookcovers.h"
 #include "src/gui/ebook/ebookmarkspage.h"
 #include "src/gui/ebook/ebookpage.h"
 #include "src/gui/ebook/ebookreader.h"
 #include "src/gui/ebook/ebooksettings.h"
-#include "src/gui/settings/processespage.h"
-#include "src/gui/settings/language.h"
-#include "src/gui/library/libraryscan.h"
-#include "src/gui/wireless/dlna.h"
-#include "src/gui/wireless/sonixlink.h"
-#include "src/gui/gearboy/gearboypage.h"
-#include "src/gui/gearboy/gearboysettings.h"
 #include "src/gui/flappybird/flappybird.h"
+#include "src/gui/fonts/fonts.h"
+#include "src/gui/gearboy/gearboypage.h"
 #include "src/gui/gearboy/gearboyplay.h"
-#include "src/gui/shell/lowbattery.h"
-#include "src/gui/shell/main_menu.h"
-#include "src/gui/library/medialist.h"
+#include "src/gui/gearboy/gearboysettings.h"
+#include "src/gui/library/audiobookextras.h"
+#include "src/gui/library/audiobooks.h"
+#include "src/gui/library/browser.h"
 #include "src/gui/library/filespage.h"
 #include "src/gui/library/imageview.h"
-#include "src/gui/library/textview.h"
-#include "src/gui/shell/morepage.h"
-#include "src/gui/shell/popover.h"
-#include "src/gui/nowplaying/trackmenu.h"
+#include "src/gui/library/libraryscan.h"
+#include "src/gui/library/medialist.h"
 #include "src/gui/library/music.h"
-#include "src/gui/audio/eqsettings.h"
-#include "src/gui/audio/peqsettings.h"
-#include "src/gui/audio/peqautoeq.h"
-#include "src/gui/settings/remap.h"
-#include "src/gui/audio/msebsettings.h"
-#include "src/gui/settings/musicsettings.h"
-#include "src/gui/nowplaying/player.h"
 #include "src/gui/library/playlistpage.h"
-#include "src/gui/settings/powersettings.h"
-#include "src/gui/shell/powermenu.h"
-#include "src/gui/shell/quickpanel.h"
-#include "src/gui/bluetooth/btreceiverpage.h"
-#include "src/gui/audio/dacpage.h"
-#include "src/gui/audio/metronomepage.h"
-#include "src/system/bluetooth/btreceiver.h"
-#include "src/system/audio/usbdac.h"
-#include "src/system/net/wifitransfer.h"
-#include "src/system/streaming/radio.h"
-#include "src/gui/streaming/radiopage.h"
 #include "src/gui/library/search.h"
+#include "src/gui/library/textview.h"
+#include "src/gui/nowplaying/chapters.h"
+#include "src/gui/nowplaying/coverflow.h"
+#include "src/gui/nowplaying/historypage.h"
+#include "src/gui/nowplaying/lyricsearch.h"
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/trackmenu.h"
+#include "src/gui/settings/appearance.h"
+#include "src/gui/settings/ccsettings.h"
+#include "src/gui/settings/devoptions.h"
+#include "src/gui/settings/kblayoutpage.h"
+#include "src/gui/settings/language.h"
+#include "src/gui/settings/musicsettings.h"
+#include "src/gui/settings/powersettings.h"
+#include "src/gui/settings/processespage.h"
+#include "src/gui/settings/recoverywizard.h"
+#include "src/gui/settings/remap.h"
+#include "src/gui/settings/screensaver.h"
 #include "src/gui/settings/settings.h"
 #include "src/gui/settings/systempage.h"
-#include "src/gui/shell/setupwifi.h"
-#include "src/gui/shell/welcome.h"
-#include "src/gui/streaming/streaming.h"
-#include "src/gui/shell/switcher.h"
 #include "src/gui/settings/timeset.h"
-#include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/confirm.h"
+#include "src/gui/shell/corners.h"
 #include "src/gui/shell/icons.h"
+#include "src/gui/shell/main_menu.h"
+#include "src/gui/shell/morepage.h"
+#include "src/gui/shell/popover.h"
+#include "src/gui/shell/powermenu.h"
+#include "src/gui/shell/quickpanel.h"
+#include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_frame.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_toast.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/gui/shell/topbar.h"
+#include "src/gui/shell/touch.h"
 #include "src/gui/shell/volume_overlay.h"
+#include "src/gui/shell/welcome.h"
+#include "src/gui/streaming/radiopage.h"
+#include "src/gui/streaming/streaming.h"
+#include "src/gui/wireless/airplay.h"
+#include "src/gui/wireless/dlna.h"
+#include "src/gui/wireless/sonixlink.h"
 #include "src/gui/wireless/wifisettings.h"
 #include "src/gui/wireless/wifitransfer.h"
 #include "src/gui/wireless/wireless.h"
+#include "src/system/audio/usbdac.h"
 #include "src/system/bluetooth/bluetooth.h"
+#include "src/system/bluetooth/btreceiver.h"
+#include "src/system/device/clock.h"
+#include "src/system/device/power.h"
 #include "src/system/device/system.h"
 #include "src/system/device/usb.h"
-#include "src/system/device/power.h"
+#include "src/system/net/wifitransfer.h"
+#include "src/system/streaming/radio.h"
 
 #include "lvgl/lvgl.h"
 #include "lvgl/src/display/lv_display_private.h"
 #include "src/system/core/lang.h"
+
+// GUI-thread-only, process-lifetime completion ownership. The modules
+// have static locks/default-null jobs, so idle service does not build lazy pages.
+static bool completions_closing;
+
+void gui_service_completions(void) {
+	if (completions_closing)
+		return;
+	gearboypage_service_completion();
+	ebookcovers_service_completion();
+	peqautoeq_service_completion();
+	filespage_service_completion();
+	playlistpage_service_completion();
+}
+
+void gui_shutdown_completions(void) {
+	if (completions_closing)
+		return;
+	completions_closing = true;
+	gearboypage_shutdown_completions();
+	ebookcovers_shutdown_completions();
+	peqautoeq_shutdown_completions();
+	filespage_shutdown_completions();
+	playlistpage_shutdown_completions();
+}
 
 // Long enough for a whole sentence: a notice truncated mid-word is a puzzle
 // rather than a warning.
@@ -101,12 +136,6 @@ typedef struct {
 	const lv_image_dsc_t *icon; // NULL for a plain notice
 	lv_color_t icon_color;
 } popup_event_t;
-
-static lv_obj_t *popup_veil; // the dimmed screen behind the card
-static lv_obj_t *popup;		 // the card itself, inside the veil
-static lv_obj_t *popup_icon;
-static lv_obj_t *popup_label;
-static lv_timer_t *popup_timer;
 
 // ---------------------------------------------------------------------------
 // gui_post: the bridge from any thread onto the GUI thread.
@@ -123,7 +152,6 @@ static lv_timer_t *popup_timer;
 
 #define GUI_POST_MAX 32
 
-
 typedef struct {
 	void (*cb)(void *);
 	void *user;
@@ -133,7 +161,22 @@ static pthread_mutex_t post_lock = PTHREAD_MUTEX_INITIALIZER;
 static gui_post_t post_ring[GUI_POST_MAX];
 static int post_head;
 static int post_count;
+#define GUI_LATEST_MAX 4
+static gui_post_t post_latest[GUI_LATEST_MAX];
+static int post_latest_next;
+static bool post_prefer_latest = true;
 static lv_timer_t *post_timer;
+
+// Leave time for input and rendering even when callbacks keep posting work.
+// A callback is not preemptible: the elapsed budget is checked after each one.
+#define POST_DRAIN_MAX 8
+#define POST_DRAIN_US 4000
+
+static uint64_t post_clock_us(void) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
 
 // ---------------------------------------------------------------------------
 // The doorbell
@@ -162,6 +205,8 @@ static int post_wake_fd = -1;
 int gui_post_wake_fd(void) { return post_wake_fd; }
 
 void gui_post_service(void) {
+	// A posted callback may update any page; none may meet one unbuilt.
+	gui_init_rest();
 	// The doorbell rang, but the drain timer is a second from expiring, so
 	// without this the posted work would sit there. Marking it ready runs it on
 	// the next pass of lv_timer_handler(), which is immediate, and this is the
@@ -199,8 +244,50 @@ bool gui_post(void (*cb)(void *), void *user) {
 	return queued;
 }
 
+bool gui_post_or_free(void (*cb)(void *), void *user) {
+	bool queued = gui_post(cb, user);
+	if (!queued)
+		free(user);
+	return queued;
+}
+
+bool gui_post_latest(void (*cb)(void *), void *user) {
+	if (!cb)
+		return false;
+	pthread_mutex_lock(&post_lock);
+	int slot = -1;
+	for (int i = 0; i < GUI_LATEST_MAX; i++) {
+		if (post_latest[i].cb == cb) {
+			slot = i;
+			break;
+		}
+		if (!post_latest[i].cb && slot < 0)
+			slot = i;
+	}
+	if (slot >= 0)
+		post_latest[slot] = (gui_post_t){cb, user};
+	pthread_mutex_unlock(&post_lock);
+	if (slot >= 0 && post_wake_fd >= 0) {
+		uint64_t one = 1;
+		ssize_t ignored = write(post_wake_fd, &one, sizeof(one));
+		(void)ignored;
+	}
+	return slot >= 0;
+}
+
+static void clock_changed_async(void *user) {
+	(void)user;
+	clock_poll();
+	topbar_refresh_clock();
+}
+
+static void clock_changed(void) { gui_post(clock_changed_async, NULL); }
+
 static void post_drain_cb(lv_timer_t *timer) {
 	(void)timer;
+	// Also apply a completed zone lookup if the bounded post queue was full.
+	if (clock_poll())
+		topbar_refresh_clock();
 
 	// Reading the eventfd clears its counter. It happens here rather than in the
 	// main loop so it also applies when the safety-net timer did the waking, and
@@ -211,29 +298,61 @@ static void post_drain_cb(lv_timer_t *timer) {
 		(void)ignored;
 	}
 
-	for (;;) {
+	uint64_t started = post_clock_us();
+	for (int ran = 0; ran < POST_DRAIN_MAX; ran++) {
 		pthread_mutex_lock(&post_lock);
-		if (post_count == 0) {
+		int latest = -1;
+		for (int i = 0; i < GUI_LATEST_MAX; i++) {
+			int slot = (post_latest_next + i) % GUI_LATEST_MAX;
+			if (post_latest[slot].cb) {
+				latest = slot;
+				break;
+			}
+		}
+		if (latest < 0 && post_count == 0) {
 			pthread_mutex_unlock(&post_lock);
 			return;
 		}
-		gui_post_t entry = post_ring[post_head];
-		post_head = (post_head + 1) % GUI_POST_MAX;
-		post_count--;
+		gui_post_t entry;
+		if (latest >= 0 && (post_prefer_latest || !post_count)) {
+			entry = post_latest[latest];
+			post_latest[latest] = (gui_post_t){0};
+			post_latest_next = (latest + 1) % GUI_LATEST_MAX;
+			post_prefer_latest = false;
+		} else {
+			entry = post_ring[post_head];
+			post_head = (post_head + 1) % GUI_POST_MAX;
+			post_count--;
+			post_prefer_latest = true;
+		}
 		pthread_mutex_unlock(&post_lock);
 
 		// Outside the lock: the callback may post in turn.
 		entry.cb(entry.user);
+		if (post_clock_us() - started >= POST_DRAIN_US)
+			break;
+	}
+
+	// Rearm the doorbell, not the running LVGL timer. The next main-loop
+	// pass services input/render timers before another bounded batch. Without
+	// eventfd the existing fallback timer services the retained tail.
+	pthread_mutex_lock(&post_lock);
+	bool pending = post_count > 0;
+	for (int i = 0; i < GUI_LATEST_MAX; i++)
+		pending |= post_latest[i].cb != NULL;
+	pthread_mutex_unlock(&post_lock);
+	if (pending && post_wake_fd >= 0) {
+		uint64_t one = 1;
+		ssize_t ignored = write(post_wake_fd, &one, sizeof(one));
+		(void)ignored;
 	}
 }
 
-// The dimmed screen every notice card sits on: black at 60%, no drop shadow
-// anywhere. Dimming the page separates the card from it without drawing a dark
-// smear around the corners that reads as a border.
-//
-// `dismissable` decides whether it eats taps and stops there (the pairing
-// notice, which has to stay until the headphones are up) or whether the caller
-// hangs a click handler on it.
+// The screen-sized layer the modal card sits on. Since 2.0 it is not dimmed --
+// a translucent layer the size of the screen is what the platform cannot
+// afford to blend (handoff, platform limits) -- but it still catches every
+// tap: while the modal is up there is nothing to press. The card stands out
+// by its own surface and a hairline instead.
 static lv_obj_t *veil_create(bool dismissable) {
 	(void)dismissable; // both kinds swallow taps; only the handler differs
 
@@ -241,8 +360,7 @@ static lv_obj_t *veil_create(bool dismissable) {
 	lv_obj_set_hidden(veil, true);
 	lv_obj_set_size(veil, lv_pct(100), lv_pct(100));
 	lv_obj_set_pos(veil, 0, 0);
-	lv_obj_set_style_bg_color(veil, lv_color_black(), 0);
-	lv_obj_set_style_bg_opa(veil, LV_OPA_60, 0);
+	lv_obj_set_style_bg_opa(veil, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(veil, 0, 0);
 	lv_obj_set_style_radius(veil, 0, 0);
 	lv_obj_set_style_shadow_width(veil, 0, 0);
@@ -252,60 +370,19 @@ static lv_obj_t *veil_create(bool dismissable) {
 	return veil;
 }
 
-static void popup_dismiss(void) {
-	if (popup_veil) {
-		lv_obj_set_hidden(popup_veil, true);
-	}
-
-	lv_timer_reset(popup_timer);
-	lv_timer_pause(popup_timer);
-}
-
-static void popup_hide_cb(lv_timer_t *timer) {
-	(void)timer;
-	popup_dismiss();
-}
-
-// A tap anywhere off the card takes the notice away without waiting out the
-// three seconds. Taps on the card itself do not get here: it is clickable, so
-// it swallows them.
-static void popup_veil_cb(lv_event_t *e) {
-	(void)e;
-	popup_dismiss();
-}
-
 static void popup_show_icon(const char *text, const lv_image_dsc_t *icon, lv_color_t color);
 
 void popup_show(const char *text) { popup_show_icon(text, NULL, lv_color_black()); }
 
+// Since 2.0 a notice is the toast at the bottom of the screen (sx_toast.h),
+// not a card in the middle over a dimmed page: the same three-second sentence,
+// the glyph at the start of the line, the page left alone around it.
 static void popup_show_icon(const char *text, const lv_image_dsc_t *icon, lv_color_t color) {
-	if (!popup) {
-		fprintf(stderr, "popup_show() was called, but popup is not initialized. this is unexpected...");
-		return;
+	if (icon) {
+		sx_toast_glyph(icon, color, tr(text));
+	} else {
+		sx_toast(tr(text));
 	}
-
-	// A glyph over the sentence, for the notices that are about a thing rather
-	// than about a failure: the headphones for "the volume lives over there".
-	if (popup_icon) {
-		if (icon) {
-			lv_image_set_src(popup_icon, icon);
-			lv_obj_set_style_image_recolor(popup_icon, color, 0);
-			lv_obj_set_style_image_recolor_opa(popup_icon, LV_OPA_COVER, 0);
-			lv_obj_set_hidden(popup_icon, false);
-		} else {
-			lv_obj_set_hidden(popup_icon, true);
-		}
-	}
-
-	lv_label_set_text(popup_label, tr(text));
-	// The card grows to whatever it has to say, rather than being a fixed box
-	// a longer message spills out of.
-	lv_obj_update_layout(popup);
-	lv_obj_center(popup);
-	lv_obj_move_foreground(popup_veil);
-	lv_obj_set_hidden(popup_veil, false);
-	lv_timer_reset(popup_timer);
-	lv_timer_resume(popup_timer);
 }
 
 static void popup_async_cb(void *user_data) {
@@ -329,7 +406,7 @@ static void popup_notify(const char *text, const lv_image_dsc_t *icon, lv_color_
 	// gui_post rather than lv_async_call: popups arrive from any thread
 	// (bluetooth, usb, Qobuz downloads), and lv_async_call from off the GUI
 	// thread corrupts the timer list. See gui_post.
-	gui_post(popup_async_cb, ev);
+	gui_post_or_free(popup_async_cb, ev);
 }
 
 void gui_notify_popup(const char *text) { popup_notify(text, NULL, lv_color_black()); }
@@ -345,9 +422,7 @@ bool gui_card_available(void) {
 
 void gui_notify_no_card(void) { gui_notify_popup(usb_storage_active() ? "usb_storage_shared" : "sd_card_missing"); }
 
-void gui_notify_popup_icon(const char *text, const lv_image_dsc_t *icon, lv_color_t color) {
-	popup_notify(text, icon, color);
-}
+void gui_notify_popup_icon(const char *text, const lv_image_dsc_t *icon, lv_color_t color) { popup_notify(text, icon, color); }
 
 // ---------------------------------------------------------------------------
 // The modal: a notice that stays until whatever it is about is over
@@ -418,9 +493,7 @@ void gui_modal_hide(void) {
 	}
 }
 
-bool gui_modal_visible(void) {
-	return modal_backdrop && !lv_obj_is_hidden(modal_backdrop);
-}
+bool gui_modal_visible(void) { return modal_backdrop && !lv_obj_is_hidden(modal_backdrop); }
 
 static bool tree_holds(const lv_obj_t *parent, const lv_obj_t *obj) {
 	uint32_t count = lv_obj_get_child_count(parent);
@@ -458,8 +531,11 @@ static void modal_init(gui_config_t *cfg) {
 	lv_obj_set_width(card, cfg->screen_width - 4 * cfg->padding);
 	lv_obj_set_height(card, LV_SIZE_CONTENT);
 	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 16, 0);
-	lv_obj_set_style_border_width(card, 0, 0);
+	lv_obj_set_style_radius(card, SX_CARD_R, 0);
+	// No veil to set it off the page any more: a hairline does (sx_tokens.h).
+	lv_obj_set_style_border_width(card, 1, 0);
+	lv_obj_set_style_border_color(card, sx_pal()->hairline, 0);
+	lv_obj_set_style_border_opa(card, sx_pal()->hairline_opa, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 26, 0);
 	lv_obj_set_style_pad_row(card, 14, 0);
@@ -503,16 +579,15 @@ static void modal_init(gui_config_t *cfg) {
 
 static void key_async_cb(void *user_data) {
 	gui_key_t key = (gui_key_t)(uintptr_t)user_data;
+	if (metronomepage_key(key)) {
+		return;
+	}
 
 	// The side keys act on the local transport, and there are states in which
 	// that transport is not what the device is doing. Pressing them then does
 	// not do nothing -- it starts a local track underneath whatever is actually
 	// going on, which is worse than nothing.
 	if (usbdac_is_active() || wifitransfer_running()) {
-		return;
-	}
-	// The same while the metronome holds the output.
-	if (metronomepage_key(key)) {
 		return;
 	}
 
@@ -537,6 +612,13 @@ static void key_async_cb(void *user_data) {
 			return;
 		}
 		break;
+	default:
+		// The rest act on this player's own queue and track, which is not
+		// what a phone streaming into the receiver is playing.
+		if (btreceiver_is_active()) {
+			return;
+		}
+		break;
 	}
 
 	switch (key) {
@@ -548,6 +630,15 @@ static void key_async_cb(void *user_data) {
 		break;
 	case GUI_KEY_PREV:
 		player_key_prev();
+		break;
+	case GUI_KEY_FAVOURITE:
+		player_key_favourite();
+		break;
+	case GUI_KEY_NEXT_ALBUM:
+		player_key_next_album();
+		break;
+	case GUI_KEY_CYCLE_MODE:
+		player_key_cycle_mode();
 		break;
 	}
 }
@@ -567,7 +658,7 @@ static void volume_async_cb(void *user_data) {
 
 // From the AVRCP reader thread and from btvolume when the headphones move the
 // level themselves, so across the bridge like the key above.
-void gui_notify_volume(int percent) { gui_post(volume_async_cb, (void *)(intptr_t)percent); }
+void gui_notify_volume(int percent) { gui_post_latest(volume_async_cb, (void *)(intptr_t)percent); }
 
 static void power_menu_async_cb(void *unused) {
 	(void)unused;
@@ -576,12 +667,70 @@ static void power_menu_async_cb(void *unused) {
 
 void gui_notify_power_menu(void) { gui_post(power_menu_async_cb, NULL); }
 
+static void build_rest(gui_config_t *cfg, bool final);
 
-void gui_init(gui_config_t *cfg) {
+// The configuration the second half is to be built with, while it is still to
+// be built; NULL before gui_init() and once it is done.
+static gui_config_t *rest_cfg;
+
+// ---------------------------------------------------------------------------
+// pages built on first use (see gui_page_defer)
+// ---------------------------------------------------------------------------
+
+// A dozen is room to spare: the list is fixed at build time and only grows
+// when a page is moved here by hand. Full, a page is simply built at once.
+#define DEFERRED_PAGES_MAX 24
+
+typedef struct {
+	lv_obj_t *screen;
+	void (*build)(gui_config_t *cfg);
+} deferred_page_t;
+
+static deferred_page_t deferred_pages[DEFERRED_PAGES_MAX];
+static int deferred_page_count;
+
+// The configuration every page is built with; main() keeps it for the life of
+// the process, which is what lets a page be built long after gui_init().
+static gui_config_t *page_cfg;
+
+void gui_page_defer(lv_obj_t *screen, void (*build)(gui_config_t *cfg)) {
+	if (!screen || !build) {
+		return;
+	}
+	if (deferred_page_count == DEFERRED_PAGES_MAX) {
+		fprintf(stderr, "gui: deferred page list full, building now\n");
+		build(page_cfg);
+		return;
+	}
+	deferred_pages[deferred_page_count++] = (deferred_page_t){screen, build};
+}
+
+void gui_page_ensure(lv_obj_t *screen) {
+	if (!screen) {
+		return;
+	}
+	for (int i = 0; i < deferred_page_count; i++) {
+		if (deferred_pages[i].screen != screen) {
+			continue;
+		}
+		// Off the list before building: a build that navigates, or that asks
+		// for its own screen again, must not build the page twice.
+		void (*build)(gui_config_t *cfg) = deferred_pages[i].build;
+		deferred_pages[i] = deferred_pages[--deferred_page_count];
+		uint32_t started = lv_tick_get();
+		build(page_cfg);
+		fprintf(stderr, "gui: page built on first use in %u ms\n", (unsigned)lv_tick_elaps(started));
+		return;
+	}
+}
+
+bool gui_init(gui_config_t *cfg, bool split) {
+	page_cfg = cfg;
+
 	// Colours first: every screen below styles itself from the active palette.
 	theme_init();
 
-	// The player sheet is parked off the right edge of the top layer, which
+	// The player sheet is parked below the bottom edge of the top layer, which
 	// makes that layer scrollable unless told otherwise -- and then a sideways
 	// drag scrolls the whole layer, taking the status bar and the floating back
 	// button along with it.
@@ -610,7 +759,6 @@ void gui_init(gui_config_t *cfg) {
 	audiobookcontrols_screen = lv_obj_create(NULL);
 	audiobookscan_screen = lv_obj_create(NULL);
 	chapters_screen = lv_obj_create(NULL);
-	lyricsearch_screen = lv_obj_create(NULL);
 	queue_screen = lv_obj_create(NULL);
 	details_screen = lv_obj_create(NULL);
 	wireless_screen = lv_obj_create(NULL);
@@ -632,16 +780,23 @@ void gui_init(gui_config_t *cfg) {
 	filespage_screen = lv_obj_create(NULL);
 	textview_screen = lv_obj_create(NULL);
 	imageview_screen = lv_obj_create(NULL);
+	lyricsearch_screen = lv_obj_create(NULL);
+	metronomepage_screen = lv_obj_create(NULL);
 	gearboypage_screen = lv_obj_create(NULL);
 	gearboyplay_screen = lv_obj_create(NULL);
 	flappybird_screen = lv_obj_create(NULL);
-	metronomepage_screen = lv_obj_create(NULL);
 
 	// Persistent topbar that stays above every screen.
 	topbar_init(cfg);
+	clock_set_change_hook(clock_changed);
 
 	// Persistent back button that hides when on the main page
+	touch_init(cfg);
 	back_btn_init(cfg);
+
+	// The 2.0 frame: the bottom slot and the mini player in it, above the
+	// pages and under everything that comes up over them.
+	sx_frame_init(cfg);
 
 	// Before the settings pages: the display page draws its screensaver switch
 	// from screensaver_get_enabled(), which is only true once this has read the
@@ -655,6 +810,38 @@ void gui_init(gui_config_t *cfg) {
 
 	main_menu_init(cfg);
 
+	// The first frame is the home screen and the status bar, and that is all
+	// built by now: the hundred-odd pages below (some six thousand objects)
+	// are none of them on it, yet building them was most of the wait for it.
+	// So when asked, stop here, show the home screen, and let main() paint it
+	// before calling gui_init_rest() for the remainder -- in the same order,
+	// so every "built after the page it points at" below still holds.
+	//
+	// Not on a first boot: then the first frame is the greeting or the clock,
+	// which are built at the very end.
+	if (split && !language_needed() && !timeset_needed()) {
+		switch_screen(main_menu_screen);
+		rest_cfg = cfg;
+		return true;
+	}
+	build_rest(cfg, true);
+	return false;
+}
+
+void gui_init_rest(void) {
+	gui_config_t *cfg = rest_cfg;
+	if (!cfg) {
+		return;
+	}
+	rest_cfg = NULL; // first: what follows navigates, and navigation calls back here
+	build_rest(cfg, false);
+}
+
+// Everything gui_init() did not build before the first frame. `final` is the
+// unsplit path, which ends by raising the first-boot questions and opening the
+// home screen; the split path has done the latter already and is never a first
+// boot.
+static void build_rest(gui_config_t *cfg, bool final) {
 	music_init(cfg);
 	coverflow_init(cfg);
 
@@ -678,11 +865,10 @@ void gui_init(gui_config_t *cfg) {
 	radiopage_init(cfg);
 	dacpage_init(cfg);
 	// After dacpage: the More section points at its pages.
-	gearboyplay_init(cfg);  // before the list: one of its rows leads here
+	gearboyplay_init(cfg);	   // before the list: one of its rows leads here
 	gearboysettings_init(cfg); // before the page: its gear opens this
 	gearboypage_init(cfg);
 	flappybird_init(cfg);
-	metronomepage_init(cfg);
 	// before morepage: the books tile opens the shelf, and the shelf opens the
 	// reader.
 	ebookreader_init(cfg);
@@ -690,9 +876,13 @@ void gui_init(gui_config_t *cfg) {
 	ebookmarkspage_init(cfg);
 	ebooksettings_init(cfg); // likewise: the other corner button opens this
 	ebookpage_init(cfg);
+	metronomepage_init(cfg);
+	imageview_init(cfg);
+	lyricsearch_init(cfg);
 	morepage_init(cfg);
-	textview_init(cfg);	 // before filespage: a text file tapped there opens here
-	imageview_init(cfg); // likewise, for a picture
+	recoverywizard_init(cfg);
+	lowbattery_init(cfg);
+	textview_init(cfg); // before filespage: a text file tapped there opens here
 	filespage_init(cfg);
 	streaming_init(cfg);
 
@@ -711,14 +901,13 @@ void gui_init(gui_config_t *cfg) {
 	processespage_init(cfg); // the processes page the devoptions entry opens
 	// after devoptions: the system entry opens the page that can unlock it
 	systempage_init(cfg);
-	bootlogopage_init(cfg); // before appearance: its row carries the screen
 	appearance_init(cfg);
 	language_init(cfg);
 	libraryscan_init(cfg);
 	msebsettings_init(cfg); // before musicsettings: the MSEB page hangs its gear off it
 	eqsettings_init(cfg);	// and the equalizer page hangs its own off this
-	peqsettings_init(cfg); // the parametric page hangs its preset screen off the gear
-	peqautoeq_init(cfg);  // the waveform entry on that page searches AutoEq profiles
+	peqsettings_init(cfg);	// the parametric page hangs its preset screen off the gear
+	peqautoeq_init(cfg);	// the waveform entry on that page searches AutoEq profiles
 	musicsettings_init(cfg);
 	search_init(cfg);
 	medialist_init(cfg);
@@ -726,22 +915,30 @@ void gui_init(gui_config_t *cfg) {
 	audiobookextras_init(cfg); // the bookmarks and summary pages
 	audiobooks_init(cfg);
 	chapters_init(cfg);
-	lyricsearch_init(cfg);
 	trackmenu_init(cfg);
+	historypage_init(cfg);
 
 	// The leftward swipe that pulls the player in works on the browsing pages
-	// -- menu, library lists, file browser -- but NOT on track rows, settings pages
+	// -- menu, library lists, file browser -- but NOT on the settings pages
 	// nor on the queue: there a stray horizontal drag would yank the player
-	// over what is being adjusted or read. Track rows use horizontal swipes for
-	// queue and favourite actions; the home mini-player opens Now Playing.
+	// over what is being adjusted or read.
 	lv_obj_t *const player_swipe_screens[] = {
-		main_menu_screen,		 music_screen,		browser_screen,		medialist_screen,
+		main_menu_screen,
+		music_screen,
+		browser_screen,
+		medialist_screen,
 		// details_screen is deliberately absent: its page is reached FROM the
 		// player, so dragging it sideways to go back into the player would be
 		// one gesture doing two contradictory things. The back swipe is the
 		// only way out of it.
-		medialist_albums_screen, audiobooks_screen, wireless_screen,
-		streaming_screen,		 radiopage_screen,	radiolist_screen,	radiosearch_screen,
+		medialist_tracks_screen,
+		medialist_albums_screen,
+		audiobooks_screen,
+		wireless_screen,
+		streaming_screen,
+		radiopage_screen,
+		radiolist_screen,
+		radiosearch_screen,
 		morepage_screen,
 	};
 	for (size_t i = 0; i < sizeof(player_swipe_screens) / sizeof(player_swipe_screens[0]); i++) {
@@ -753,28 +950,17 @@ void gui_init(gui_config_t *cfg) {
 	// exits are their own buttons -- and the handler itself skips the main
 	// menu.
 	lv_obj_t *const back_swipe_screens[] = {
-		main_menu_screen, music_screen,			browser_screen,	  settings_screen,
-		devoptions_screen, processespage_screen, musicsettings_screen, powersettings_screen, appearance_screen,
-		language_screen,
-		medialist_screen,  medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, audiobooksettings_screen,
-		queue_screen,	  chapters_screen,		 details_screen,   audiobookcontrols_screen,
-		lyricsearch_screen,
-		wireless_screen,
-		wifisettings_screen,
-		btsettings_screen, btaudio_screen,	 airpodspage_screen, airplay_screen,   streaming_screen,
-		radiopage_screen,  radiolist_screen, radiosearch_screen,
-		dlna_screen,	   sonixlink_screen,	 morepage_screen,	  gearboypage_screen, metronomepage_screen,
+		main_menu_screen, music_screen, browser_screen, settings_screen, devoptions_screen, processespage_screen, musicsettings_screen, powersettings_screen, appearance_screen, language_screen, medialist_screen, medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, audiobooksettings_screen, queue_screen, chapters_screen, details_screen, audiobookcontrols_screen, wireless_screen, wifisettings_screen, btsettings_screen, btaudio_screen, airpodspage_screen, airplay_screen, streaming_screen, radiopage_screen, radiolist_screen, radiosearch_screen, dlna_screen, sonixlink_screen, morepage_screen, gearboypage_screen,
 	};
 	for (size_t i = 0; i < sizeof(back_swipe_screens) / sizeof(back_swipe_screens[0]); i++) {
 		switcher_attach_back_gesture(back_swipe_screens[i]);
 	}
 
 	quickpanel_init(cfg); // above the pages, under the popover/power menu
-	popover_init(); // last: its veil must sit above the other top-layer chrome
+	popover_init();		  // last: its veil must sit above the other top-layer chrome
 	powersettings_init(cfg);
 	confirm_init(cfg);
 	toast_init(cfg);
-	lowbattery_init(cfg);
 
 	// The screensaver is drawn both when the panel goes dark (so the wake opens
 	// on it rather than on the page) and when it lights up again; and the
@@ -783,47 +969,8 @@ void gui_init(gui_config_t *cfg) {
 	power_set_wake_hook(screensaver_prepare);
 	player_set_cover_release_cb(screensaver_release_artwork);
 
-	// The notice card: the interface's card style, wrapping, and only as tall
-	// as what it has to say.
-	//
-	// It sits on a veil rather than floating over the page on a drop shadow:
-	// black at 60%, the same one the confirmation dialog uses, so a notice reads
-	// as a notice across the whole interface. The veil is also what makes "tap
-	// anywhere else to dismiss" possible.
-	popup_veil = veil_create(true);
-	lv_obj_add_event_cb(popup_veil, popup_veil_cb, LV_EVENT_CLICKED, NULL);
-
-	popup = lv_obj_create(popup_veil);
-	lv_obj_set_width(popup, cfg->screen_width - 4 * cfg->padding);
-	lv_obj_set_height(popup, LV_SIZE_CONTENT);
-	lv_obj_add_style(popup, &theme_style_card, 0);
-	lv_obj_set_style_radius(popup, 16, 0);
-	lv_obj_set_style_border_width(popup, 0, 0);
-	lv_obj_set_style_shadow_width(popup, 0, 0);
-	lv_obj_set_style_pad_all(popup, 22, 0);
-	lv_obj_set_scrollable(popup, false);
-	lv_obj_set_clickable(popup, true); // so a tap on the card is not a tap outside
-	lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_style_pad_row(popup, 12, 0);
-	lv_obj_center(popup);
-
-	popup_icon = lv_image_create(popup);
-	lv_image_set_src(popup_icon, &icon_headphones_big);
-	lv_obj_add_style(popup_icon, &theme_style_icon, 0);
-	lv_obj_set_hidden(popup_icon, true);
-
-	popup_label = lv_label_create(popup);
-	lv_obj_set_width(popup_label, lv_pct(100));
-	lv_label_set_long_mode(popup_label, LV_LABEL_LONG_WRAP);
-	lv_obj_add_style(popup_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(popup_label, &font_ui_22, 0);
-	lv_obj_set_style_text_align(popup_label, LV_TEXT_ALIGN_CENTER, 0);
-
-	// Three seconds: long enough to read a whole sentence, not just a two-word
-	// notice.
-	popup_timer = lv_timer_create(popup_hide_cb, 3000, NULL);
-	lv_timer_pause(popup_timer); // nothing to hide until a notice is shown
+	// The notices (gui_notify_popup) are the 2.0 toast: see popup_show_icon().
+	sx_toast_init();
 
 	// The gui_post doorbell and the timer that drains it, created here, once, on
 	// the GUI thread, because the timer is the only piece of LVGL in the whole
@@ -858,7 +1005,19 @@ void gui_init(gui_config_t *cfg) {
 	// language brings the clock up itself, so the two only chain here on the
 	// path where the language has already been answered before.
 	welcome_init(cfg);
-	setupwifi_init(cfg); // the step between the language and the clock
+
+	// The pages that own the whole panel: no mini player over a game, the book
+	// being read, or a scan that exits through its own buttons.
+	lv_obj_t *const full_screens[] = {
+		gearboyplay_screen, flappybird_screen, ebookreader_screen, libraryscan_screen, audiobookscan_screen,
+	};
+	for (size_t i = 0; i < sizeof(full_screens) / sizeof(full_screens[0]); i++) {
+		sx_mini_hide_on_screen(full_screens[i]);
+	}
+
+	if (!final) {
+		return;
+	}
 
 	// Ahead of everything else, and only on a device that has never been booted:
 	// the greeting. Its button opens the language picker itself, which in turn

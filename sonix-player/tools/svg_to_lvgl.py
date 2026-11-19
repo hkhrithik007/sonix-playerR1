@@ -44,6 +44,9 @@ OUT_H = os.path.join(REPO_ROOT, "src", "gui", "shell", "icons.h")
 # button, 46 px inside the control centre's 88 px circles, 56 px for a dialog
 # glyph, 96-160 px for a placeholder standing in for missing artwork.
 ICONS = [
+    ("battery-warning.svg", "battery_warning", 48),    ("lyrics-search.svg", "lyrics_search", 36),
+    ("minus.svg", "minus", 36),
+    ("ui3-metronome.svg", "menu_metronome", 34),
     ("chevron-left.svg", "chevron_left", 36),
     ("chevron-right.svg", "chevron_right", 36),
     # Marks the chosen row in a single-choice list, in place of the chevron.
@@ -65,8 +68,8 @@ ICONS = [
     ("repeat.svg", "repeat_all", 30),
     ("repeat-1.svg", "repeat_one", 30),
     ("repeat-off.svg", "repeat_off", 30),
-    ("play.svg", "play", 40),
-    ("pause.svg", "pause", 40),
+    ("ui3-play.svg", "play", 35),
+    ("ui3-pause.svg", "pause", 35),
     # A live stream has no position to come back to, so on a radio the same
     # button stops. Smaller than play/pause: a solid square of the same side
     # reads heavier than either of them.
@@ -82,8 +85,8 @@ ICONS = [
     # Detect changes, beside play/pause: looking over the card, then done.
     ("database-search.svg", "library_checking", 26),
     ("database-check.svg", "library_checked", 26),
-    ("skip-back.svg", "skip_back", 34),
-    ("skip-forward.svg", "skip_forward", 34),
+    ("ui3-skipb.svg", "skip_back", 28),
+    ("ui3-skipf.svg", "skip_forward", 28),
     # The control centre's transport, a size up from the player's: the sheet is
     # reached by feel over whatever was on screen.
     ("play.svg", "play_large", 48),
@@ -113,8 +116,6 @@ ICONS = [
     # Power menu.
     ("power-off.svg", "power_off", 56),
     ("reboot.svg", "reboot", 56),
-    # The low battery warning and the countdown to the shutdown at 1 %.
-    ("battery-warning.svg", "battery_warning", 56),
     # Library pages. One glyph per index, and the stand-in for artwork that is
     # not there: they ride inside the 72 px thumbnail box on a library row and
     # the 56 px one on a search hit.
@@ -155,9 +156,6 @@ ICONS = [
     ("list-x.svg", "list_x", 34),
     ("star-x.svg", "star_x", 34),
     ("search.svg", "search", 34),
-    # Spotify-inspired bottom navigation glyphs, sized to match search.
-    ("home.svg", "nav_home", 34),
-    ("library.svg", "nav_library", 34),
     ("wifi.svg", "wifi", 46),
     ("bluetooth.svg", "bluetooth", 46),
     # Status bar radios. The wifi glyph is the same arc with none, one, two or
@@ -186,8 +184,6 @@ ICONS = [
     ("delete.svg", "delete", 30),
     ("space.svg", "space", 34),
     ("chevron-up.svg", "chevron_up", 32), # built, and currently unused
-    # The Music page's "more below", shown for a moment when the page opens.
-    ("chevron-down.svg", "chevron_down", 36),
     # The control centre's close hint, drawn the way iOS draws its home
     # indicator. Big because the glyph's line spans only the middle 14 of its
     # 24 units, so 56 px of bitmap is a ~33 px bar.
@@ -219,6 +215,12 @@ ICONS = [
     # the gap itself -- the two halves apart while off, closed up while on.
     ("gapless-on-quick.svg", "gapless_on_quick", 46),
     ("gapless-off-quick.svg", "gapless_off_quick", 46),
+    # 2.0's control centre: the volume limit (Lucide's gauge), USB DAC mode
+    # (the USB-C port of its status glyph) and the DAC's filter (a waveform),
+    # at circle size.
+    ("gauge.svg", "volume_limit_quick", 46),
+    ("usb-audio-out.svg", "dac_quick", 46),
+    ("audio-waveform.svg", "dac_filter_quick", 46),
     # File types, in the file manager and on the web page: one glyph per
     # family, at the size of the folder beside them.
     ("files-music.svg", "files_music", 32),
@@ -240,11 +242,7 @@ ICONS = [
     ("grip-horizontal.svg", "grip", 36),
     ("move-vertical.svg", "reorder", 34), # turns on reordering in a playlist
     ("now-playing.svg", "now_playing", 32), # the playing row in the queue
-    # The queue's corner, after a long press on a row: choose rows to take out.
-    # Moving them by hand is arrow_down_up, next to it.
-    ("circle-dashed-check.svg", "select_mode", 34),
     ("plus.svg", "plus", 36),
-    ("minus.svg", "minus", 36),             # the metronome: one beat per minute slower
     ("import.svg", "import", 34), # brings an .m3u from the card into the player's folder
     ("reset.svg", "reset", 36),             # MSEB / equalizer: back to flat
     ("circle-check.svg", "circle_check", 64), # the confirmation popup
@@ -264,8 +262,8 @@ ICONS = [
     ("file-down.svg", "file_down", 34),
     # An episode's state in its row, and the play and pause buttons of the podcast pages.
     ("check.svg", "check_small", 22),
-    ("play.svg", "play_small", 26),
-    ("pause.svg", "pause_small", 26),
+    ("ui3-play.svg", "play_small", 28),
+    ("ui3-pause.svg", "pause_small", 28),
     # The same glyph the podcast rows use, at the size the three the player
     # stands in with are drawn: an episode with no artwork gets this one.
     ("podcast-list.svg", "podcast_cover", 128),
@@ -276,12 +274,9 @@ ICONS = [
     # it does the same job as list-a-z on the all-tracks page, and two buttons
     # that sort a list should weigh the same.
     ("arrow-down-up.svg", "arrow_down_up", 34),
-    ("star.svg", "star", 32),
-    ("star-filled.svg", "star_filled", 32),
+    ("ui3-star.svg", "star", 28),
+    ("ui3-starf.svg", "star_filled", 28),
     ("star.svg", "star_corner", 34),
-    # Over the lyrics, beside the star or the ellipsis: look the words up again
-    # on LRCLIB, to replace them. The star's size, since the two sit together.
-    ("lyrics-search.svg", "lyrics_search", 32),
     ("radio-recent.svg", "radio_recent", 34), # stations played most recently
     ("custom-radio.svg", "radio_custom", 34), # the stations written into radio.txt
     # Under a station's name: the stream's quality, one glyph in four colours
@@ -386,14 +381,68 @@ ICONS = [
     # The heart that jumps out when the coffee QR code is closed. 160 px
     # because the animation grows it to 1:1 and no further.
     ("heart.svg", "heart", 160),
+    # Sonix UI 2.0. The player's way out, now that it is put away downwards;
+    # the moon in the status bar while a sleep timer runs; and the "play next"
+    # glyph on the underlay of a row pulled to the right (its partner, "add to
+    # the end", is list_plus).
+    ("chevron-down.svg", "chevron_down", 36),
+    ("moon.svg", "moon_status", 24),
+    ("list-start.svg", "list_start", 30),
+    ("list-plus.svg", "list_plus_small", 30),
+    ("x.svg", "x_small", 30),
+    # The glyph at the start of a toast, which is a 56 px line now.
+    ("circle-check.svg", "circle_check_small", 28),
+    ("circle-alert.svg", "circle_alert_small", 28),
 ]
 
 # Main menu and section tiles, which keep their own colours and are therefore
 # listed separately from the recolourable glyphs above. Stored at exactly the
 # size they are drawn at: LVGL does not scale them, so a larger bitmap would be
 # weight in the binary and nothing else.
-MAIN_MENU_ICON_SIZE = 128
-SECTION_ICON_SIZE = 112
+MAIN_MENU_ICON_SIZE = 34
+SECTION_ICON_SIZE = 34
+
+# Graphite tiles use small, pre-rasterised line glyphs.
+ICONS += [
+    ("ui3-music.svg", "menu_music", 34),
+    ("ui3-music.svg", "menu_all", 34),
+    ("ui3-disc.svg", "menu_album", 34),
+    ("ui3-user.svg", "menu_artist", 34),
+    ("ui3-users.svg", "menu_album_artist", 34),
+    ("ui3-tag.svg", "menu_genre", 34),
+    ("ui3-calendar.svg", "menu_year", 34),
+    ("ui3-star.svg", "menu_favourites", 34),
+    ("history.svg", "menu_most_played", 34),
+    ("ui3-folder.svg", "menu_explorer", 34),
+    ("ui3-list.svg", "menu_playlist", 34),
+    ("ui3-radio.svg", "menu_streaming", 34),
+    ("ui3-globe.svg", "menu_wireless", 34),
+    ("wifi.svg", "menu_wifi_settings", 34),
+    ("bluetooth.svg", "menu_bluetooth", 34),
+    ("airplay-status.svg", "menu_airplay", 34),
+    ("wifi-transfer-quick.svg", "menu_wifi_transfer", 34),
+    ("sonixlink-status.svg", "menu_sonixlink", 34),
+    ("dlna-quick.svg", "menu_dlna", 34),
+    ("ui3-radio.svg", "menu_radio", 34),
+    ("podcast-list.svg", "menu_podcast", 34),
+    ("ui3-book.svg", "menu_audiobooks", 34),
+    ("book-headphones.svg", "menu_audiobook_library", 34),
+    ("chapter.svg", "menu_audiobook_series", 34),
+    ("artist.svg", "menu_audiobook_author", 34),
+    ("bookmark.svg", "menu_audiobook_continue", 34),
+    ("ui3-sliders.svg", "menu_settings", 34),
+    ("ui3-grid.svg", "menu_more", 34),
+    ("usb-audio-out.svg", "menu_dac", 34),
+    ("files-gamepad.svg", "menu_gearboy", 34),
+    ("zap.svg", "menu_flappy_bird", 34),
+    ("files-book.svg", "menu_books", 34),
+    ("folder-open.svg", "menu_file_explorer", 34),
+    ("ui3-wave.svg", "menu_tidal", 34),
+    ("ui3-disc.svg", "menu_qobuz", 34),
+    ("ui3-server.svg", "menu_subsonic", 34),
+    ("ui3-music.svg", "menu_yandex", 34),
+    ("ui3-spotify.svg", "menu_spotify", 34),
+]
 
 COLOR_ICONS = [
     # The quality badges under a track's title. Here rather than above because
@@ -409,54 +458,20 @@ COLOR_ICONS = [
     ("sonixlink-icon-page.png", "sonixlink_page", 200),
     ("bluetooth-receiver-icon-page.png", "bluetooth_receiver_page", 200),
 
-    ("music.png", "menu_music", MAIN_MENU_ICON_SIZE),
     # The Musica section's own grid.
-    ("all.png", "menu_all", SECTION_ICON_SIZE),
-    ("album.png", "menu_album", SECTION_ICON_SIZE),
-    ("artist.png", "menu_artist", SECTION_ICON_SIZE),
-    ("album_artist.png", "menu_album_artist", SECTION_ICON_SIZE),
-    ("genre.png", "menu_genre", SECTION_ICON_SIZE),
-    ("year.png", "menu_year", SECTION_ICON_SIZE),
-    ("favourites.png", "menu_favourites", SECTION_ICON_SIZE),
-    ("most-played.png", "menu_most_played", SECTION_ICON_SIZE),
-    ("explorer.png", "menu_explorer", SECTION_ICON_SIZE),
-    ("playlist.png", "menu_playlist", SECTION_ICON_SIZE),
-    ("streaming.png", "menu_streaming", MAIN_MENU_ICON_SIZE),
-    ("wireless.png", "menu_wireless", MAIN_MENU_ICON_SIZE),
     # The Wireless section's own grid.
-    ("wifi-settings.png", "menu_wifi_settings", SECTION_ICON_SIZE),
-    ("bluetooth.png", "menu_bluetooth", SECTION_ICON_SIZE),
-    ("airplay.png", "menu_airplay", SECTION_ICON_SIZE),
-    ("wifi-transfer.png", "menu_wifi_transfer", SECTION_ICON_SIZE),
-    ("sonixlink.png", "menu_sonixlink", SECTION_ICON_SIZE),
-    ("dlna.png", "menu_dlna", SECTION_ICON_SIZE),
     # The Streaming section's own grid.
-    ("tidal.png", "menu_tidal", SECTION_ICON_SIZE),
-    ("qobuz.png", "menu_qobuz", SECTION_ICON_SIZE),
-    ("radio.png", "menu_radio", SECTION_ICON_SIZE),
-    ("podcast.png", "menu_podcast", SECTION_ICON_SIZE),
-    ("audiobooks.png", "menu_audiobooks", MAIN_MENU_ICON_SIZE),
-    ("audiobook-library.png", "menu_audiobook_library", SECTION_ICON_SIZE),
-    ("audiobook-series.png", "menu_audiobook_series", SECTION_ICON_SIZE),
-    ("audiobook-author.png", "menu_audiobook_author", SECTION_ICON_SIZE),
-    ("audiobook-continue.png", "menu_audiobook_continue", SECTION_ICON_SIZE),
-    ("settings.png", "menu_settings", MAIN_MENU_ICON_SIZE),
-    ("more.png", "menu_more", MAIN_MENU_ICON_SIZE),
     # What lives inside "More", at section size.
-    ("dac.png", "menu_dac", SECTION_ICON_SIZE),
-    ("gearboy.png", "menu_gearboy", SECTION_ICON_SIZE),
-    ("flappy-bird.png", "menu_flappy_bird", SECTION_ICON_SIZE),
-    ("ebook.png", "menu_books", SECTION_ICON_SIZE),
-    ("file-explorer.png", "menu_file_explorer", SECTION_ICON_SIZE),
-    ("metronome.png", "menu_metronome", SECTION_ICON_SIZE),
 
     # The service badges in the player's top right corner, where the radio puts
     # its LIVE mark. They sit over the cover art, so these are the outlined
     # versions rather than the menu ones, which would vanish on a dark cover.
-    # One size for all three: they replace each other in the same place.
+    # One size for all of them: they replace each other in the same place.
     ("qobuz-badge.png", "qobuz_badge", 52),
     ("tidal-badge.png", "tidal_badge", 52),
     ("podcast-badge.png", "podcast_badge", 52),
+    ("subsonic-badge.png", "subsonic_badge", 52),
+    ("yandex-badge.png", "yandex_badge", 52),
 ]
 
 

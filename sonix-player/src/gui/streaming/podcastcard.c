@@ -1,4 +1,5 @@
 #include "podcastcard.h"
+#include "src/gui/shell/artview.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -15,14 +16,17 @@
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/trackmenu.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/shell/icons.h"
-#include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
 #include "src/gui/shell/switcher.h"
-#include "src/gui/shell/tabbar.h"
+#include "src/gui/shell/sx_card.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/gui/streaming/podcastpage.h"
@@ -48,6 +52,8 @@ lv_obj_t *podcastcard_screen;
 lv_obj_t *podcastcard_feed_screen;
 
 static gui_config_t *g_cfg;
+// Written and read only by the GUI thread for the latest shelf scan.
+static bool last_scan_pending;
 
 // ---------------------------------------------------------------------------
 // what the card says about an episode
@@ -235,6 +241,8 @@ static void count_folder(const char *folder, podcastcard_show_t *show) {
 	if (!dir) {
 		return;
 	}
+	if (podcastpair_pending_fd(dirfd(dir)))
+		last_scan_pending = true;
 	// One pass over the listing: a download from Sonix has its ".tags" beside
 	// it, and seeing that name is cheaper than asking after every file.
 	char sidecar[900] = "";
@@ -249,11 +257,22 @@ static void count_folder(const char *folder, podcastcard_show_t *show) {
 		if (!is_episode_name(de->d_name) || !entry_is(de, path, false)) {
 			continue;
 		}
-		count_file(path, show);
+		if (podcastpair_ready_at(dirfd(dir), de->d_name))
+			count_file(path, show);
+		else
+			last_scan_pending = true;
 	}
 	closedir(dir);
 	if (sidecar[0]) {
 		show->downloaded = true;
+		// Imported folders include IDs for collision-free filenames. Their
+		// display name stays the show's title, not the storage suffix.
+		char service[24];
+		if (podcastcache_tag(sidecar, "source_service", service, sizeof(service)) && (strcmp(service, "yandex") == 0 || strcmp(service, "zvuk") == 0)) {
+			char title[sizeof(show->name)];
+			if (podcastcache_tag(sidecar, "album", title, sizeof(title)))
+				snprintf(show->name, sizeof(show->name), "%s", title);
+		}
 		char text[32];
 		if (podcastcache_tag(sidecar, "feed_id", text, sizeof(text))) {
 			show->feed_id = strtoll(text, NULL, 10);
@@ -270,8 +289,12 @@ static int show_cmp(const void *a, const void *b) {
 	return strcasecmp(x->name, y->name);
 }
 
+bool podcastcard_scan_pending(void) { return last_scan_pending; }
+
 int podcastcard_shows(podcastcard_show_t *out, int max) {
-	const char *root = podcastdl_root();
+	last_scan_pending = false;
+	char root[512];
+	podcastdl_root(root, sizeof(root));
 	if (!out || max <= 0 || !root[0]) {
 		return 0;
 	}
@@ -286,6 +309,8 @@ int podcastcard_shows(podcastcard_show_t *out, int max) {
 		heard_free();
 		return 0;
 	}
+	if (podcastpair_pending_fd(dirfd(dir)))
+		last_scan_pending = true;
 	struct dirent *de;
 	while ((de = readdir(dir)) != NULL && count < max) {
 		if (de->d_name[0] == '.' || strlen(de->d_name) >= sizeof(out[0].name)) {
@@ -294,7 +319,10 @@ int podcastcard_shows(podcastcard_show_t *out, int max) {
 		char path[900];
 		snprintf(path, sizeof(path), "%s/%s", root, de->d_name);
 		if (is_episode_name(de->d_name) && entry_is(de, path, false)) {
-			count_file(path, &loose);
+			if (podcastpair_ready_at(dirfd(dir), de->d_name))
+				count_file(path, &loose);
+			else
+				last_scan_pending = true;
 			continue;
 		}
 		if (!entry_is(de, path, true)) {
@@ -323,14 +351,18 @@ const char *podcastcard_show_name(const podcastcard_show_t *show) {
 }
 
 int podcastcard_count_for_title(const char *title) {
-	const char *root = podcastdl_root();
+	char root[512];
+	podcastdl_root(root, sizeof(root));
 	if (!title || !title[0] || !root[0]) {
 		return 0;
 	}
 	char name[256];
 	podcastdl_safe_name(title, "Podcast", name, sizeof(name));
 	char folder[600];
-	snprintf(folder, sizeof(folder), "%s/%s", root, name);
+	int written = snprintf(folder, sizeof(folder), "%s/%s", root, name);
+	if (written < 0 || (size_t)written >= sizeof(folder)) {
+		return 0;
+	}
 	DIR *dir = opendir(folder);
 	if (!dir) {
 		return 0;
@@ -338,7 +370,7 @@ int podcastcard_count_for_title(const char *title) {
 	int n = 0;
 	struct dirent *de;
 	while ((de = readdir(dir)) != NULL) {
-		if (is_episode_name(de->d_name)) {
+		if (is_episode_name(de->d_name) && podcastpair_ready_at(dirfd(dir), de->d_name)) {
 			n++;
 		}
 	}
@@ -382,16 +414,18 @@ static bool is_now(const char *path, long long episode_id) {
 	return (path && path[0] && strcmp(path, now_path) == 0) || (episode_id > 0 && episode_id == now_episode);
 }
 
-// To the player, without starting the episode again: tapping the one already
-// in it would otherwise take it back to the second last written down.
-// `go_on` also lets a paused one carry on.
-static void show_player(bool go_on) {
+// The episode already in the player, tapped or resumed: it is not started
+// again (that would take it back to the second last written down), a paused
+// one carries on, and the page stays -- the mini player shows it, as for any
+// episode started here (the handoff: a tap on a row plays, it does not leave
+// the list). The player itself opens from the mini player, or from "Now
+// listening" on the podcasts' page.
+static void show_player(void) {
 	bool playing = false;
-	if (go_on && now_read(&playing) && !playing) {
+	if (now_read(&playing) && !playing) {
 		player_key_play_pause();
 	}
 	player_refresh_now_playing();
-	switch_screen(player_screen);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +467,8 @@ typedef struct {
 	lv_obj_t *detail;
 	lv_obj_t *bar;
 	lv_obj_t *menu_btn;
-	lv_obj_t *mark; // the tick on a chosen row while choosing, where the three dots are
+	lv_obj_t *mark; // while choosing, in the status's place: the tick on a chosen row,
+	lv_obj_t *ring; // and an empty ring on the others
 	int index; // into shown[]; -1 for none, -2 to force a rebind
 } ep_row_t;
 
@@ -450,7 +485,7 @@ typedef struct {
 	lv_obj_t *hero_left; // the card's: how many, or how long, still to hear
 	lv_obj_t *resume_btn;
 	lv_obj_t *online_row; // the card's: the same podcast in the catalogue
-	tabbar_t filters;
+	lv_obj_t *filter_pills[3];
 	lv_obj_t *body;
 	lv_obj_t *more_spinner; // the catalogue's: the next step coming
 	lv_obj_t *loader;		// the catalogue's: the first step coming
@@ -582,6 +617,8 @@ static int folder_read(const char *folder, episode_t *out, int max, char (*title
 		}
 		char path[900];
 		snprintf(path, sizeof(path), "%.600s/%.255s", folder, de->d_name);
+		if (!podcastpair_ready_at(dirfd(dir), de->d_name))
+			continue;
 		// The listing says what the entry is and a date in its name says when
 		// it is from: only a file that leaves either open is asked.
 		time_t when = date_in_name(de->d_name);
@@ -736,18 +773,8 @@ static void titles_done_cb(void *user) {
 typedef struct {
 	unsigned generation;
 	int count;
-	char **paths;	 // copies: the array may be rebuilt meanwhile
-	uint8_t *stateless; // per path: no state was found under the file
+	char **paths; // copies: the array may be rebuilt meanwhile
 } titles_job_t;
-
-static void titles_job_free(titles_job_t *job) {
-	for (int i = 0; i < job->count; i++) {
-		free(job->paths[i]);
-	}
-	free(job->paths);
-	free(job->stateless);
-	free(job);
-}
 
 static void *titles_main(void *arg) {
 	titles_job_t *job = arg;
@@ -759,11 +786,6 @@ static void *titles_main(void *arg) {
 		pthread_mutex_unlock(&titles_lock);
 		if (stale) {
 			break;
-		}
-		// A download whose episode was played before it was saved: its state
-		// still names the other file. Once it names this one the page redraws.
-		if (job->stateless[i]) {
-			podcaststate_downloaded(podcastcache_episode_id(job->paths[i]), job->paths[i]);
 		}
 		char title[PODCAST_TITLE_MAX] = "";
 		if (!podcastcache_tag(job->paths[i], "title", title, sizeof(title))) {
@@ -790,16 +812,12 @@ static void *titles_main(void *arg) {
 	}
 	free(m);
 	gui_post(titles_done_cb, (void *)(uintptr_t)job->generation);
-	titles_job_free(job);
-	return NULL;
-}
-
-static void titles_job_add(titles_job_t *job, const episode_t *e) {
-	job->paths[job->count] = strdup(e->path);
-	if (job->paths[job->count]) {
-		job->stateless[job->count] = e->touched == 0;
-		job->count++;
+	for (int i = 0; i < job->count; i++) {
+		free(job->paths[i]);
 	}
+	free(job->paths);
+	free(job);
+	return NULL;
 }
 
 static void titles_start(void) {
@@ -809,9 +827,8 @@ static void titles_start(void) {
 		return;
 	}
 	job->paths = calloc((size_t)(p->count > 0 ? p->count : 1), sizeof(char *));
-	job->stateless = calloc((size_t)(p->count > 0 ? p->count : 1), 1);
-	if (!job->paths || !job->stateless) {
-		titles_job_free(job);
+	if (!job->paths) {
+		free(job);
 		return;
 	}
 	// A reader still at work on an older list notices the generation has moved
@@ -821,7 +838,10 @@ static void titles_start(void) {
 	pthread_mutex_unlock(&titles_lock);
 	// The order shown, so the rows on screen get their titles first.
 	for (int k = 0; k < p->shown_count; k++) {
-		titles_job_add(job, &p->episodes[p->shown[k]]);
+		job->paths[job->count] = strdup(p->episodes[p->shown[k]].path);
+		if (job->paths[job->count]) {
+			job->count++;
+		}
 	}
 	for (int i = 0; i < p->count; i++) {
 		bool listed = false;
@@ -829,14 +849,21 @@ static void titles_start(void) {
 			listed = p->shown[k] == i;
 		}
 		if (!listed) {
-			titles_job_add(job, &p->episodes[i]);
+			job->paths[job->count] = strdup(p->episodes[i].path);
+			if (job->paths[job->count]) {
+				job->count++;
+			}
 		}
 	}
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, titles_main, job) == 0) {
 		pthread_detach(thread);
 	} else {
-		titles_job_free(job);
+		for (int i = 0; i < job->count; i++) {
+			free(job->paths[i]);
+		}
+		free(job->paths);
+		free(job);
 	}
 }
 
@@ -863,9 +890,9 @@ static void format_minutes(double seconds, char *out, size_t size) {
 		minutes = 1;
 	}
 	if (minutes < 60) {
-		snprintf(out, size, "%d min", minutes);
+		snprintf(out, size, tr("podcast_duration_min"), minutes);
 	} else {
-		snprintf(out, size, "%d h %02d min", minutes / 60, minutes % 60);
+		snprintf(out, size, tr("podcast_duration_h_min"), minutes / 60, minutes % 60);
 	}
 }
 
@@ -895,15 +922,21 @@ static void episode_detail(const episode_t *e, char *out, size_t size) {
 // the page
 // ---------------------------------------------------------------------------
 
-// While choosing, the three dots go and a chosen row has the tick in their
-// place, as on the library lists.
+// While choosing, the episode's status gives way to a tick or an empty ring,
+// on the left where the round button in the corner cannot cover it, and the
+// three dots go.
 static void row_paint_choice(page_t *p, ep_row_t *row) {
 	int index = row->index;
 	bool on = p->selecting && index >= 0 && index < p->shown_count && p->chosen[p->shown[index]];
-	if (on) {
-		lv_obj_set_style_image_recolor(row->mark, theme()->accent, 0);
+	if (p->selecting) {
+		lv_obj_set_hidden(row->dot, true);
+		lv_obj_set_hidden(row->arc, true);
+		lv_obj_set_hidden(row->check, true);
+		lv_obj_set_style_image_recolor(row->mark, sx_pal()->accent, 0);
+		lv_obj_set_style_border_color(row->ring, sx_pal()->text, 0);
 	}
 	lv_obj_set_hidden(row->mark, !on);
+	lv_obj_set_hidden(row->ring, !p->selecting || on);
 	lv_obj_set_hidden(row->menu_btn, p->selecting);
 }
 
@@ -942,6 +975,9 @@ static void row_bind(page_t *p, ep_row_t *row, int index) {
 			permille = 1000;
 		}
 		lv_arc_set_value(row->arc, permille / 10);
+		// The palette as it is now: it follows the cover playing.
+		lv_obj_set_style_arc_color(row->arc, sx_pal()->press, LV_PART_MAIN);
+		lv_obj_set_style_arc_color(row->arc, sx_pal()->accent, LV_PART_INDICATOR);
 		lv_bar_set_value(row->bar, permille, LV_ANIM_OFF);
 	}
 	// A heard episode is quieter than one waiting.
@@ -1011,18 +1047,20 @@ static int count_heard(const page_t *p, bool heard_ones) {
 static void paint_pills(page_t *p) {
 	const char *const TAGS[3] = {"podcast_filter_unheard", "podcast_filter_all", "podcast_filter_heard"};
 	const int counts[3] = {count_heard(p, false), p->count, count_heard(p, true)};
-	for (int i = 0; i < p->filters.count; i++) {
+	for (int i = 0; i < 3; i++) {
+		if (!p->filter_pills[i]) {
+			continue;
+		}
+		lv_obj_t *label = lv_obj_get_child(p->filter_pills[i], 0);
 		// The catalogue's list arrives a step at a time: a count would be the
 		// count of what has arrived so far.
-		char text[96];
 		if (p->feed) {
-			snprintf(text, sizeof(text), "%s", tr(TAGS[i]));
+			lv_label_set_text(label, tr(TAGS[i]));
 		} else {
-			snprintf(text, sizeof(text), "%s %d", tr(TAGS[i]), counts[i]);
+			lv_label_set_text_fmt(label, "%s  %d", tr(TAGS[i]), counts[i]);
 		}
-		tabbar_set_text(&p->filters, i, text);
+		settingsrow_pill_active(p->filter_pills[i], (int)p->filter == i);
 	}
-	tabbar_set_active(&p->filters, (int)p->filter);
 }
 
 static void refresh_counts_card(page_t *p) {
@@ -1127,6 +1165,7 @@ static void refill(page_t *p, bool keep_scroll) {
 // ---------------------------------------------------------------------------
 
 static void hero_placeholder(page_t *p) {
+	sx_artview_detach(p->hero_cover);
 	lv_image_set_src(p->hero_cover, &icon_podcast_list);
 	lv_obj_add_style(p->hero_cover, &theme_style_icon, 0);
 	lv_obj_set_style_image_recolor_opa(p->hero_cover, LV_OPA_COVER, 0);
@@ -1135,16 +1174,16 @@ static void hero_placeholder(page_t *p) {
 static void hero_show(page_t *p, const cover_image_t *image) {
 	// Off the old pixels before they go.
 	hero_placeholder(p);
-	cover_free(&p->hero_image);
+	sx_artview_release_cover(&p->hero_image);
 	p->hero_image = *image;
 	lv_obj_remove_style(p->hero_cover, &theme_style_icon, 0);
 	lv_obj_set_style_image_recolor_opa(p->hero_cover, LV_OPA_TRANSP, 0);
-	lv_image_set_src(p->hero_cover, &p->hero_image.dsc);
+	sx_artview_bind(p->hero_cover, &p->hero_image.dsc, p->hero_image.display_generation);
 }
 
 static void hero_clear(page_t *p) {
 	hero_placeholder(p);
-	cover_free(&p->hero_image);
+	sx_artview_release_cover(&p->hero_image);
 	p->hero_waiting = false;
 }
 
@@ -1223,8 +1262,8 @@ static void play_paths(const char *const *paths, int count) {
 		return;
 	}
 	device_state_play_list_ordered(paths, count, 0);
+	// 2.0: the page stays, the mini player comes up with the episode.
 	player_refresh_now_playing();
-	switch_screen(player_screen);
 }
 
 static int page_row_index(page_t *p, lv_obj_t *button) {
@@ -1257,7 +1296,7 @@ static void row_clicked_cb(lv_event_t *e) {
 	}
 	episode_t *ep = &p->episodes[p->shown[index]];
 	if (is_now(ep->path, ep->id)) {
-		show_player(false);
+		show_player();
 		return;
 	}
 	if (p->feed) {
@@ -1281,7 +1320,7 @@ bool podcastcard_play(const podcaststate_t *state) {
 		return false;
 	}
 	if (is_now(state->path, state->episode_id)) {
-		show_player(true);
+		show_player();
 		return true;
 	}
 	if (!podcastdl_owns(state->path)) {
@@ -1334,7 +1373,7 @@ static void resume_cb(lv_event_t *e) {
 	}
 	podcaststate_t *st = &p->resume;
 	if (is_now(st->path, st->episode_id)) {
-		show_player(true);
+		show_player();
 		return;
 	}
 	if (!p->feed) {
@@ -1405,13 +1444,18 @@ static void play_next_cb(void *user) {
 	if (!e) {
 		return;
 	}
-	bool ok = menu_page->feed ? podcastpage_feed_play_next(e->item) : playlist_insert_next(e->path);
-	if (ok) {
-		device_state_queue_changed();
-		toast_success(tr("added_to_the_queue"));
-	} else {
+	// The queue's one door (trackmenu_queue_paths): "Play next" the 2.0 way --
+	// a copy further down moves up rather than playing twice -- written down
+	// once, and said in a toast with "Undo" like every other change to it.
+	char path[512] = "";
+	bool ok = menu_page->feed ? podcastpage_feed_path(e->item, path, sizeof(path))
+							  : (e->path && snprintf(path, sizeof(path), "%s", e->path) > 0);
+	if (!ok) {
 		toast_error(tr("playlist_cannot_add_the_tracks"));
+		return;
 	}
+	const char *one = path;
+	trackmenu_queue_paths(&one, 1, PLAYLIST_QUEUE_NEXT);
 }
 
 static void download_cb(void *user) {
@@ -1424,7 +1468,8 @@ static void download_cb(void *user) {
 }
 
 static void remove_folder_if_empty(const char *folder) {
-	if (strcmp(folder, podcastdl_root()) == 0) {
+	char root[512];
+	if (!podcastdl_root(root, sizeof(root)) || strcmp(folder, root) == 0) {
 		return; // the Podcast folder itself stays
 	}
 	DIR *dir = opendir(folder);
@@ -1541,9 +1586,7 @@ static void selection_show(page_t *p) {
 	if (p->selecting) {
 		lv_obj_move_foreground(p->sel_action_btn);
 	}
-	// Room under the last row while the round button is up, so that row can be
-	// scrolled clear of it.
-	lv_obj_set_style_pad_bottom(p->page, p->selecting ? g_cfg->padding + SEL_FAB_SIZE + 12 : g_cfg->padding, 0);
+	// Drawn again: leaving the mode puts each row's status back.
 	rows_invalidate(p);
 	window_update(p);
 }
@@ -1749,8 +1792,6 @@ void podcastcard_feed_loaded(unsigned ticket, int count, const char *error, cons
 		if (info->episode_count > 0) {
 			open_feed.episode_count = info->episode_count;
 		}
-		// A followed podcast's row in the list says the same.
-		podcastsubs_update(&open_feed);
 		if (!open_feed.title[0] && info->title[0]) {
 			snprintf(open_feed.title, sizeof(open_feed.title), "%s", info->title);
 			lv_label_set_text(p->page_title, open_feed.title);
@@ -1789,7 +1830,7 @@ void podcastcard_open_feed(const podcast_feed_t *feed) {
 		}
 		lv_label_set_text(p->page_title, open_feed.title[0] ? open_feed.title : tr("podcasts"));
 		podcastpage_set_browsing(&open_feed);
-		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0] || open_feed.episode_count <= 0);
+		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0]);
 		refill(p, false);
 	} else {
 		// The same podcast again: whatever this record knows that the page
@@ -1820,8 +1861,8 @@ static void filter_cb(lv_event_t *e) {
 	if (switcher_back_drag_active()) {
 		return;
 	}
-	lv_obj_t *tab = lv_event_get_current_target(e);
-	page_t *p = lv_obj_get_parent(tab) == card_page.filters.bar ? &card_page : &feed_page;
+	lv_obj_t *pill = lv_event_get_current_target(e);
+	page_t *p = lv_obj_get_parent(lv_obj_get_parent(pill)) == card_page.page ? &card_page : &feed_page;
 	p->filter = (filter_t)(intptr_t)lv_event_get_user_data(e);
 	refill(p, false);
 	if (!p->feed) {
@@ -1867,13 +1908,14 @@ static void online_cb(lv_event_t *e) {
 static void build_rows(page_t *p, int width) {
 	for (int i = 0; i < EP_ROW_POOL; i++) {
 		ep_row_t *row = &p->rows[i];
+		// The 2.0 row's look (sx_row.h): transparent on the page, the pressed
+		// fill under a finger, the row's radius -- an episode is a row of a
+		// list, not a card of its own.
 		row->button = lv_btn_create(p->body);
+		lv_obj_remove_style_all(row->button);
 		lv_obj_set_size(row->button, width, EP_ROW_HEIGHT);
-		lv_obj_add_style(row->button, &theme_style_card, 0);
-		lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
-		lv_obj_set_style_radius(row->button, 12, 0);
-		lv_obj_set_style_border_width(row->button, 0, 0);
-		lv_obj_set_style_shadow_width(row->button, 0, 0);
+		lv_obj_add_style(row->button, &sx_style_press, LV_STATE_PRESSED);
+		lv_obj_set_style_radius(row->button, SX_ROW_R, 0);
 		lv_obj_set_style_pad_left(row->button, 12, 0);
 		lv_obj_set_style_pad_right(row->button, 4, 0);
 		lv_obj_set_style_pad_ver(row->button, 0, 0);
@@ -1898,8 +1940,8 @@ static void build_rows(page_t *p, int width) {
 		lv_obj_remove_style_all(row->dot);
 		lv_obj_set_size(row->dot, 12, 12);
 		lv_obj_set_style_radius(row->dot, LV_RADIUS_CIRCLE, 0);
+		lv_obj_add_style(row->dot, &sx_style_accent, 0);
 		lv_obj_set_style_bg_opa(row->dot, LV_OPA_COVER, 0);
-		lv_obj_set_style_bg_color(row->dot, theme()->accent, 0);
 		lv_obj_center(row->dot);
 		lv_obj_set_event_bubble(row->dot, true);
 
@@ -1912,11 +1954,26 @@ static void build_rows(page_t *p, int width) {
 		lv_obj_remove_style(row->arc, NULL, LV_PART_KNOB);
 		lv_obj_set_style_arc_width(row->arc, 4, LV_PART_MAIN);
 		lv_obj_set_style_arc_width(row->arc, 4, LV_PART_INDICATOR);
-		lv_obj_set_style_arc_color(row->arc, theme()->surface_pressed, LV_PART_MAIN);
-		lv_obj_set_style_arc_color(row->arc, theme()->accent, LV_PART_INDICATOR);
 		lv_obj_set_style_pad_all(row->arc, 0, 0);
 		lv_obj_set_clickable(row->arc, false);
 		lv_obj_set_event_bubble(row->arc, true);
+
+		row->ring = lv_obj_create(status);
+		lv_obj_remove_style_all(row->ring);
+		lv_obj_set_size(row->ring, 24, 24);
+		lv_obj_set_style_radius(row->ring, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_border_width(row->ring, 2, 0);
+		lv_obj_set_style_border_opa(row->ring, LV_OPA_50, 0);
+		lv_obj_center(row->ring);
+		lv_obj_set_event_bubble(row->ring, true);
+		lv_obj_set_hidden(row->ring, true);
+
+		row->mark = lv_image_create(status);
+		lv_image_set_src(row->mark, &icon_check_small);
+		lv_obj_set_style_image_recolor_opa(row->mark, LV_OPA_COVER, 0);
+		lv_obj_center(row->mark);
+		lv_obj_set_event_bubble(row->mark, true);
+		lv_obj_set_hidden(row->mark, true);
 
 		row->check = lv_image_create(status);
 		lv_image_set_src(row->check, &icon_check_small);
@@ -1937,23 +1994,23 @@ static void build_rows(page_t *p, int width) {
 		row->title = lv_label_create(texts);
 		lv_label_set_long_mode(row->title, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(row->title, lv_pct(100));
-		lv_obj_set_height(row->title, lv_font_get_line_height(&font_ui_22));
-		lv_obj_add_style(row->title, &theme_style_text, 0);
-		lv_obj_set_style_text_font(row->title, &font_ui_22, 0);
+		lv_obj_set_height(row->title, lv_font_get_line_height(&font_ui_24));
+		lv_obj_add_style(row->title, &sx_style_text, 0);
+		lv_obj_set_style_text_font(row->title, &font_ui_24, 0);
 
 		row->detail = lv_label_create(texts);
 		lv_label_set_long_mode(row->detail, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(row->detail, lv_pct(100));
-		lv_obj_set_height(row->detail, lv_font_get_line_height(&font_ui_18));
-		lv_obj_add_style(row->detail, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(row->detail, &font_ui_18, 0);
+		lv_obj_set_height(row->detail, lv_font_get_line_height(&font_ui_20));
+		lv_obj_add_style(row->detail, &sx_style_text2, 0);
+		lv_obj_set_style_text_font(row->detail, &font_ui_20, 0);
 
 		row->bar = lv_bar_create(texts);
 		lv_obj_set_size(row->bar, lv_pct(100), 5);
 		lv_bar_set_range(row->bar, 0, 1000);
-		lv_obj_set_style_bg_color(row->bar, theme()->surface_pressed, LV_PART_MAIN);
+		lv_obj_add_style(row->bar, &sx_style_press, LV_PART_MAIN);
 		lv_obj_set_style_bg_opa(row->bar, LV_OPA_COVER, LV_PART_MAIN);
-		lv_obj_set_style_bg_color(row->bar, theme()->accent, LV_PART_INDICATOR);
+		lv_obj_add_style(row->bar, &sx_style_accent, LV_PART_INDICATOR);
 		lv_obj_set_style_radius(row->bar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
 		lv_obj_set_style_radius(row->bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
 		lv_obj_set_event_bubble(row->bar, true);
@@ -1967,18 +2024,9 @@ static void build_rows(page_t *p, int width) {
 		lv_obj_add_event_cb(row->menu_btn, row_menu_cb, LV_EVENT_CLICKED, p);
 		lv_obj_t *dots = lv_image_create(row->menu_btn);
 		lv_image_set_src(dots, &icon_ellipsis_vertical);
-		lv_obj_add_style(dots, &theme_style_icon, 0);
+		lv_obj_add_style(dots, &sx_style_icon2, 0);
 		lv_obj_set_style_image_recolor_opa(dots, LV_OPA_COVER, 0);
 		lv_obj_center(dots);
-
-		row->mark = lv_image_create(row->button);
-		lv_image_set_src(row->mark, &icon_check);
-		lv_obj_add_style(row->mark, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(row->mark, LV_OPA_COVER, 0);
-		lv_obj_set_style_margin_right(row->mark, 6, 0);
-		lv_obj_set_clickable(row->mark, false);
-		lv_obj_set_event_bubble(row->mark, true);
-		lv_obj_set_hidden(row->mark, true);
 
 
 		row->index = -1;
@@ -1991,15 +2039,10 @@ static void repaint_page(page_t *p) {
 		if (!p->rows[i].button) {
 			continue;
 		}
-		lv_obj_set_style_bg_color(p->rows[i].dot, theme()->accent, 0);
-		lv_obj_set_style_arc_color(p->rows[i].arc, theme()->surface_pressed, LV_PART_MAIN);
-		lv_obj_set_style_arc_color(p->rows[i].arc, theme()->accent, LV_PART_INDICATOR);
-		lv_obj_set_style_bg_color(p->rows[i].bar, theme()->surface_pressed, LV_PART_MAIN);
-		lv_obj_set_style_bg_color(p->rows[i].bar, theme()->accent, LV_PART_INDICATOR);
+		lv_obj_set_style_arc_color(p->rows[i].arc, sx_pal()->press, LV_PART_MAIN);
+		lv_obj_set_style_arc_color(p->rows[i].arc, sx_pal()->accent, LV_PART_INDICATOR);
 	}
-	if (p->resume_btn) {
-		lv_obj_set_style_bg_color(p->resume_btn, theme()->accent, 0);
-	}
+
 	if (p->page) {
 		paint_pills(p);
 	}
@@ -2029,11 +2072,17 @@ static void states_refresh(page_t *p) {
 
 // Once a second while a page is in sight: the player sits over it as a sheet,
 // and closing the sheet does not load the page again.
+static lv_timer_t *states_timer;
+
 static void states_watch_cb(lv_timer_t *timer) {
-	(void)timer;
 	lv_obj_t *active = lv_screen_active();
 	page_t *p = active == podcastcard_screen ? &card_page : active == podcastcard_feed_screen ? &feed_page : NULL;
-	if (!p || player_sheet_is_open() || p->count == 0) {
+	if (!p) {
+		// Neither page is up: asleep until one is loaded again.
+		lv_timer_pause(timer);
+		return;
+	}
+	if (player_sheet_is_open() || p->count == 0) {
 		return;
 	}
 	if (podcaststate_revision() != p->states_seen) {
@@ -2042,6 +2091,7 @@ static void states_watch_cb(lv_timer_t *timer) {
 }
 
 static void card_loaded_cb(lv_event_t *e) {
+	lv_timer_resume(states_timer);
 	(void)e;
 	page_t *p = &card_page;
 	selection_stop(p);
@@ -2071,10 +2121,11 @@ static void feed_unloaded_cb(lv_event_t *e) {
 }
 
 static void feed_loaded_cb(lv_event_t *e) {
+	lv_timer_resume(states_timer);
 	(void)e;
 	page_t *p = &feed_page;
 	if (!feed_loaded && !feed_loading && open_feed.id > 0) {
-		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0] || open_feed.episode_count <= 0);
+		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0]);
 		refill(p, false);
 		return;
 	}
@@ -2102,6 +2153,20 @@ void podcastcard_open(const podcastcard_show_t *show) {
 		card_hero_load();
 	}
 	switch_screen(podcastcard_screen);
+}
+
+static lv_obj_t *make_filter_pill(page_t *p, lv_obj_t *parent, filter_t which) {
+	(void)p;
+	lv_obj_t *btn = lv_btn_create(parent);
+	sx_pill_style(btn);
+	lv_obj_set_width(btn, LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_hor(btn, 16, 0);
+	lv_obj_add_event_cb(btn, filter_cb, LV_EVENT_CLICKED, (void *)(intptr_t)which);
+	lv_obj_t *label = lv_label_create(btn);
+	lv_label_set_text(label, "");
+	lv_obj_set_style_text_font(label, &font_ui_20, 0);
+	lv_obj_center(label);
+	return btn;
 }
 
 static void build_page(page_t *p, gui_config_t *cfg) {
@@ -2191,15 +2256,15 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 		lv_label_set_long_mode(p->hero_author, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(p->hero_author, lv_pct(100));
 		lv_obj_set_style_max_height(p->hero_author, 2 * lv_font_get_line_height(&font_ui_18), 0);
-		lv_obj_add_style(p->hero_author, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(p->hero_author, &font_ui_18, 0);
+		lv_obj_add_style(p->hero_author, &sx_style_text2, 0);
+		lv_obj_set_style_text_font(p->hero_author, &font_ui_20, 0);
 		lv_label_set_text(p->hero_author, "");
 	}
 
 	p->hero_counts = lv_label_create(texts);
 	lv_label_set_long_mode(p->hero_counts, LV_LABEL_LONG_WRAP);
 	lv_obj_set_width(p->hero_counts, lv_pct(100));
-	lv_obj_add_style(p->hero_counts, &theme_style_text, 0);
+	lv_obj_add_style(p->hero_counts, &sx_style_text, 0);
 	lv_obj_set_style_text_font(p->hero_counts, &font_ui_20, 0);
 	lv_label_set_text(p->hero_counts, "");
 
@@ -2207,31 +2272,31 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 		p->hero_left = lv_label_create(texts);
 		lv_label_set_long_mode(p->hero_left, LV_LABEL_LONG_WRAP);
 		lv_obj_set_width(p->hero_left, lv_pct(100));
-		lv_obj_add_style(p->hero_left, &theme_style_text, 0);
+		lv_obj_add_style(p->hero_left, &sx_style_text, 0);
 		lv_obj_set_style_text_font(p->hero_left, &font_ui_20, 0);
 		lv_label_set_text(p->hero_left, "");
 		lv_obj_set_hidden(p->hero_left, true);
 	}
 
-	// The big button: the episode left halfway most recently.
+	// The big button: the episode left halfway most recently. The accent pill
+	// of 2.0, its glyph and words in the accent's own ink.
 	p->resume_btn = lv_btn_create(p->page);
-	lv_obj_set_size(p->resume_btn, width, 56);
-	lv_obj_set_style_radius(p->resume_btn, LV_RADIUS_CIRCLE, 0);
-	lv_obj_set_style_shadow_width(p->resume_btn, 0, 0);
-	lv_obj_set_style_border_width(p->resume_btn, 0, 0);
-	lv_obj_set_style_bg_color(p->resume_btn, theme()->accent, 0);
+	sx_pill_style(p->resume_btn);
+	lv_obj_set_size(p->resume_btn, width, SX_PILL_H + 4);
+	sx_pill_set_active(p->resume_btn, true);
 	lv_obj_set_style_pad_column(p->resume_btn, 8, 0);
 	lv_obj_set_flex_flow(p->resume_btn, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(p->resume_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_add_event_cb(p->resume_btn, resume_cb, LV_EVENT_CLICKED, p);
-	lv_obj_t *play_icon = lv_image_create(p->resume_btn);
-	lv_image_set_src(play_icon, &icon_play_small);
-	lv_obj_set_style_image_recolor(play_icon, lv_color_white(), 0);
-	lv_obj_set_style_image_recolor_opa(play_icon, LV_OPA_COVER, 0);
 	lv_obj_t *play_label = lv_label_create(p->resume_btn);
 	lv_label_set_text(play_label, tr("podcast_resume_listening"));
 	lv_obj_set_style_text_font(play_label, &font_ui_22, 0);
-	lv_obj_set_style_text_color(play_label, lv_color_white(), 0);
+	// The glyph before the words; both take the accent's ink from the pill.
+	lv_obj_t *play_icon = lv_image_create(p->resume_btn);
+	lv_image_set_src(play_icon, &icon_play_small);
+	lv_obj_add_style(play_icon, &sx_style_accent, 0);
+	lv_obj_set_style_bg_opa(play_icon, LV_OPA_TRANSP, 0);
+	lv_obj_move_to_index(play_icon, 0);
 	lv_obj_set_hidden(p->resume_btn, true);
 
 	if (!p->feed) {
@@ -2241,11 +2306,17 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 		lv_obj_set_hidden(p->online_row, true);
 	}
 
-	tabbar_create(&p->filters, p->page);
-	lv_obj_set_width(p->filters.bar, width);
-	tabbar_add(&p->filters, "podcast_filter_unheard", filter_cb, (void *)(intptr_t)FILTER_UNHEARD);
-	tabbar_add(&p->filters, "podcast_filter_all", filter_cb, (void *)(intptr_t)FILTER_ALL);
-	tabbar_add(&p->filters, "podcast_filter_heard", filter_cb, (void *)(intptr_t)FILTER_HEARD);
+	lv_obj_t *pills = lv_obj_create(p->page);
+	lv_obj_remove_style_all(pills);
+	lv_obj_set_size(pills, width, LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_column(pills, 8, 0);
+	lv_obj_set_event_bubble(pills, true);
+	lv_obj_set_scroll_dir(pills, LV_DIR_HOR);
+	lv_obj_set_scrollbar_mode(pills, LV_SCROLLBAR_MODE_OFF);
+	lv_obj_set_flex_flow(pills, LV_FLEX_FLOW_ROW);
+	p->filter_pills[0] = make_filter_pill(p, pills, FILTER_UNHEARD);
+	p->filter_pills[1] = make_filter_pill(p, pills, FILTER_ALL);
+	p->filter_pills[2] = make_filter_pill(p, pills, FILTER_HEARD);
 
 	// The rows slide over this, which is exactly as tall as the list.
 	p->body = lv_obj_create(p->page);
@@ -2275,7 +2346,7 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 	lv_label_set_long_mode(p->empty_label, LV_LABEL_LONG_WRAP);
 	lv_obj_set_width(p->empty_label, width);
 	lv_obj_set_style_text_align(p->empty_label, LV_TEXT_ALIGN_CENTER, 0);
-	lv_obj_add_style(p->empty_label, &theme_style_text_dim, 0);
+	lv_obj_add_style(p->empty_label, &sx_style_text2, 0);
 	lv_obj_set_style_text_font(p->empty_label, &font_ui_22, 0);
 	lv_obj_set_hidden(p->empty_label, true);
 
@@ -2286,7 +2357,7 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 	lv_obj_set_size(p->sel_action_btn, SEL_FAB_SIZE, SEL_FAB_SIZE);
 	lv_obj_set_style_radius(p->sel_action_btn, LV_RADIUS_CIRCLE, 0);
 	if (p->feed) {
-		lv_obj_add_style(p->sel_action_btn, &theme_style_accent_bg, 0);
+		lv_obj_add_style(p->sel_action_btn, &sx_style_accent, 0);
 	} else {
 		lv_obj_set_style_bg_color(p->sel_action_btn, lv_color_make(224, 27, 36), 0);
 		lv_obj_set_style_bg_color(p->sel_action_btn, lv_color_make(192, 28, 40), LV_STATE_PRESSED);
@@ -2299,8 +2370,14 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 	lv_obj_add_event_cb(p->sel_action_btn, sel_action_cb, LV_EVENT_CLICKED, p);
 	lv_obj_t *action_icon = lv_image_create(p->sel_action_btn);
 	lv_image_set_src(action_icon, p->feed ? &icon_download : &icon_trash);
-	lv_obj_set_style_image_recolor(action_icon, lv_color_white(), 0);
-	lv_obj_set_style_image_recolor_opa(action_icon, LV_OPA_COVER, 0);
+	// On the accent, the accent's own ink: white on a pale accent (the dark
+	// theme's, yellow) was barely there. White on the red of the bin.
+	if (p->feed) {
+		lv_obj_add_style(action_icon, &sx_style_icon_on_accent, 0);
+	} else {
+		lv_obj_set_style_image_recolor(action_icon, lv_color_white(), 0);
+		lv_obj_set_style_image_recolor_opa(action_icon, LV_OPA_COVER, 0);
+	}
 	lv_obj_center(action_icon);
 	lv_obj_set_hidden(p->sel_action_btn, true);
 
@@ -2323,7 +2400,7 @@ void podcastcard_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(podcastcard_feed_screen, feed_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
 	theme_register_refresh(repaint);
-	pagetimer_bind(lv_timer_create(states_watch_cb, 1000, NULL), podcastcard_screen, podcastcard_feed_screen);
+	states_timer = lv_timer_create(states_watch_cb, 1000, NULL);
 	hero_timer = lv_timer_create(hero_poll_cb, 100, NULL);
 	lv_timer_pause(hero_timer);
 }

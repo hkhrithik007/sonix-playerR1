@@ -25,6 +25,7 @@
 // A cell still above this is not empty, whatever the gauge says: a gauge that
 // failed and reads 0 must not switch the player off at every boot.
 #define OFF_MAX_MV 3600
+#define OFF_MIN_MV 2000
 #define COUNTDOWN_S 10
 
 #define COLOR_EMPTY lv_color_make(224, 27, 36)
@@ -42,7 +43,9 @@ static int level(void) {
 	if (!text || text[0] < '0' || text[0] > '9') {
 		return -1;
 	}
-	return atoi(text);
+	char *end;
+	long value = strtol(text, &end, 10);
+	return end != text && !*end && value >= 0 && value <= 100 ? (int)value : -1;
 }
 
 static bool on_battery(void) { return !usb_vbus_present() && !read_battery_charging(); }
@@ -63,8 +66,10 @@ static void countdown_stop(void) {
 
 static void countdown_cb(lv_timer_t *timer) {
 	(void)timer;
-	if (!on_battery()) {
-		printf("power: charger plugged in, low battery shutdown called off\n");
+	int percent = level();
+	int mv = read_battery_millivolts();
+	if (!on_battery() || percent < 0 || percent > OFF_PERCENT || mv < OFF_MIN_MV || mv >= OFF_MAX_MV) {
+		printf("power: low battery condition cleared, shutdown called off\n");
 		countdown_stop();
 		low_readings = 0;
 		return;
@@ -82,6 +87,11 @@ static void countdown_cb(lv_timer_t *timer) {
 }
 
 static void countdown_start(int mv) {
+	countdown_timer = lv_timer_create(countdown_cb, 1000, NULL);
+	if (!countdown_timer) {
+		fprintf(stderr, "power: countdown timer unavailable, will recheck battery\n");
+		return;
+	}
 	printf("power: battery at %d%% or under (%d mV), shutting down in %d s\n", OFF_PERCENT, mv, COUNTDOWN_S);
 	countdown_left = COUNTDOWN_S;
 	confirm_close(); // the 5 % notice, if it is still up
@@ -89,7 +99,6 @@ static void countdown_start(int mv) {
 		power_screen_on();
 	}
 	countdown_show();
-	countdown_timer = lv_timer_create(countdown_cb, 1000, NULL);
 }
 
 static void check_cb(lv_timer_t *timer) {
@@ -108,7 +117,7 @@ static void check_cb(lv_timer_t *timer) {
 
 	if (percent <= OFF_PERCENT) {
 		int mv = read_battery_millivolts();
-		if (mv >= OFF_MAX_MV) {
+		if (mv < OFF_MIN_MV || mv >= OFF_MAX_MV) {
 			low_readings = 0;
 			return;
 		}

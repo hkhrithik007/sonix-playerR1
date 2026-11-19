@@ -42,6 +42,7 @@ static const sysinfo_model_t MODELS[] = {
 		.pmic_charger = true,
 		.cs43131 = true,
 		.tap_wake = false,
+		.event_touch = true,
 		.one_flank = true,
 		.media_keys_swapped = false,
 	},

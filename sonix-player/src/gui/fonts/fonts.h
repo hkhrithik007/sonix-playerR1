@@ -10,6 +10,8 @@
 // There are no fonts inside the binary. Everything is rendered through
 // FreeType from the faces shipped in /usr/resource/sonix/fonts:
 //
+//   ui-regular.ttf  optional Segoe UI Regular from the approved prototype
+//   ui-semibold.ttf optional Segoe UI Semibold for emphasized UI roles
 //   default.otf   MiSans Regular -- Latin, Greek, Cyrillic, kana, full CJK
 //   bold.otf      optional bold weight for the headings; regular stands in
 //                 when it is not there
@@ -23,7 +25,8 @@
 //
 // The last four each have a -bold file for the bold sizes, optional like
 // bold.otf. fonts_init() opens them once and builds one fallback chain per
-// size: default answers first, Korean, Thai and Arabic fill in what it lacks.
+// size: the optional prototype face answers first, with MiSans and script
+// faces retained as fallbacks. Without it, the original default is used.
 // In Japanese, Rodin answers the CJK letters ahead of default (see fonts.c).
 // FreeType maps the files -- nothing is decoded up front -- and rendered
 // glyphs live in the shared FTC cache (LV_FREETYPE_CACHE_FT_GLYPH_CNT), so
@@ -38,16 +41,23 @@
 
 extern lv_font_t font_ui_14;
 extern lv_font_t font_ui_16;
+extern lv_font_t font_ui_17; // 2.0: the mono-ish card subtitle (codec, network)
 extern lv_font_t font_ui_18;
 extern lv_font_t font_ui_20;
 extern lv_font_t font_ui_20_bold; // bold text in the release notes of the update card
+extern lv_font_t font_ui_21; // 2.0: a card's subtitle, a sheet's
 extern lv_font_t font_ui_22;
 extern lv_font_t font_ui_22_bold; // headings in the release notes of the update card
 extern lv_font_t font_ui_24;
 extern lv_font_t font_ui_24_bold;
 extern lv_font_t font_ui_26;
+extern lv_font_t font_ui_26_bold; // 2.0: a sheet's title
 extern lv_font_t font_ui_28;
+extern lv_font_t font_ui_28_bold; // 2.0: the player's and an album page's title
+extern lv_font_t font_ui_30_bold; // 2.0: a page title longer than 12 letters
 extern lv_font_t font_ui_32;
+extern lv_font_t font_ui_32_bold;
+extern lv_font_t font_ui_34_bold; // 2.0: a page title
 // The A and B letters on the Gearboy buttons, nothing else: on a 110 pixel
 // circle the regular weight is lost.
 extern lv_font_t font_ui_36_bold;

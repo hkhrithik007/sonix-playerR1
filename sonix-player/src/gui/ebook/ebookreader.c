@@ -217,7 +217,7 @@ static void position_load(const char *path, uint32_t *spine, uint32_t *block, ui
 	*spine = *block = *offset = 0;
 	char key[32];
 	position_key(path, key, sizeof(key));
-	const char *value = config_store_get(config_ebook_store(), "ebook", key, "");
+	const char *value = config_store_get_copy(config_ebook_store(), "ebook", key, "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE);
 	if (value && value[0]) {
 		unsigned a = 0, b = 0, c = 0;
 		if (sscanf(value, "%u:%u:%u", &a, &b, &c) == 3) {

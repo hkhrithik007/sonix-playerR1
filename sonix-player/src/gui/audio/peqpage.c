@@ -1,4 +1,7 @@
 #include "peqpage.h"
+#include "src/gui/shell/sx_mini.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_styles.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -12,6 +15,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/system/audio/eq.h"
 #include "src/system/core/lang.h"
 
@@ -181,7 +185,7 @@ static void build_graph(lv_obj_t *parent) {
 	lv_obj_set_width(card, lv_pct(100));
 	lv_obj_set_height(card, 236);
 	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 12, 0);
+	lv_obj_set_style_radius(card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 14, 0);
@@ -261,7 +265,7 @@ static void paint_pill(lv_obj_t *btn, bool on) {
 		return;
 	}
 	lv_obj_set_style_bg_color(btn, on ? theme()->accent : theme()->surface_pressed, 0);
-	lv_obj_set_style_text_color(lv_obj_get_child(btn, 0), on ? lv_color_white() : theme()->text_primary, 0);
+	lv_obj_set_style_text_color(lv_obj_get_child(btn, 0), on ? theme()->on_accent : theme()->text_primary, 0);
 }
 
 static void band_page_refresh(void) {
@@ -424,6 +428,7 @@ static int entry_parse_scaled(const char *text, int decimals) {
 // The keypad's own X is its way out: the back arrow goes while it is up.
 static void entry_hide(void) {
 	lv_obj_set_hidden(entry_layer, true);
+	sx_mini_input_overlay(band_screen, false);
 	back_btn_hide_on_screen(band_screen, false);
 }
 
@@ -555,6 +560,7 @@ static void entry_open(entry_kind_t kind) {
 
 	entry_paint();
 	lv_obj_set_hidden(entry_layer, false);
+	sx_mini_input_overlay(band_screen, true);
 	lv_obj_move_foreground(entry_layer);
 	back_btn_hide_on_screen(band_screen, true);
 }
@@ -662,7 +668,8 @@ static void build_entry_layer(gui_config_t *cfg) {
 	entry_sign_btn = entry_key(pad, "+/-", NULL, entry_key_cb, '-', 31);
 	entry_ok_btn = entry_key(pad, tr("ok"), NULL, entry_accept_cb, 0, 100);
 	lv_obj_add_style(entry_ok_btn, &theme_style_accent_bg, 0);
-	lv_obj_set_style_text_color(lv_obj_get_child(entry_ok_btn, 0), lv_color_white(), 0);
+	lv_obj_add_style(lv_obj_get_child(entry_ok_btn, 0), &sx_style_accent, 0);
+	lv_obj_set_style_bg_opa(lv_obj_get_child(entry_ok_btn, 0), LV_OPA_TRANSP, 0);
 }
 
 // The number over a slider becomes the way into the keypad: set on a rounded
@@ -754,7 +761,7 @@ static void build_band_page(gui_config_t *cfg) {
 	lv_obj_set_width(shape_card, lv_pct(100));
 	lv_obj_set_height(shape_card, LV_SIZE_CONTENT);
 	lv_obj_add_style(shape_card, &theme_style_card, 0);
-	lv_obj_set_style_radius(shape_card, 12, 0);
+	lv_obj_set_style_radius(shape_card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(shape_card, 0, 0);
 	lv_obj_set_style_shadow_width(shape_card, 0, 0);
 	lv_obj_set_style_pad_all(shape_card, 18, 0);
@@ -799,8 +806,6 @@ static void build_band_page(gui_config_t *cfg) {
 
 static lv_obj_t *enable_switch;
 static lv_obj_t *reset_btn;
-static lv_obj_t *autoeq_btn;
-static lv_timer_t *autoeq_timer;
 static lv_obj_t *preamp_slider, *preamp_value;
 static lv_obj_t *headroom_label;
 static lv_obj_t *band_rows[PEQ_BANDS];
@@ -970,27 +975,7 @@ static void open_settings_cb(lv_event_t *e) {
 
 static void open_autoeq_cb(lv_event_t *e) {
 	(void)e;
-	if (peqautoeq_network_needed()) {
-		return;
-	}
 	peqautoeq_open();
-}
-
-// The AutoEq button at half strength without a network; a tap on it then only
-// says why.
-static void autoeq_btn_refresh(void) {
-	if (autoeq_btn) {
-		lv_obj_set_style_opa(autoeq_btn, peqautoeq_network_ready() ? LV_OPA_COVER : LV_OPA_40, 0);
-	}
-}
-
-// Wi-Fi can come and go while the page is open.
-static void autoeq_timer_cb(lv_timer_t *timer) {
-	if (lv_screen_active() != main_screen) {
-		lv_timer_pause(timer);
-		return;
-	}
-	autoeq_btn_refresh();
 }
 
 static void screen_loaded_cb(lv_event_t *e) {
@@ -1012,10 +997,6 @@ static void screen_loaded_cb(lv_event_t *e) {
 	refresh_preamp();
 	graph_refresh();
 
-	autoeq_btn_refresh();
-	if (autoeq_timer) {
-		lv_timer_resume(autoeq_timer);
-	}
 }
 
 // Called after a preset is loaded: the band rows, the preamp, the graph and,
@@ -1050,9 +1031,7 @@ void peqpage_init(gui_config_t *cfg) {
 	settingsrow_title_corner_slots(settingsrow_page_title(main_screen), cfg, 3);
 	reset_btn = corner_button(main_screen, cfg, 0, &icon_reset, reset_cb);
 	corner_button(main_screen, cfg, 1, &icon_music_settings, open_settings_cb);
-	autoeq_btn = corner_button(main_screen, cfg, 2, &icon_audio_waveform, open_autoeq_cb);
-	autoeq_timer = lv_timer_create(autoeq_timer_cb, 1000, NULL);
-	lv_timer_pause(autoeq_timer);
+	corner_button(main_screen, cfg, 2, &icon_audio_waveform, open_autoeq_cb);
 
 	peqsettings_set_reload_cb(reload_after_preset);
 	peqautoeq_set_reload_cb(reload_after_preset);

@@ -126,12 +126,62 @@ void device_state_add_prepare_cb(device_state_prepare_cb cb);
 // Jump to entry `index` of the current queue.
 bool device_state_play_queue_index(int index);
 
+// ---------------------------------------------------------------------------
+// Outside the queue (2.0, the handoff's `ext`)
+//
+// A book, or a track a phone sends over DLNA, plays "outside the queue": the
+// music queue it interrupted is kept aside, whole, rather than replaced, and
+// the queue page shows it under "Now playing X -- outside the queue". Going
+// back to it is a tap on one of its rows (device_state_resume_parked). Any
+// other new queue -- a list, an album, a folder of music -- forgets it.
+// (Radio, AirPlay and the Bluetooth receiver never touched the queue in the
+// first place: they play beside it.) In memory only. UI thread.
+// ---------------------------------------------------------------------------
+
+// True while a queue is parked; `count` its length and `position` the track it
+// was on (either may be NULL).
+bool device_state_parked(int *count, int *position);
+
+// Entry `index` (playback order) of the parked queue.
+bool device_state_parked_path(int index, char *out, size_t size);
+
+// Puts the parked queue back as the queue and plays its entry `index` (-1: the
+// track it was on), from the start. False when nothing is parked.
+bool device_state_resume_parked(int index);
+
 // Call when the current track has finished on its own (see
 // device_state_take_completion). Advances the folder queue according to the
 // active playback mode and starts the next track; returns true if playback
 // continued (optionally copying the new track's path into out_path), or false
 // if playback should stop (end of folder in normal mode / empty queue).
 bool device_state_advance_auto(char *out_path, size_t out_size);
+
+// "Stop after": a one-shot instruction for the end of what is playing, from the
+// player's menu. When it fires the queue moves on to what would have played
+// next and loads it paused -- the audiobook's "stop at the end of the chapter"
+// does the same with a book's next part -- so play carries on from there. It
+// then clears itself.
+//
+//   TRACK  fires when the playing track ends on its own.
+//   ALBUM  fires when the track that ends is the last of its album: the next
+//          one in the queue belongs to another album (by the library's album,
+//          else the tag, else the folder for an untagged file), or there is no
+//          next one, or the queue would come round again under repeat-all.
+//          Under shuffle over many albums the next track is almost always from
+//          another one, so it then stops after this track.
+//
+// At the end of the queue it simply stops there: "play albums back to back"
+// and "play by folder" do not start the next record. Repeat-one still repeats
+// (a track that comes round again has not ended) unless the instruction is
+// TRACK. Only in memory: a restart forgets it. UI thread.
+typedef enum {
+	DEVICE_STATE_STOP_AFTER_NONE = 0,
+	DEVICE_STATE_STOP_AFTER_TRACK,
+	DEVICE_STATE_STOP_AFTER_ALBUM,
+} device_state_stop_after_t;
+
+void device_state_set_stop_after(device_state_stop_after_t when);
+device_state_stop_after_t device_state_stop_after(void);
 
 // Whether consecutive album playback -- one record rolling into the next -- is
 // switched on, and the setting behind it.
@@ -156,6 +206,16 @@ bool device_state_play_random_album(library_filter_t filter, const char *value);
 // off the end of it into the directory tree would be a surprise.
 bool device_state_folder_chaining(void);
 void device_state_set_folder_chaining(bool on);
+
+// "Next album", for a button: the first track of the next record. In the queue
+// first -- the next entry, in playing order, from another album (the album
+// "stop after this album" goes by), looked for among the next few hundred --
+// and when the queue holds no other record ahead, the record after this one
+// the way "play albums back to back" or "play by folder" would take it, even
+// with those options off: the key asks for it. Under shuffle the next entry
+// is usually another album's, so it is then the next track. False, with
+// nothing changed, when there is no next record anywhere. UI thread.
+bool device_state_next_album(char *out_path, size_t out_size);
 
 // User-initiated skip to the next/previous track in the folder queue. Start
 // the new track and return true (optionally copying its path into out_path);
@@ -225,15 +285,25 @@ void device_state_refresh_battery(void);
 //
 // note()    called from the player's poll. Decides on its own whether there is
 //           anything worth writing; cheap when there is not.
-// flush()   called on the way out -- the power menu and the automatic
-//           shutdown. Neither of those passes through the interface, so
-//           without it the position is up to ten seconds stale after a normal
-//           power-off, and stale by a whole seek after one made while paused.
+// flush()   called on the way out -- the power menu, the automatic
+//           shutdown and a standby suspend. None of those passes through the
+//           interface, so without it the position is up to thirty seconds
+//           stale after a normal power-off, and stale by a whole seek after one
+//           made while paused.
 // restored() told what the boot restore asked for, so a poll that lands before
 //           the decoder has seeked cannot write a zero over it.
 // ---------------------------------------------------------------------------
+// Whether "Remember track" is on: on unless switched off (the default moved to
+// on in 2.0, for players that never set it).
+bool device_state_remember_enabled(void);
+
 void device_state_remember_note(void);
 void device_state_remember_flush(void);
 void device_state_remember_restored(const char *path, double position);
+
+// GUI thread: presentation-only metadata, independent of the persisted queue.
+unsigned device_state_metadata_revision(void);
+bool device_state_refresh_metadata(const char *path);
+void device_state_note_metadata_available(const char *path);
 
 #endif // DEVICE_STATE_H

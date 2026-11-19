@@ -1,0 +1,128 @@
+--- a/src/a2dp-ldac.c
++++ b/src/a2dp-ldac.c
+@@ -18,6 +18,8 @@
+ 
+ #include <ldacBT.h>
+ #include <ldacBT_abr.h>
++
++#include "ldac-handle-api.h"
+ 
+ #include "a2dp.h"
+ #include "ba-transport.h"
+@@ -34,6 +36,11 @@
+ #include "shared/log.h"
+ #include "shared/rt.h"
+ 
++static struct ldac_handle_api ldac_encoder_api;
++#if HAVE_LDAC_DECODE
++static struct ldac_handle_api ldac_decoder_api;
++#endif
++
+ static const struct a2dp_bit_mapping a2dp_ldac_channels[] = {
+ 	{ LDAC_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+ 	{ LDAC_CHANNEL_MODE_DUAL, .ch = { 2, a2dp_channel_map_stereo } },
+@@ -117,12 +124,12 @@
+ 	struct io_poll io = { .timeout = -1 };
+ 
+ 	HANDLE_LDAC_BT handle;
+-	if ((handle = ldacBT_get_handle()) == NULL) {
++	if ((handle = ldac_encoder_api.get()) == NULL) {
+ 		error("Couldn't get LDAC handle: %s", strerror(errno));
+ 		goto fail_open_ldac;
+ 	}
+ 
+-	pthread_cleanup_push(PTHREAD_CLEANUP(ldacBT_free_handle), handle);
++	pthread_cleanup_push(PTHREAD_CLEANUP(ldac_encoder_api.free), handle);
+ 
+ 	HANDLE_LDAC_ABR handle_abr;
+ 	if ((handle_abr = ldac_ABR_get_handle()) == NULL) {
+@@ -307,12 +314,12 @@
+ 	struct io_poll io = { .timeout = -1 };
+ 
+ 	HANDLE_LDAC_BT handle;
+-	if ((handle = ldacBT_get_handle()) == NULL) {
++	if ((handle = ldac_decoder_api.get()) == NULL) {
+ 		error("Couldn't get LDAC handle: %s", strerror(errno));
+ 		goto fail_open;
+ 	}
+ 
+-	pthread_cleanup_push(PTHREAD_CLEANUP(ldacBT_free_handle), handle);
++	pthread_cleanup_push(PTHREAD_CLEANUP(ldac_decoder_api.free), handle);
+ 
+ 	const a2dp_ldac_t *configuration = &t->media.a2dp.configuration.ldac;
+ 	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t_pcm->format);
+@@ -485,6 +492,8 @@
+ }
+ 
+ static error_code_t a2dp_ldac_source_init(struct a2dp_sep *sep) {
++	if (ldac_handle_api_open(&ldac_encoder_api, "libldacBT_enc.so.2") == -1)
++		return ERROR_SYSTEM(ENOSYS);
+ 	if (config.a2dp.force_mono)
+ 		sep->config.capabilities.ldac.channel_mode = LDAC_CHANNEL_MODE_MONO;
+ 	if (config.a2dp.force_44100)
+@@ -527,6 +536,13 @@
+ 
+ #if HAVE_LDAC_DECODE
+ 
++static error_code_t a2dp_ldac_sink_init(struct a2dp_sep *sep) {
++	(void)sep;
++	if (ldac_handle_api_open(&ldac_decoder_api, "libldacdec.so.1") == -1)
++		return ERROR_SYSTEM(ENOSYS);
++	return ERROR_CODE_OK;
++}
++
+ static int a2dp_ldac_sink_transport_start(struct ba_transport *t) {
+ 	return ba_transport_pcm_start(&t->media.pcm, a2dp_ldac_dec_thread, "ba-a2dp-ldac");
+ }
+@@ -552,6 +568,7 @@
+ 				LDAC_SAMPLING_FREQ_96000,
+ 		},
+ 	},
++	.init = a2dp_ldac_sink_init,
+ 	.configuration_select = a2dp_ldac_configuration_select,
+ 	.configuration_check = a2dp_ldac_configuration_check,
+ 	.transport_init = a2dp_ldac_transport_init,
+--- /dev/null
++++ b/src/ldac-handle-api.h
+@@ -0,0 +1,31 @@
++/* LDAC encoder and stock decoder have incompatible handle implementations. */
++#pragma once
++#include <dlfcn.h>
++#include <stddef.h>
++#include <ldacBT.h>
++
++struct ldac_handle_api {
++	void *library;
++	HANDLE_LDAC_BT (*get)(void);
++	void (*free)(HANDLE_LDAC_BT);
++};
++
++/* Called once during codec setup, before transport workers are started.
++ * Keep the library reference for the daemon lifetime, like linked codecs. */
++static inline int ldac_handle_api_open(struct ldac_handle_api *api, const char *soname) {
++	if (api->library != NULL)
++		return 0;
++	void *library = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
++	if (library == NULL)
++		return -1;
++	HANDLE_LDAC_BT (*get)(void) = dlsym(library, "ldacBT_get_handle");
++	void (*release)(HANDLE_LDAC_BT) = dlsym(library, "ldacBT_free_handle");
++	if (get == NULL || release == NULL) {
++		dlclose(library);
++		return -1;
++	}
++	api->get = get;
++	api->free = release;
++	api->library = library;
++	return 0;
++}
+--- a/configure.ac
++++ b/configure.ac
+@@ -222,6 +222,7 @@
+ 	[AS_HELP_STRING([--enable-ldac], [enable LDAC support])])
+ AM_CONDITIONAL([ENABLE_LDAC], [test "x$enable_ldac" = "xyes"])
+ AM_COND_IF([ENABLE_LDAC], [
++	AC_SEARCH_LIBS([dlopen], [dl], [], [AC_MSG_ERROR([Dynamic loader support not found])])
+ 	PKG_CHECK_MODULES([LDAC_ABR], [ldacBT-abr >= 1.0.0])
+ 	PKG_CHECK_MODULES([LDAC_DEC], [ldacBT-dec >= 2.0.0],
+ 		AC_DEFINE([HAVE_LDAC_DECODE], [1], [Define to 1 if you have LDAC decode module.]), [:])

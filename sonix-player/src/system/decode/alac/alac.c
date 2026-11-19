@@ -33,6 +33,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
+#include <stddef.h>
 #ifdef _WIN32
 	#include "stdint_win.h"
 #else
@@ -51,14 +53,16 @@
                    v = (((v) & 0x00FF) << 0x08) | \
                        (((v) & 0xFF00) >> 0x08); } while (0)
 
-struct {signed int x:24;} se_struct_24;
-#define SignExtend24(val) (se_struct_24.x = val)
+#define SignExtend24(val) ((int32_t)((uint32_t)(val) << 8) >> 8)
 
-extern int host_bigendian;
+extern const int host_bigendian;
 
 struct alac_file
 {
-    unsigned char *input_buffer;
+    const unsigned char *input_buffer;
+    const unsigned char *input_start;
+    const unsigned char *input_end;
+    jmp_buf input_error;
     int input_buffer_bitaccumulator; /* used so we can do arbitary
                                         bit reads */
 
@@ -96,7 +100,7 @@ struct alac_file
 };
 
 
-static void allocate_buffers(alac_file *alac)
+static int allocate_buffers(alac_file *alac)
 {
     alac->predicterror_buffer_a = malloc(alac->setinfo_max_samples_per_frame * 4);
     alac->predicterror_buffer_b = malloc(alac->setinfo_max_samples_per_frame * 4);
@@ -106,9 +110,12 @@ static void allocate_buffers(alac_file *alac)
 	
 	alac->uncompressed_bytes_buffer_a = malloc(alac->setinfo_max_samples_per_frame * 4);
 	alac->uncompressed_bytes_buffer_b = malloc(alac->setinfo_max_samples_per_frame * 4);
+    return alac->predicterror_buffer_a && alac->predicterror_buffer_b &&
+        alac->outputsamples_buffer_a && alac->outputsamples_buffer_b &&
+        alac->uncompressed_bytes_buffer_a && alac->uncompressed_bytes_buffer_b;
 }
 
-void alac_set_info(alac_file *alac, char *inputbuffer)
+int alac_set_info(alac_file *alac, char *inputbuffer)
 {
   char *ptr = inputbuffer;
   ptr += 4; /* size */
@@ -152,7 +159,7 @@ void alac_set_info(alac_file *alac, char *inputbuffer)
       _Swap32(alac->setinfo_8a_rate);
   ptr += 4;
 
-  allocate_buffers(alac);
+  return allocate_buffers(alac);
 
 }
 
@@ -164,9 +171,18 @@ static uint32_t readbits_16(alac_file *alac, int bits)
     uint32_t result;
     int new_accumulator;
 
+    /* Local hardening: a short packet is an error, not zero-padded audio.
+     * No resources are acquired during decode_frame(), so the error jump
+     * only unwinds its C call stack and leaves ownership with the wrapper. */
+    ptrdiff_t remaining = alac->input_end - alac->input_buffer;
+    if (bits < 0 || bits > 16 || remaining < 0 ||
+        (remaining < 3 && remaining * 8 < alac->input_buffer_bitaccumulator + bits))
+        longjmp(alac->input_error, 1);
+    if (bits == 0) return 0;
+
     result = (alac->input_buffer[0] << 16) |
-             (alac->input_buffer[1] << 8) |
-             (alac->input_buffer[2]);
+             (remaining > 1 ? alac->input_buffer[1] << 8 : 0) |
+             (remaining > 2 ? alac->input_buffer[2] : 0);
 
     /* shift left by the number of bits we've already read,
      * so that the top 'n' bits of the 24 bits we read will
@@ -193,7 +209,8 @@ static uint32_t readbits_16(alac_file *alac, int bits)
 /* supports reading 1 to 32 bits, in big endian format */
 static uint32_t readbits(alac_file *alac, int bits)
 {
-    int32_t result = 0;
+    uint32_t result = 0;
+    if (bits < 0 || bits > 32) longjmp(alac->input_error, 1);
 
     if (bits > 16)
     {
@@ -212,6 +229,7 @@ static int readbit(alac_file *alac)
     int result;
     int new_accumulator;
 
+    if (alac->input_buffer >= alac->input_end) longjmp(alac->input_error, 1);
     result = alac->input_buffer[0];
 
     result = result << alac->input_buffer_bitaccumulator;
@@ -229,6 +247,8 @@ static int readbit(alac_file *alac)
 
 static void unreadbits(alac_file *alac, int bits)
 {
+    int64_t consumed = (int64_t)(alac->input_buffer - alac->input_start) * 8 + alac->input_buffer_bitaccumulator;
+    if (bits < 0 || bits > consumed) longjmp(alac->input_error, 1);
     int new_accumulator = (alac->input_buffer_bitaccumulator - bits);
 
     alac->input_buffer += (new_accumulator >> 3);
@@ -484,7 +504,7 @@ void entropy_rice_decode(alac_file* alac,
 	}
 }
 
-#define SIGN_EXTENDED32(val, bits) ((val << (32 - bits)) >> (32 - bits))
+#define SIGN_EXTENDED32(val, bits) ((int32_t)((uint32_t)(val) << (32 - (bits))) >> (32 - (bits)))
 
 #define SIGN_ONLY(v) \
                      ((v < 0) ? (-1) : \
@@ -532,7 +552,7 @@ static void predictor_decompress_fir_adapt(int32_t *error_buffer,
     if (predictor_coef_num > 0)
     {
         int i;
-        for (i = 0; i < predictor_coef_num; i++)
+        for (i = 0; i < predictor_coef_num && i + 1 < output_size; i++)
         {
             int32_t val;
 
@@ -543,6 +563,8 @@ static void predictor_decompress_fir_adapt(int32_t *error_buffer,
             buffer_out[i+1] = val;
         }
     }
+
+    if (output_size <= predictor_coef_num + 1) return;
 
 #if 0
     /* 4 and 8 are very common cases (the only ones i've seen). these
@@ -570,19 +592,20 @@ static void predictor_decompress_fir_adapt(int32_t *error_buffer,
              i++)
         {
             int j;
-            int sum = 0;
+            uint32_t sum = 0;
             int outval;
             int error_val = error_buffer[i];
 
             for (j = 0; j < predictor_coef_num; j++)
             {
-                sum += (buffer_out[predictor_coef_num-j] - buffer_out[0]) *
-                       predictor_coef_table[j];
+                sum += ((uint32_t)buffer_out[predictor_coef_num-j] - (uint32_t)buffer_out[0]) *
+                       (uint32_t)predictor_coef_table[j];
             }
 
-            outval = (1 << (predictor_quantitization-1)) + sum;
+            /* Preserve the codec's modulo-32 arithmetic before signed shifts. */
+            outval = (int32_t)((1u << (predictor_quantitization-1)) + sum);
             outval = outval >> predictor_quantitization;
-            outval = outval + buffer_out[0] + error_val;
+            outval = (int32_t)((uint32_t)outval + (uint32_t)buffer_out[0] + (uint32_t)error_val);
             outval = SIGN_EXTENDED32(outval, readsamplesize);
 
             buffer_out[predictor_coef_num+1] = outval;
@@ -719,8 +742,8 @@ void deinterlace_24(int32_t *buffer_a, int32_t *buffer_b,
 			if (uncompressed_bytes)
 			{
 				uint32_t mask = ~(0xFFFFFFFF << (uncompressed_bytes * 8));
-				left <<= (uncompressed_bytes * 8);
-				right <<= (uncompressed_bytes * 8);
+				left = (uint32_t)left << (uncompressed_bytes * 8);
+				right = (uint32_t)right << (uncompressed_bytes * 8);
 				
 				left |= uncompressed_bytes_buffer_a[i] & mask;
 				right |= uncompressed_bytes_buffer_b[i] & mask;
@@ -749,8 +772,8 @@ void deinterlace_24(int32_t *buffer_a, int32_t *buffer_b,
 		if (uncompressed_bytes)
 		{
 			uint32_t mask = ~(0xFFFFFFFF << (uncompressed_bytes * 8));
-			left <<= (uncompressed_bytes * 8);
-			right <<= (uncompressed_bytes * 8);
+			left = (uint32_t)left << (uncompressed_bytes * 8);
+			right = (uint32_t)right << (uncompressed_bytes * 8);
 			
 			left |= uncompressed_bytes_buffer_a[i] & mask;
 			right |= uncompressed_bytes_buffer_b[i] & mask;
@@ -768,18 +791,35 @@ void deinterlace_24(int32_t *buffer_a, int32_t *buffer_b,
 	
 }
 
+static void validate_predictor(alac_file *alac, int samples, int type, int quantization, int coefficients)
+{
+    if (type != 0 || (coefficients != 0 && coefficients != 31 &&
+        samples > coefficients + 1 && quantization == 0))
+        longjmp(alac->input_error, 1);
+}
+
 void decode_frame(alac_file *alac,
-                  unsigned char *inbuffer,
+                  const unsigned char *inbuffer, int input_bytes,
                   void *outbuffer, int *outputsize)
 {
     int channels;
     int32_t outputsamples = alac->setinfo_max_samples_per_frame;
 
+    *outputsize = 0;
+    if (input_bytes <= 0) return;
+    if (setjmp(alac->input_error)) {
+        *outputsize = 0;
+        return;
+    }
+
     /* setup the stream */
     alac->input_buffer = inbuffer;
+    alac->input_start = inbuffer;
+    alac->input_end = inbuffer + input_bytes;
     alac->input_buffer_bitaccumulator = 0;
 
     channels = readbits(alac, 3);
+    if (channels + 1 != alac->numchannels) longjmp(alac->input_error, 1);
 
     *outputsize = outputsamples * alac->bytespersample;
 
@@ -821,13 +861,15 @@ void decode_frame(alac_file *alac,
              * sia di quello del chiamante. Il formato garantisce che un frame
              * non superi mai frameLength, quindi si taglia li'.
              */
-            if (outputsamples < 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
-                outputsamples = (int32_t)alac->setinfo_max_samples_per_frame;
+            if (outputsamples <= 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
+                longjmp(alac->input_error, 1);
             /* --- fine modifica locale -------------------------------------- */
             *outputsize = outputsamples * alac->bytespersample;
         }
 
         readsamplesize = alac->setinfo_sample_size - (uncompressed_bytes * 8);
+        if (!isnotcompressed && (readsamplesize < 1 || readsamplesize > 32))
+            longjmp(alac->input_error, 1);
 
         if (!isnotcompressed)
         { /* so it is compressed */
@@ -847,6 +889,7 @@ void decode_frame(alac_file *alac,
 
             ricemodifier = readbits(alac, 3);
             predictor_coef_num = readbits(alac, 5);
+            validate_predictor(alac, outputsamples, prediction_type, prediction_quantitization, predictor_coef_num);
 
             /* read the predictor table */
             for (i = 0; i < predictor_coef_num; i++)
@@ -870,7 +913,7 @@ void decode_frame(alac_file *alac,
 								alac->setinfo_rice_initialhistory,
 								alac->setinfo_rice_kmodifier,
 								ricemodifier * alac->setinfo_rice_historymult / 4,
-								(1 << alac->setinfo_rice_kmodifier) - 1);
+								(1u << alac->setinfo_rice_kmodifier) - 1);
 
             if (prediction_type == 0)
             { /* adaptive fir */
@@ -918,7 +961,7 @@ void decode_frame(alac_file *alac,
                     audiobits = readbits(alac, 16);
                     /* special case of sign extension..
                      * as we'll be ORing the low 16bits into this */
-                    audiobits = audiobits << (alac->setinfo_sample_size - 16);
+                    audiobits = (uint32_t)audiobits << (alac->setinfo_sample_size - 16);
                     audiobits |= readbits(alac, alac->setinfo_sample_size - 16);
 					audiobits = SignExtend24(audiobits);
 
@@ -952,7 +995,7 @@ void decode_frame(alac_file *alac,
 				if (uncompressed_bytes)
 				{
 					uint32_t mask;
-					sample = sample << (uncompressed_bytes * 8);
+					sample = (uint32_t)sample << (uncompressed_bytes * 8);
 					mask = ~(0xFFFFFFFF << (uncompressed_bytes * 8));
 					sample |= alac->uncompressed_bytes_buffer_a[i] & mask;
 				}
@@ -1010,13 +1053,15 @@ void decode_frame(alac_file *alac,
              * sia di quello del chiamante. Il formato garantisce che un frame
              * non superi mai frameLength, quindi si taglia li'.
              */
-            if (outputsamples < 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
-                outputsamples = (int32_t)alac->setinfo_max_samples_per_frame;
+            if (outputsamples <= 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
+                longjmp(alac->input_error, 1);
             /* --- fine modifica locale -------------------------------------- */
             *outputsize = outputsamples * alac->bytespersample;
         }
 
         readsamplesize = alac->setinfo_sample_size - (uncompressed_bytes * 8) + 1;
+        if (!isnotcompressed && (readsamplesize < 1 || readsamplesize > 32))
+            longjmp(alac->input_error, 1);
 
         if (!isnotcompressed)
         { /* compressed */
@@ -1035,6 +1080,7 @@ void decode_frame(alac_file *alac,
             int i;
 
             interlacing_shift = readbits(alac, 8);
+            if (interlacing_shift > 31) longjmp(alac->input_error, 1);
             interlacing_leftweight = readbits(alac, 8);
 
             /******** channel 1 ***********/
@@ -1043,6 +1089,7 @@ void decode_frame(alac_file *alac,
 
             ricemodifier_a = readbits(alac, 3);
             predictor_coef_num_a = readbits(alac, 5);
+            validate_predictor(alac, outputsamples, prediction_type_a, prediction_quantitization_a, predictor_coef_num_a);
 
             /* read the predictor table */
             for (i = 0; i < predictor_coef_num_a; i++)
@@ -1056,6 +1103,7 @@ void decode_frame(alac_file *alac,
 
             ricemodifier_b = readbits(alac, 3);
             predictor_coef_num_b = readbits(alac, 5);
+            validate_predictor(alac, outputsamples, prediction_type_b, prediction_quantitization_b, predictor_coef_num_b);
 
             /* read the predictor table */
             for (i = 0; i < predictor_coef_num_b; i++)
@@ -1082,7 +1130,7 @@ void decode_frame(alac_file *alac,
 								alac->setinfo_rice_initialhistory,
 								alac->setinfo_rice_kmodifier,
 								ricemodifier_a * alac->setinfo_rice_historymult / 4,
-								(1 << alac->setinfo_rice_kmodifier) - 1);
+								(1u << alac->setinfo_rice_kmodifier) - 1);
 
             if (prediction_type_a == 0)
             { /* adaptive fir */
@@ -1107,7 +1155,7 @@ void decode_frame(alac_file *alac,
 								alac->setinfo_rice_initialhistory,
 								alac->setinfo_rice_kmodifier,
 								ricemodifier_b * alac->setinfo_rice_historymult / 4,
-								(1 << alac->setinfo_rice_kmodifier) - 1);
+								(1u << alac->setinfo_rice_kmodifier) - 1);
 
             if (prediction_type_b == 0)
             { /* adaptive fir */
@@ -1151,12 +1199,12 @@ void decode_frame(alac_file *alac,
                     int32_t audiobits_a, audiobits_b;
 
                     audiobits_a = readbits(alac, 16);
-                    audiobits_a = audiobits_a << (alac->setinfo_sample_size - 16);
+                    audiobits_a = (uint32_t)audiobits_a << (alac->setinfo_sample_size - 16);
                     audiobits_a |= readbits(alac, alac->setinfo_sample_size - 16);
 					audiobits_a = SignExtend24(audiobits_a);
 
                     audiobits_b = readbits(alac, 16);
-                    audiobits_b = audiobits_b << (alac->setinfo_sample_size - 16);
+                    audiobits_b = (uint32_t)audiobits_b << (alac->setinfo_sample_size - 16);
                     audiobits_b |= readbits(alac, alac->setinfo_sample_size - 16);
 					audiobits_b = SignExtend24(audiobits_b);
 					

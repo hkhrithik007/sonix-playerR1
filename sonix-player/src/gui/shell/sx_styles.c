@@ -1,0 +1,229 @@
+#include "sx_styles.h"
+
+#include <string.h>
+
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/theme.h"
+
+lv_style_t sx_style_page;
+lv_style_t sx_style_panel;
+lv_style_t sx_style_panel_press;
+lv_style_t sx_style_panel_text;
+lv_style_t sx_style_panel_text2;
+lv_style_t sx_style_panel_action;
+lv_style_t sx_style_panel_icon;
+lv_style_t sx_style_panel_icon_action;
+lv_style_t sx_style_panel_accent;
+lv_style_t sx_style_panel_accent_press;
+lv_style_t sx_style_panel_active;
+
+lv_style_t sx_style_surface;
+lv_style_t sx_style_press;
+lv_style_t sx_style_active;
+lv_style_t sx_style_text;
+lv_style_t sx_style_text2;
+lv_style_t sx_style_search_placeholder;
+lv_style_t sx_style_album_text;
+lv_style_t sx_style_album_icon;
+lv_style_t sx_style_text_accent;
+lv_style_t sx_style_accent;
+lv_style_t sx_style_accent_press;
+lv_style_t sx_style_icon;
+lv_style_t sx_style_icon2;
+lv_style_t sx_style_icon_accent;
+lv_style_t sx_style_icon_on_accent;
+lv_style_t sx_style_hairline;
+lv_style_t sx_style_swipe_end;
+lv_style_t sx_style_cover_tone;
+lv_style_t sx_style_mini;
+lv_style_t sx_style_mini_tone;
+lv_style_t sx_style_np_accent;
+lv_style_t sx_style_star_on;
+lv_style_t sx_style_flat;
+
+static void init_bg(lv_style_t *s) {
+	lv_style_init(s);
+	lv_style_set_bg_opa(s, LV_OPA_COVER);
+}
+
+static void init_recolour(lv_style_t *s) {
+	lv_style_init(s);
+	lv_style_set_image_recolor_opa(s, LV_OPA_COVER);
+}
+
+void sx_styles_init(void) {
+	init_bg(&sx_style_panel);
+	init_bg(&sx_style_panel_press);
+	lv_style_set_transform_width(&sx_style_panel_press, 0);
+	lv_style_set_transform_height(&sx_style_panel_press, 0);
+	lv_style_init(&sx_style_panel_text);
+	lv_style_init(&sx_style_panel_text2);
+	lv_style_init(&sx_style_panel_action);
+	init_recolour(&sx_style_panel_icon);
+	init_recolour(&sx_style_panel_icon_action);
+	init_bg(&sx_style_panel_accent);
+	init_bg(&sx_style_panel_accent_press);
+	init_bg(&sx_style_panel_active);
+
+	init_bg(&sx_style_page);
+	init_bg(&sx_style_surface);
+	init_bg(&sx_style_press);
+	// The pressed fill is immediate and flat: no grow, no shadow (principle 2:
+	// the fill changes at once, without animation).
+	lv_style_set_transform_width(&sx_style_press, 0);
+	lv_style_set_transform_height(&sx_style_press, 0);
+	init_bg(&sx_style_active);
+	lv_style_init(&sx_style_text);
+	lv_style_init(&sx_style_text2);
+	lv_style_init(&sx_style_search_placeholder);
+	lv_style_init(&sx_style_album_text);
+	init_recolour(&sx_style_album_icon);
+	lv_style_init(&sx_style_text_accent);
+	init_bg(&sx_style_accent);
+	init_bg(&sx_style_accent_press);
+	lv_style_set_image_recolor_opa(&sx_style_accent, LV_OPA_COVER);
+	init_recolour(&sx_style_icon);
+	init_recolour(&sx_style_icon2);
+	init_recolour(&sx_style_icon_accent);
+	init_recolour(&sx_style_icon_on_accent);
+	lv_style_init(&sx_style_hairline);
+	init_bg(&sx_style_swipe_end);
+	init_bg(&sx_style_cover_tone);
+	init_bg(&sx_style_mini);
+	lv_style_set_text_color(&sx_style_mini, lv_color_white());
+	init_bg(&sx_style_mini_tone);
+	init_bg(&sx_style_np_accent);
+	init_recolour(&sx_style_star_on);
+
+	lv_style_init(&sx_style_flat);
+	lv_style_set_bg_opa(&sx_style_flat, LV_OPA_TRANSP);
+	lv_style_set_border_width(&sx_style_flat, 0);
+	lv_style_set_outline_width(&sx_style_flat, 0);
+	lv_style_set_shadow_width(&sx_style_flat, 0);
+	lv_style_set_radius(&sx_style_flat, 0);
+	lv_style_set_pad_all(&sx_style_flat, 0);
+	lv_style_set_pad_gap(&sx_style_flat, 0);
+}
+
+void sx_styles_apply(void) {
+	const sx_palette_t *p = sx_pal();
+
+	lv_style_set_bg_color(&sx_style_panel, p->panel);
+	lv_style_set_text_color(&sx_style_panel, p->panel_text);
+	lv_style_set_bg_color(&sx_style_panel_press, p->panel_press);
+	lv_style_set_text_color(&sx_style_panel_text, p->panel_text);
+	lv_style_set_text_color(&sx_style_panel_text2, p->panel_text2);
+	lv_style_set_text_color(&sx_style_panel_action, p->panel_action);
+	lv_style_set_image_recolor(&sx_style_panel_icon, p->panel_text);
+	lv_style_set_image_recolor(&sx_style_panel_icon_action, p->panel_action);
+	lv_style_set_bg_color(&sx_style_panel_accent, p->panel_accent);
+	lv_style_set_text_color(&sx_style_panel_accent, p->panel_on_accent);
+	lv_style_set_image_recolor(&sx_style_panel_accent, p->panel_on_accent);
+	lv_style_set_image_recolor_opa(&sx_style_panel_accent, LV_OPA_COVER);
+	lv_style_set_bg_color(&sx_style_panel_accent_press, sx_mix(lv_color_eq(p->panel_on_accent, lv_color_white()) ? lv_color_black() : lv_color_white(), p->panel_accent, 12));
+	lv_style_set_text_color(&sx_style_panel_accent_press, p->panel_on_accent);
+	lv_style_set_bg_color(&sx_style_panel_active, p->panel_active);
+
+	lv_style_set_bg_color(&sx_style_page, p->bg);
+	lv_style_set_bg_color(&sx_style_surface, p->surface);
+	lv_style_set_text_color(&sx_style_surface, p->text);
+	lv_style_set_bg_color(&sx_style_press, p->press);
+	lv_style_set_bg_color(&sx_style_active, p->active);
+	lv_style_set_text_color(&sx_style_text, p->text);
+	lv_style_set_text_color(&sx_style_text2, p->text2);
+	if (theme_get_palette() != 0)
+		lv_style_set_text_color(&sx_style_search_placeholder, p->text2);
+	else
+		lv_style_remove_prop(&sx_style_search_placeholder, LV_STYLE_TEXT_COLOR);
+	lv_style_set_text_color(&sx_style_album_text, p->album_text);
+	lv_style_set_image_recolor(&sx_style_album_icon, p->album_text);
+	lv_style_set_text_color(&sx_style_text_accent, p->accent_text);
+	lv_style_set_bg_color(&sx_style_accent, p->accent);
+	lv_style_set_bg_color(&sx_style_accent_press, sx_mix(lv_color_eq(p->on_accent, lv_color_white()) ? lv_color_black() : lv_color_white(), p->accent, 12));
+	lv_style_set_text_color(&sx_style_accent_press, p->on_accent);
+	lv_style_set_text_color(&sx_style_accent, p->on_accent);
+	lv_style_set_image_recolor(&sx_style_accent, p->on_accent);
+	lv_style_set_image_recolor(&sx_style_icon, p->text);
+	lv_style_set_image_recolor(&sx_style_icon2, p->text2);
+	lv_style_set_image_recolor(&sx_style_icon_accent, p->accent_text);
+	lv_style_set_image_recolor(&sx_style_icon_on_accent, p->on_accent);
+	lv_style_set_bg_color(&sx_style_hairline, p->hairline);
+	lv_style_set_bg_opa(&sx_style_hairline, p->hairline_opa);
+	lv_style_set_bg_color(&sx_style_swipe_end, p->swipe_end);
+	lv_style_set_text_color(&sx_style_swipe_end, p->text);
+	lv_style_set_image_recolor(&sx_style_swipe_end, p->text);
+	lv_style_set_bg_color(&sx_style_cover_tone, p->cover_tone);
+	lv_style_set_bg_color(&sx_style_mini, p->mini_bg);
+	lv_style_set_text_color(&sx_style_mini, p->mini_ink);
+	lv_style_set_bg_color(&sx_style_mini_tone, p->mini_cover_tone);
+	lv_style_set_bg_color(&sx_style_np_accent, p->np_accent);
+	lv_style_set_image_recolor(&sx_style_star_on, p->star_on);
+}
+
+lv_obj_t *sx_box(lv_obj_t *parent) {
+	lv_obj_t *box = lv_obj_create(parent);
+	lv_obj_remove_style_all(box);
+	lv_obj_add_style(box, &sx_style_flat, 0);
+	lv_obj_set_scrollable(box, false);
+	lv_obj_set_clickable(box, false);
+	lv_obj_set_click_focusable(box, false);
+	lv_obj_set_event_bubble(box, true);
+	return box;
+}
+
+lv_obj_t *sx_label(lv_obj_t *parent, const lv_font_t *font, lv_style_t *colour_style) {
+	lv_obj_t *label = lv_label_create(parent);
+	lv_label_set_text(label, "");
+	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+	if (font) {
+		lv_obj_set_style_text_font(label, font, 0);
+		// One line, and the height is what says so: LV_LABEL_LONG_DOT wraps
+		// first and puts the dots in only where the wrapped text runs past
+		// the height it is given -- left to its content, a long row title
+		// took two lines and ran over the subtitle under it.
+		lv_obj_set_height(label, lv_font_get_line_height(font));
+	}
+	if (colour_style) {
+		lv_obj_add_style(label, colour_style, 0);
+	}
+	return label;
+}
+
+void sx_set_text(lv_obj_t *label, const char *text) {
+	if (!label || !text) {
+		return;
+	}
+	const char *now = lv_label_get_text(label);
+	if (!now || strcmp(now, text) != 0) {
+		lv_label_set_text(label, text);
+	}
+}
+
+void sx_set_src(lv_obj_t *img, const void *src) {
+	if (img && lv_image_get_src(img) != src) {
+		lv_image_set_src(img, src);
+	}
+}
+
+void sx_set_bg_color(lv_obj_t *obj, lv_color_t color) {
+	if (!obj)
+		return;
+	lv_style_value_t value;
+	if (lv_obj_get_local_style_prop(obj, LV_STYLE_BG_COLOR, &value, 0) != LV_STYLE_RES_FOUND || !lv_color_eq(value.color, color))
+		lv_obj_set_style_bg_color(obj, color, 0);
+}
+
+void sx_set_recolor(lv_obj_t *img, lv_color_t color) {
+	if (!img) {
+		return;
+	}
+	lv_style_value_t v;
+	if (lv_obj_get_local_style_prop(img, LV_STYLE_IMAGE_RECOLOR, &v, 0) != LV_STYLE_RES_FOUND ||
+		!lv_color_eq(v.color, color)) {
+		lv_obj_set_style_image_recolor(img, color, 0);
+	}
+	if (lv_obj_get_local_style_prop(img, LV_STYLE_IMAGE_RECOLOR_OPA, &v, 0) != LV_STYLE_RES_FOUND ||
+		v.num != LV_OPA_COVER) {
+		lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
+	}
+}

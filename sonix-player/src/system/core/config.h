@@ -2,6 +2,9 @@
 #define CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
+
+#define CONFIG_VALUE_SIZE 128
 
 // Settings that survive a power cycle.
 //
@@ -18,13 +21,16 @@
 //     last_seen = 1786000000
 //
 // Everything is held in memory; config_save() rewrites the file atomically, so
-// a power cut in the middle of a write cannot leave a truncated config behind.
+// file and parent-directory sync are checked before reporting success.
+// Set/get are serialized; save writes a snapshot without locking RAM for I/O.
 
 // Loads the file. A missing or unreadable file is not an error: the defaults
 // passed to the getters are used and the file appears on the first save.
 bool config_init(const char *path);
 
-const char *config_get(const char *section, const char *key, const char *fallback);
+// Copies under the store lock; the returned pointer is out, or NULL when
+// absent with a NULL fallback. Keep out alive for every use of the result.
+const char *config_get_copy(const char *section, const char *key, const char *fallback, char *out, size_t size);
 long config_get_int(const char *section, const char *key, long fallback);
 bool config_get_bool(const char *section, const char *key, bool fallback);
 
@@ -38,7 +44,7 @@ void config_set_bool(const char *section, const char *key, bool value);
 bool config_save(void);
 
 // Where the settings are being kept, or NULL if config_init() was never called.
-const char *config_path(void);
+const char *config_path_copy(char *out, size_t size);
 
 // ---------------------------------------------------------------------------
 // A second file, same shape
@@ -60,9 +66,9 @@ config_store_t *config_main_store(void);
 config_store_t *config_ebook_store(void);
 
 bool config_store_init(config_store_t *store, const char *path);
-const char *config_store_path(const config_store_t *store);
+const char *config_store_path_copy(const config_store_t *store, char *out, size_t size);
 
-const char *config_store_get(config_store_t *store, const char *section, const char *key, const char *fallback);
+const char *config_store_get_copy(config_store_t *store, const char *section, const char *key, const char *fallback, char *out, size_t size);
 long config_store_get_int(config_store_t *store, const char *section, const char *key, long fallback);
 void config_store_set(config_store_t *store, const char *section, const char *key, const char *value);
 void config_store_set_int(config_store_t *store, const char *section, const char *key, long value);
@@ -71,6 +77,7 @@ bool config_store_save(config_store_t *store);
 // Moves every key of `section` from one store to the other and returns how many
 // moved. What carries a player updated in place over to the split above,
 // instead of silently resetting every book it had open.
+// The destination is saved first; failure keeps every source entry intact.
 int config_store_move_section(config_store_t *from, config_store_t *to, const char *section);
 
 #endif /* CONFIG_H */

@@ -21,6 +21,10 @@
 // Writing to the card can be turned off (Settings > Developer options): it is
 // a constant trickle of writes to the user's music card, worth having only
 // while something is being debugged.
+// The background writer keeps up to 8 MiB in sonix_player.log and one previous
+// file, sonix_player.log.1. An older oversized log is reduced to its newest
+// 8 MiB using a temporary copy; a failed copy leaves the original intact.
+// Explicit SONIX_LOG paths are not rotated.
 
 // Starts the stamping and redirects output to the tmpfs. Call first thing in
 // main(), before anything can print: it replaces stdout and stderr.
@@ -47,7 +51,8 @@ const char *logging_path(void);
 // The USB mass-storage export unmounts the card the log lives on. Suspend
 // releases the file (output is held in memory meanwhile -- an open descriptor
 // on the card would make the unmount fail); resume reopens the file and
-// appends everything said in between. Both are safe to call when the log was
+// appends up to 32 KiB said in between; further output is dropped without
+// growing the tmpfs file. Both are safe to call when the log was
 // never on the card.
 void logging_suspend_for_usb(void);
 void logging_resume_after_usb(void);
@@ -85,6 +90,12 @@ void logging_flush(void);
 // may outlive the next move of the log (a daemon): a descriptor of its own on
 // the card's file keeps the card from being unmounted. Without logging_init()
 // it changes nothing.
+// Also marks other inherited descriptors close-on-exec, preventing a daemon
+// from retaining a decoded track or database. Stdio pipes installed by the
+// caller afterward still work: dup2 clears close-on-exec on the destination.
+// ALSA character descriptors (Linux major 116, fd >= 3) are closed in the
+// child immediately, before an instrumented exec may flush profile data.
+// This does not change the parent's handles or release inherited mappings.
 void logging_child_stdio(void);
 
 // Copies the kernel's warnings and errors printed since the last call into the

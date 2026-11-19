@@ -34,6 +34,13 @@ $(info Cloning LVGL v$(LVGL_VER)...)
 $(shell git clone --depth 1 -b v$(LVGL_VER) https://github.com/lvgl/lvgl.git)
 endif
 
+# Apply the bounded evdev fix before make reads source/dependency timestamps.
+# The script is idempotent and fails closed on an unsupported driver layout.
+LVGL_EVDEV_FRAMES := $(shell python3 tools/lvgl_evdev_frames.py "$(LVGL_DIR)")
+ifneq ($(LVGL_EVDEV_FRAMES),ok)
+$(error Cannot prepare LVGL evdev frame delivery)
+endif
+
 # Read out of the headers, so a checkout with no git history still answers.
 # All three places are tried: the macros sit in lvgl.h up to 9.1, in
 # lv_version.h from 9.2 and in include/lvgl/lv_version.h from 9.6.
@@ -58,6 +65,16 @@ endif
 #                               or offset wider than 32 bits, which an exFAT
 #                               card produces routinely.
 CFLAGS = -O3 -g -Wall -MMD -MP -D_FILE_OFFSET_BITS=64 -I. -I$(LVGL_DIR) -DLV_CONF_INCLUDE_SIMPLE=1 -DGB_CORE=1
+
+# The Zvuk service (zvuk.com): this fork's builds carry it, upstream's would
+# not -- its API is unofficial, as Yandex's. `make SONIX_ZVUK=0` builds without
+# it: every Zvuk source compiles to nothing and the hooks elsewhere fall away.
+# The objects do not depend on the flag: after changing it, `make clean` (or
+# touch src/system/streaming/zvuk*.c src/gui/streaming/zvuk*.c and the hooks).
+SONIX_ZVUK ?= 1
+ifeq ($(SONIX_ZVUK),1)
+CFLAGS += -DSONIX_ZVUK=1
+endif
 # On the host the audio libraries are the system ones (libopusfile-dev,
 # libwavpack-dev); on the target they are the ones this Makefile builds below.
 # opusfile.h includes <opus_multistream.h> unprefixed, so the opus/ directory
@@ -109,14 +126,17 @@ TARGET_CFLAGS = $(CFLAGS) -march=mips32r2 -mno-madd4 -mplt -ffunction-sections -
 # cache, smaller code is seldom slower code.
 #
 # The hot paths: the audio chain and its effects, the decoders, the Game Boy
-# core, and LVGL's software renderer and colour mixing. SQLite is at -O2, the
-# level it is normally built at.
+# core, LVGL's software renderer and colour mixing, and the cover decoders and
+# scalers (system/image), which run on every track change and every screenful
+# of album art in the library and decide how soon the cover appears. SQLite is
+# at -O2, the level it is normally built at.
 #
 # TARGET_OPT is per object: the default level everywhere, the hot one on the
 # objects matching TARGET_HOT_PATTERNS.
 TARGET_DEFAULT_OPT = -O2
 TARGET_HOT_OPT = -O3
 TARGET_HOT_PATTERNS = build_target/system/audio/% build_target/system/decode/% build_target/gb/% \
+					  build_target/system/image/% \
 					  build_target/lvgl/src/draw/sw/% build_target/lvgl/src/misc/lv_color%
 TARGET_OPT = $(TARGET_DEFAULT_OPT)
 $(TARGET_HOT_PATTERNS): TARGET_OPT = $(TARGET_HOT_OPT)
@@ -157,15 +177,56 @@ HOST_LDFLAGS = $(shell sdl2-config --libs) -lpthread -lm -ldl -lasound $(shell p
 TARGET_LDFLAGS = $(FREETYPE_PREFIX)/lib/libfreetype.a $(AUDIO_LIBS) -lpthread -lm -ldl -lasound \
 				 $(GB_LDFLAGS) -Wl,--gc-sections
 
+# Default target-only LTO. Keep the compile-time O2/O3 split above, but
+# choose the final link level explicitly (O3; O2 remains a comparison option).
+# Repeat the MIPS flags so link-time code generation keeps the same
+# ISA and separate floating-point multiply/add rounding. Host, launcher and
+# prebuilt dependency archives retain their existing flags. TARGET_FLAGS_STAMP
+# sees this through TARGET_CFLAGS, so both enabling and disabling rebuild objects.
+# A single LTRANS unit keeps glibc_compat.h's assembler-local .symver directives
+# beside every generated math call. Multiple partitions can request GLIBC_2.27.
+TARGET_LTO ?= 1
+TARGET_LTO_OPT ?= 3
+ifneq ($(filter $(TARGET_LTO_OPT),2 3),$(TARGET_LTO_OPT))
+$(error TARGET_LTO_OPT must be 2 or 3)
+endif
+ifeq ($(TARGET_LTO),1)
+TARGET_CFLAGS += -flto=4
+TARGET_LDFLAGS += -flto=4 -flto-partition=one -O$(TARGET_LTO_OPT) -march=mips32r2 -mno-madd4 -mplt
+else ifneq ($(TARGET_LTO),0)
+$(error TARGET_LTO must be 0 or 1)
+endif
+
+# Profiles are collected in RAM on the device, then copied to the build host.
+# Keep identical sources, build paths and per-file optimization levels. A
+# training-only TARGET_LTO=0 build can feed the final LTO build; profile mismatch
+# and missing-profile errors must remain fatal. Never collect profiles on SD.
+TARGET_PGO ?= off
+TARGET_PROFILE_DIR ?= /tmp/sonix-pgo
+# Explicit source paths relative to src/ for edits made without retraining.
+# Only these C objects omit profile use; all others keep strict profile checks.
+TARGET_PGO_UNPROFILED ?=
+ifeq ($(TARGET_PGO),generate)
+TARGET_CFLAGS += -fprofile-generate=$(TARGET_PROFILE_DIR) -fprofile-update=prefer-atomic -DSONIX_PROFILE_GENERATE=1
+TARGET_LDFLAGS += -fprofile-generate=$(TARGET_PROFILE_DIR)
+else ifeq ($(TARGET_PGO),use)
+TARGET_CFLAGS += -fprofile-use=$(TARGET_PROFILE_DIR) -fprofile-correction -Werror=coverage-mismatch -Werror=missing-profile
+TARGET_LDFLAGS += -fprofile-use=$(TARGET_PROFILE_DIR) -fprofile-correction -Werror=coverage-mismatch -Werror=missing-profile
+else ifneq ($(TARGET_PGO),off)
+$(error TARGET_PGO must be off, generate or use)
+endif
+
 # FreeType for the target, built static: the rootfs has no libfreetype.so. The
 # host uses the system one. The device's fonts are plain OTF/TTF, so zlib,
 # bzip2, png, harfbuzz and brotli are all off.
-FREETYPE_VER = 2.13.3
+# Keep the approved Segoe UI rasterization; 2.15 changes it at 16-18 px.
+FREETYPE_VER = 2.14.3
+FREETYPE_SHA256 = 36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f
 FREETYPE_TARBALL = freetype-$(FREETYPE_VER).tar.xz
 FREETYPE_URL = https://download.savannah.gnu.org/releases/freetype/$(FREETYPE_TARBALL)
 FREETYPE_URL_MIRROR = https://downloads.sourceforge.net/project/freetype/freetype2/$(FREETYPE_VER)/$(FREETYPE_TARBALL)
 FREETYPE_SRC = $(CURDIR)/freetype-$(FREETYPE_VER)
-FREETYPE_PREFIX = $(CURDIR)/freetype-target
+FREETYPE_PREFIX = $(CURDIR)/freetype-target/$(FREETYPE_VER)
 
 # The audio libraries carried inside the binary, static like FreeType. The
 # firmware's /usr/lib holds a libopus.so, but it is the raw codec with no Ogg
@@ -176,16 +237,20 @@ FREETYPE_PREFIX = $(CURDIR)/freetype-target
 #
 # The configure options below were settled against these versions.
 # ALAC is not here: its decoder is a single file under src/system/decode/alac/.
-AUDIO_PREFIX = $(CURDIR)/audio-target
+# Keep archives separate across version sets. The include paths also change
+# TARGET_FLAGS_STAMP, so switching back to a cached set recompiles consumers.
+AUDIO_PREFIX = $(CURDIR)/audio-target/ogg-$(OGG_VER)-opus-$(OPUS_VER)-opusfile-$(OPUSFILE_VER)-wv-$(WAVPACK_VER)
 
-OGG_VER = 1.3.5
+OGG_VER = 1.3.6
+OGG_SHA256 = 83e6704730683d004d20e21b8f7f55dcb3383cdf84c0daedf30bde175f774638
 OGG_TARBALL = libogg-$(OGG_VER).tar.gz
 OGG_URL = https://downloads.xiph.org/releases/ogg/$(OGG_TARBALL)
 OGG_URL_MIRROR = https://ftp.osuosl.org/pub/xiph/releases/ogg/$(OGG_TARBALL)
 OGG_SRC = $(CURDIR)/libogg-$(OGG_VER)
 OGG_LIB = $(AUDIO_PREFIX)/lib/libogg.a
 
-OPUS_VER = 1.4
+OPUS_VER = 1.6.1
+OPUS_SHA256 = 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
 OPUS_TARBALL = opus-$(OPUS_VER).tar.gz
 OPUS_URL = https://downloads.xiph.org/releases/opus/$(OPUS_TARBALL)
 OPUS_URL_MIRROR = https://ftp.osuosl.org/pub/xiph/releases/opus/$(OPUS_TARBALL)
@@ -193,13 +258,15 @@ OPUS_SRC = $(CURDIR)/opus-$(OPUS_VER)
 OPUS_LIB = $(AUDIO_PREFIX)/lib/libopus.a
 
 OPUSFILE_VER = 0.12
+OPUSFILE_SHA256 = 118d8601c12dd6a44f52423e68ca9083cc9f2bfe72da7a8c1acb22a80ae3550b
 OPUSFILE_TARBALL = opusfile-$(OPUSFILE_VER).tar.gz
 OPUSFILE_URL = https://downloads.xiph.org/releases/opus/$(OPUSFILE_TARBALL)
 OPUSFILE_URL_MIRROR = https://ftp.osuosl.org/pub/xiph/releases/opus/$(OPUSFILE_TARBALL)
 OPUSFILE_SRC = $(CURDIR)/opusfile-$(OPUSFILE_VER)
 OPUSFILE_LIB = $(AUDIO_PREFIX)/lib/libopusfile.a
 
-WAVPACK_VER = 5.6.0
+WAVPACK_VER = 5.9.0
+WAVPACK_SHA256 = b0038f515d322042aaa6bd352d437729c6f5f904363cc85bbc9b0d8bd4a81927
 WAVPACK_TARBALL = wavpack-$(WAVPACK_VER).tar.bz2
 WAVPACK_URL = https://www.wavpack.com/$(WAVPACK_TARBALL)
 WAVPACK_URL_MIRROR = https://github.com/dbry/WavPack/releases/download/$(WAVPACK_VER)/$(WAVPACK_TARBALL)
@@ -228,6 +295,18 @@ HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_ho
 			$(LVGL_SRCS:$(LVGL_DIR)/%.c=build_host/lvgl/%.o)
 TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=build_target/%.opp) \
 			  $(LVGL_SRCS:$(LVGL_DIR)/%.c=build_target/lvgl/%.o)
+
+# Opt-in native UI regression runner; never linked into the device binary.
+ifeq ($(UI_TEST),1)
+HOST_BIN = sonix_player_host_ui_test
+HOST_OBJS := $(filter-out build_host/main.o,$(HOST_OBJS)) build_host/tests/main.o build_host/tests/graphite_ui_test.o
+build_host/tests/main.o: src/main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HOST_CFLAGS) -DSONIX_UI_TEST -c $< -o $@
+build_host/tests/graphite_ui_test.o: tests/graphite_ui_test.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HOST_CFLAGS) -c $< -o $@
+endif
 
 .PHONY: all host target clean compile_commands.json
 
@@ -273,9 +352,12 @@ build_host/lvgl/%.o: $(LVGL_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-target: $(TARGET_BIN) $(LAUNCH_BIN) compile_commands.json
+target: $(TARGET_BIN) $(LAUNCH_BIN) sonix_recovery_r1 compile_commands.json
 
-$(TARGET_BIN): $(TARGET_OBJS)
+sonix_recovery_r1: tools/r1_recovery_patch.c src/system/core/sha256.c src/system/device/recovery_r1.h $(CROSS_CC)
+	$(CROSS_CC) -std=gnu11 -O2 -static -D_FILE_OFFSET_BITS=64 -I. tools/r1_recovery_patch.c src/system/core/sha256.c -o $@
+
+$(TARGET_BIN): $(TARGET_OBJS) Makefile
 	$(TARGET_LD) -o $@ $(TARGET_OBJS) $(TARGET_LDFLAGS)
 	@$(MAKE) --no-print-directory check-abi
 	@$(MAKE) --no-print-directory strip-target
@@ -373,16 +455,17 @@ check-abi:
 # included. Rewritten only when they differ, so a change of flags rebuilds
 # everything and nothing else does.
 TARGET_FLAGS_STAMP = build_target/.flags
-TARGET_FLAGS_LINE = $(TARGET_CFLAGS) | $(TARGET_CXXFLAGS) | $(TARGET_DEFAULT_OPT) $(TARGET_HOT_OPT) $(TARGET_HOT_PATTERNS)
+TARGET_FLAGS_LINE = $(TARGET_CFLAGS) | $(TARGET_CXXFLAGS) | $(TARGET_DEFAULT_OPT) $(TARGET_HOT_OPT) $(TARGET_HOT_PATTERNS) | $(TARGET_LDFLAGS) | unprofiled=$(TARGET_PGO_UNPROFILED)
 $(TARGET_FLAGS_STAMP): FORCE
 	@mkdir -p $(dir $@)
 	@echo '$(TARGET_FLAGS_LINE)' | cmp -s - $@ || \
 		echo '$(TARGET_FLAGS_LINE)' > $@
 FORCE:
 
+
 build_target/%.o: src/%.c $(TARGET_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CROSS_CC) $(TARGET_CFLAGS) $(TARGET_OPT) -c $< -o $@
+	$(CROSS_CC) $(if $(and $(filter use,$(TARGET_PGO)),$(filter $(patsubst src/%,%,$<),$(TARGET_PGO_UNPROFILED))),$(filter-out -fprofile-use=% -fprofile-correction -Werror=coverage-mismatch -Werror=missing-profile,$(TARGET_CFLAGS)),$(TARGET_CFLAGS)) $(TARGET_OPT) -c $< -o $@
 
 build_target/%.opp: src/%.cpp $(TARGET_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
@@ -408,6 +491,7 @@ libs-clean:
 # objects with it.
 $(TARGET_OBJS): $(CROSS_CC) $(FREETYPE_PREFIX)/lib/libfreetype.a $(AUDIO_LIBS)
 $(TARGET_BIN): $(FREETYPE_PREFIX)/lib/libfreetype.a $(AUDIO_LIBS)
+$(FREETYPE_PREFIX)/lib/libfreetype.a $(AUDIO_LIBS): Makefile
 
 $(CROSS_CC):
 	@echo "Building Rockbox toolchain..."
@@ -418,15 +502,30 @@ $(CROSS_CC):
 # are built once: `make libs-clean` removes them, with their extracted sources,
 # so the next `make target` builds them again.
 LIB_CFLAGS = -O2 -march=mips32r2 -mplt
+OPUS_CONFIGURE = --enable-fixed-point --disable-doc --disable-extra-programs --disable-deep-plc --disable-dred --disable-osce
+WAVPACK_CONFIGURE = --disable-apps --disable-man --disable-asm --disable-threads --enable-dsd --enable-legacy --without-libiconv-prefix
+# The MIPS headers in Opus define helpers unused by the 24-bit path. Keep
+# warnings enabled for the player; scope this upstream-only warning here.
+OPUS_CFLAGS = $(LIB_CFLAGS) -Wno-unused-function
+FREETYPE_FLAGS_STAMP = $(FREETYPE_PREFIX)/.flags
+AUDIO_FLAGS_STAMP = $(AUDIO_PREFIX)/.flags
+$(FREETYPE_FLAGS_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(CROSS_CC) | $(LIB_CFLAGS)' | cmp -s - $@ || echo '$(CROSS_CC) | $(LIB_CFLAGS)' > $@
+$(AUDIO_FLAGS_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(CROSS_CC) | $(LIB_CFLAGS) | $(OPUS_CFLAGS) | $(OPUS_CONFIGURE) | $(WAVPACK_CONFIGURE)' | cmp -s - $@ || \
+		echo '$(CROSS_CC) | $(LIB_CFLAGS) | $(OPUS_CFLAGS) | $(OPUS_CONFIGURE) | $(WAVPACK_CONFIGURE)' > $@
 
 # Cross-build FreeType, once. configure needs the toolchain on PATH for
 # ranlib/ar to be found under their host-triplet names.
-$(FREETYPE_PREFIX)/lib/libfreetype.a: $(CROSS_CC)
+$(FREETYPE_PREFIX)/lib/libfreetype.a: $(CROSS_CC) $(FREETYPE_FLAGS_STAMP)
 	@echo "Building static FreeType $(FREETYPE_VER) for the target..."
 	@if [ ! -f $(FREETYPE_TARBALL) ]; then \
 		wget -O $(FREETYPE_TARBALL) $(FREETYPE_URL) || \
 		wget -O $(FREETYPE_TARBALL) $(FREETYPE_URL_MIRROR); \
 	fi
+	@echo '$(FREETYPE_SHA256)  $(FREETYPE_TARBALL)' | sha256sum -c -
 	rm -rf $(FREETYPE_SRC) && tar xf $(FREETYPE_TARBALL)
 	cd $(FREETYPE_SRC) && PATH="$(ROCKBOX_TOOLCHAIN_DIR)/bin:$$PATH" ./configure \
 		--host=mipsel-rockbox-linux-gnu \
@@ -452,11 +551,12 @@ CROSS_TOOLS = CC=$(CROSS_CC) CFLAGS="$(LIB_CFLAGS)" \
 			  RANLIB=$(ROCKBOX_TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-ranlib
 CROSS_COMMON = --host=mipsel-rockbox-linux-gnu --prefix=$(AUDIO_PREFIX) --disable-shared --enable-static
 
-$(OGG_LIB): $(CROSS_CC)
+$(OGG_LIB): $(CROSS_CC) $(AUDIO_FLAGS_STAMP)
 	@echo "Building static libogg $(OGG_VER) for the target..."
 	@if [ ! -f $(OGG_TARBALL) ]; then \
 		wget -O $(OGG_TARBALL) $(OGG_URL) || wget -O $(OGG_TARBALL) $(OGG_URL_MIRROR); \
 	fi
+	@echo '$(OGG_SHA256)  $(OGG_TARBALL)' | sha256sum -c -
 	rm -rf $(OGG_SRC) && tar xf $(OGG_TARBALL)
 	cd $(OGG_SRC) && $(CROSS_PATH) ./configure $(CROSS_COMMON) $(CROSS_TOOLS)
 	$(CROSS_PATH) $(MAKE) -C $(OGG_SRC)
@@ -464,15 +564,15 @@ $(OGG_LIB): $(CROSS_CC)
 
 # --enable-fixed-point: integer decoder, bit-exact across platforms. The float
 # API stays compiled in -- removing it would take --disable-float-api.
-$(OPUS_LIB): $(CROSS_CC)
+$(OPUS_LIB): $(CROSS_CC) $(AUDIO_FLAGS_STAMP)
 	@echo "Building static libopus $(OPUS_VER) for the target..."
 	@if [ ! -f $(OPUS_TARBALL) ]; then \
 		wget -O $(OPUS_TARBALL) $(OPUS_URL) || wget -O $(OPUS_TARBALL) $(OPUS_URL_MIRROR); \
 	fi
+	@echo '$(OPUS_SHA256)  $(OPUS_TARBALL)' | sha256sum -c -
 	rm -rf $(OPUS_SRC) && tar xf $(OPUS_TARBALL)
 	cd $(OPUS_SRC) && $(CROSS_PATH) ./configure $(CROSS_COMMON) \
-		--enable-fixed-point --disable-doc --disable-extra-programs \
-		$(CROSS_TOOLS)
+		$(OPUS_CONFIGURE) $(CROSS_TOOLS) CFLAGS="$(OPUS_CFLAGS)"
 	$(CROSS_PATH) $(MAKE) -C $(OPUS_SRC)
 	$(CROSS_PATH) $(MAKE) -C $(OPUS_SRC) install
 
@@ -480,11 +580,12 @@ $(OPUS_LIB): $(CROSS_CC)
 # PKG_CHECK_MODULES, and no pkg-config here knows the cross sysroot. Passing
 # them skips the search. --disable-http drops the stream support that would
 # pull in OpenSSL.
-$(OPUSFILE_LIB): $(CROSS_CC) $(OGG_LIB) $(OPUS_LIB)
+$(OPUSFILE_LIB): $(CROSS_CC) $(OGG_LIB) $(OPUS_LIB) $(AUDIO_FLAGS_STAMP)
 	@echo "Building static opusfile $(OPUSFILE_VER) for the target..."
 	@if [ ! -f $(OPUSFILE_TARBALL) ]; then \
 		wget -O $(OPUSFILE_TARBALL) $(OPUSFILE_URL) || wget -O $(OPUSFILE_TARBALL) $(OPUSFILE_URL_MIRROR); \
 	fi
+	@echo '$(OPUSFILE_SHA256)  $(OPUSFILE_TARBALL)' | sha256sum -c -
 	rm -rf $(OPUSFILE_SRC) && tar xf $(OPUSFILE_TARBALL)
 	cd $(OPUSFILE_SRC) && $(CROSS_PATH) ./configure $(CROSS_COMMON) \
 		--disable-http --disable-examples --disable-doc \
@@ -498,16 +599,15 @@ $(OPUSFILE_LIB): $(CROSS_CC) $(OGG_LIB) $(OPUS_LIB)
 # costs a few kilobytes. --enable-dsd keeps DSD inside WavPack, which the
 # wrapper opens with OPEN_DSD_AS_PCM. --disable-asm because the assembly wavpack
 # ships is for x86 and ARM.
-$(WAVPACK_LIB): $(CROSS_CC)
+$(WAVPACK_LIB): $(CROSS_CC) $(AUDIO_FLAGS_STAMP)
 	@echo "Building static libwavpack $(WAVPACK_VER) for the target..."
 	@if [ ! -f $(WAVPACK_TARBALL) ]; then \
 		wget -O $(WAVPACK_TARBALL) $(WAVPACK_URL) || wget -O $(WAVPACK_TARBALL) $(WAVPACK_URL_MIRROR); \
 	fi
+	@echo '$(WAVPACK_SHA256)  $(WAVPACK_TARBALL)' | sha256sum -c -
 	rm -rf $(WAVPACK_SRC) && tar xf $(WAVPACK_TARBALL)
 	cd $(WAVPACK_SRC) && $(CROSS_PATH) ./configure $(CROSS_COMMON) \
-		--disable-apps --disable-man --disable-asm \
-		--enable-dsd --enable-legacy --without-libiconv-prefix \
-		$(CROSS_TOOLS)
+		$(WAVPACK_CONFIGURE) $(CROSS_TOOLS)
 	$(CROSS_PATH) $(MAKE) -C $(WAVPACK_SRC)
 	$(CROSS_PATH) $(MAKE) -C $(WAVPACK_SRC) install
 

@@ -1,6 +1,7 @@
 #ifndef TIDALPAGE_H
 #define TIDALPAGE_H
 
+#include "src/gui/library/searchsource.h"
 #include <stdbool.h>
 
 #include "src/gui/shell/gui.h"
@@ -26,5 +27,9 @@ extern lv_obj_t *tidal_list_screen;
 // registers it itself with device_state_add_prepare_cb(); it is declared here
 // because it is defined elsewhere in the file than where it is registered.
 bool tidalpage_prepare_track(const char *path);
+
+void tidalpage_search_results_kind(const char *query, int kind);
+bool tidalpage_search_path(const search_hit_t *hit, char *out, size_t size);
+void tidalpage_search_open_hit(const search_result_t *result, int index, const char *query);
 
 #endif /* TIDALPAGE_H */

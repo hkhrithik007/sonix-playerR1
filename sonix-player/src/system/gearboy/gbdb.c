@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,16 +75,6 @@ const char *gbdb_saves_dir(void) {
 	return path;
 }
 
-static bool card_root(char *out, size_t size) {
-	pthread_mutex_lock(&root_lock);
-	bool have = root_path[0] != '\0';
-	if (have) {
-		snprintf(out, size, "%s", root_path);
-	}
-	pthread_mutex_unlock(&root_lock);
-	return have;
-}
-
 // ---------------------------------------------------------------------------
 // CRC32
 // ---------------------------------------------------------------------------
@@ -129,6 +120,7 @@ uint32_t gbdb_crc32_file(const char *path) {
 	uint8_t *buf = malloc(CRC_CHUNK);
 	if (!buf) {
 		fclose(f);
+		errno = ENOMEM;
 		return 0;
 	}
 
@@ -199,13 +191,13 @@ static void cache_path(char *out, size_t size, const char *root) {
 	snprintf(out, size, "%s/%s/%s", root, CACHE_DIR, CACHE_FILE);
 }
 
-static void cache_load(cache_t *c, const char *root) {
+static bool cache_load(cache_t *c, const char *root) {
 	char path[WORK_PATH_MAX];
 	cache_path(path, sizeof(path), root);
 
 	FILE *f = fopen(path, "r");
 	if (!f) {
-		return;
+		return errno != ENOMEM;
 	}
 
 	// Twice GBROM_PATH_MAX plus a name covers any line cache_save() can have
@@ -244,54 +236,127 @@ static void cache_load(cache_t *c, const char *root) {
 		snprintf(e.path, sizeof(e.path), "%s", field[3]);
 		snprintf(e.name, sizeof(e.name), "%s", field[4]);
 
-		if (e.path[0]) {
-			cache_push(c, &e);
+		if (e.path[0] && !cache_push(c, &e)) {
+			fclose(f);
+			return false;
 		}
 	}
 
 	fclose(f);
+	return true;
 }
 
-// mkdir -p for the two levels needed: .local almost always exists already (the
-// log lives there), gearboy-cache almost never does on the first run.
-static void ensure_cache_dir(const char *root) {
-	char path[WORK_PATH_MAX];
-	snprintf(path, sizeof(path), "%s/.local", root);
-	mkdir(path, 0777);
-	snprintf(path, sizeof(path), "%s/%s", root, CACHE_DIR);
-	mkdir(path, 0777);
+// Only the publication phase pins storage; CRC/name work holds no card fd.
+static pthread_mutex_t cache_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t cache_nonce;
+
+static int cache_open_dir(int parent, const char *name) {
+	if (mkdirat(parent, name, 0777) != 0 && errno != EEXIST)
+		return -1;
+	return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
-// Written to a temporary file and renamed, never written in place: if power is
-// lost halfway through -- which happens on a battery device that shuts itself
-// down -- the old file survives intact instead of becoming half a new one.
-static void cache_save(const cache_t *c, const char *root) {
-	ensure_cache_dir(root);
-
-	char path[WORK_PATH_MAX];
-	char tmp[WORK_PATH_MAX + 8];
-	cache_path(path, sizeof(path), root);
-	snprintf(tmp, sizeof(tmp), "%s.new", path);
-
-	FILE *f = fopen(tmp, "w");
-	if (!f) {
-		fprintf(stderr, "gbdb: the cache cannot be written (%s): %s\n", tmp, strerror(errno));
-		return;
+static bool cache_write_all(int fd, const char *bytes, size_t size) {
+	while (size) {
+		ssize_t written = write(fd, bytes, size);
+		if (written < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (!written) {
+			errno = EIO;
+			return false;
+		}
+		bytes += written;
+		size -= (size_t)written;
 	}
+	return true;
+}
 
+// All paths after admission are relative to the original filesystem fd.
+// Optional cache errors preserve browsing; revoked ownership rejects the scan.
+static int cache_save(const cache_t *c, const storage_card_token_t *token) {
+	int rootfd = -1, localfd = -1, cachefd = -1, fd = -1;
+	int error = 0, result = 0;
+	char temp[64] = "";
+	bool owned = false, published = false;
+	pthread_mutex_lock(&cache_commit_lock);
+	rootfd = storage_pin_card_if(token);
+	if (rootfd < 0) {
+		error = errno;
+		if (error == ESTALE || error == ENODEV || error == EBUSY || error == EINVAL)
+			result = -ESTALE;
+		goto done;
+	}
+	localfd = cache_open_dir(rootfd, ".local");
+	if (localfd < 0)
+		goto failed;
+	cachefd = cache_open_dir(localfd, "gearboy-cache");
+	if (cachefd < 0)
+		goto failed;
+	for (int attempt = 0; attempt < 8; attempt++) {
+		if (cache_nonce == UINT64_MAX) {
+			errno = EOVERFLOW;
+			goto failed;
+		}
+		snprintf(temp, sizeof(temp), ".index-%ld-%llu.tmp", (long)getpid(),
+				 (unsigned long long)++cache_nonce);
+		fd = openat(cachefd, temp, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0666);
+		if (fd >= 0) {
+			owned = true;
+			break;
+		}
+		if (errno != EEXIST)
+			goto failed;
+	}
+	if (fd < 0)
+		goto failed;
 	for (int i = 0; i < c->count; i++) {
 		const cache_entry_t *e = &c->items[i];
-		fprintf(f, "%08X\t%lld\t%lld\t%s\t%s\n", e->crc, e->size, e->mtime, e->path, e->name);
+		char line[GBROM_PATH_MAX + GBROM_NAME_MAX + 96];
+		int length = snprintf(line, sizeof(line), "%08X\t%lld\t%lld\t%s\t%s\n",
+							  e->crc, e->size, e->mtime, e->path, e->name);
+		if (length < 0 || (size_t)length >= sizeof(line)) {
+			errno = EOVERFLOW;
+			goto failed;
+		}
+		if (!cache_write_all(fd, line, (size_t)length))
+			goto failed;
 	}
-
-	fflush(f);
-	fclose(f);
-
-	if (rename(tmp, path) != 0) {
-		fprintf(stderr, "gbdb: the cache cannot be renamed: %s\n", strerror(errno));
-		remove(tmp);
-	}
+	if (fsync(fd) != 0)
+		goto failed;
+	// Do not retry close after EINTR: ownership of that descriptor is uncertain.
+	int closed = close(fd);
+	fd = -1;
+	if (closed != 0)
+		goto failed;
+	if (renameat(cachefd, temp, cachefd, CACHE_FILE) != 0)
+		goto failed;
+	owned = false;
+	published = true;
+	if (fsync(cachefd) != 0)
+		goto failed;
+	goto done;
+failed:
+	error = errno;
+done:
+	if (fd >= 0 && close(fd) != 0 && !error)
+		error = errno;
+	if (owned && unlinkat(cachefd, temp, 0) != 0 && !error)
+		error = errno;
+	if (cachefd >= 0 && close(cachefd) != 0 && !error)
+		error = errno;
+	if (localfd >= 0 && close(localfd) != 0 && !error)
+		error = errno;
+	if (rootfd >= 0 && close(rootfd) != 0 && !error)
+		error = errno;
+	pthread_mutex_unlock(&cache_commit_lock);
+	if (error && (error != EROFS || published))
+		fprintf(stderr, "gbdb: cache %s: %s\n", published ? "published, durability uncertain" : "not saved", strerror(error));
+	return result;
 }
+
 
 static const cache_entry_t *cache_find(const cache_t *c, const char *path, long long size, long long mtime) {
 	for (int i = 0; i < c->count; i++) {
@@ -470,17 +535,21 @@ static bool romlist_push(romlist_t *l, const gbrom_t *r) {
 
 // Lists the candidate files in one directory, without CRC or name. The
 // expensive work comes later, and only for the ones the cache does not cover.
-static void collect_dir(romlist_t *list, const char *root, const char *subdir, bool color_dir) {
+static bool collect_dir(romlist_t *list, const char *root, const char *subdir, bool color_dir) {
 	char dir[WORK_PATH_MAX];
 	snprintf(dir, sizeof(dir), "%s/%s", root, subdir);
 
 	DIR *d = opendir(dir);
 	if (!d) {
-		return;
+		return errno != ENOMEM;
 	}
 
 	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
+	for (;;) {
+		errno = 0;
+		de = readdir(d);
+		if (!de)
+			break;
 		if (de->d_name[0] == '.') {
 			continue;
 		}
@@ -510,10 +579,15 @@ static void collect_dir(romlist_t *list, const char *root, const char *subdir, b
 			continue;
 		}
 
-		romlist_push(list, &r);
+		if (!romlist_push(list, &r)) {
+			closedir(d);
+			return false;
+		}
 	}
 
+	bool complete = errno != ENOMEM;
 	closedir(d);
+	return complete;
 }
 
 static int compare_by_name(const void *a, const void *b) {
@@ -522,19 +596,20 @@ static int compare_by_name(const void *a, const void *b) {
 	return c ? c : strcmp(x->path, y->path);
 }
 
-int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), void *user) {
+int gbdb_scan_admitted(gbrom_t **out, const char *root, const storage_card_token_t *token,
+					   bool (*progress)(int done, int total, void *user), void *user) {
 	if (out) {
 		*out = NULL;
 	}
 
-	char root[GBROM_PATH_MAX];
-	if (!card_root(root, sizeof(root))) {
-		return -1;
-	}
+	if (!root || !root[0] || strlen(root) >= GBROM_PATH_MAX || !token || !token->epoch)
+		return -EINVAL;
 
 	romlist_t list = {0};
-	collect_dir(&list, root, DIR_GB, false);
-	collect_dir(&list, root, DIR_GBC, true);
+	if (!collect_dir(&list, root, DIR_GB, false) || !collect_dir(&list, root, DIR_GBC, true)) {
+		free(list.items);
+		return -ENOMEM;
+	}
 
 	// Logged on every scan, not only on failure: "nothing found" and "looking
 	// in the wrong place" are the same empty screen, and without this line they
@@ -547,12 +622,21 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 	}
 
 	cache_t cache = {0};
-	cache_load(&cache, root);
+	if (!cache_load(&cache, root)) {
+		cache_free(&cache);
+		free(list.items);
+		return -ENOMEM;
+	}
 
 	// First pass: entries answered by the cache are done; the rest are read
 	// through to compute their CRC. This is the only expensive part, and the
 	// one `progress` reports on.
 	wanted_t *wanted = calloc((size_t)list.count, sizeof(*wanted));
+	if (!wanted) {
+		cache_free(&cache);
+		free(list.items);
+		return -ENOMEM;
+	}
 	int wanted_count = 0;
 	bool stopped = false;
 
@@ -579,7 +663,14 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 			break;
 		}
 
+		errno = 0;
 		r->crc = gbdb_crc32_file(r->path);
+		if (!r->crc && errno == ENOMEM) {
+			free(wanted);
+			cache_free(&cache);
+			free(list.items);
+			return -ENOMEM;
+		}
 		if (r->crc && wanted) {
 			wanted[wanted_count].crc = r->crc;
 			wanted_count++;
@@ -623,6 +714,7 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 	// so the next scan picks them up.
 	{
 		cache_t fresh = {0};
+		bool complete = true;
 		for (int i = 0; i < list.count; i++) {
 			const gbrom_t *r = &list.items[i];
 			if (!r->crc) {
@@ -639,10 +731,24 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 			e.mtime = (long long)st.st_mtime;
 			snprintf(e.path, sizeof(e.path), "%s", r->path);
 			snprintf(e.name, sizeof(e.name), "%s", r->from_db ? r->name : "");
-			cache_push(&fresh, &e);
+			if (!cache_push(&fresh, &e)) {
+				complete = false;
+				break;
+			}
 		}
-		cache_save(&fresh, root);
+		if (!complete) {
+			cache_free(&fresh);
+			cache_free(&cache);
+			free(list.items);
+			return -ENOMEM;
+		}
+		int saved = cache_save(&fresh, token);
 		cache_free(&fresh);
+		if (saved < 0) {
+			cache_free(&cache);
+			free(list.items);
+			return saved;
+		}
 	}
 
 	cache_free(&cache);
@@ -659,4 +765,15 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 		free(list.items);
 	}
 	return list.count;
+}
+
+// Legacy callers admit once too; a commit never refreshes that original token.
+int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), void *user) {
+	if (out)
+		*out = NULL;
+	char root[GBROM_PATH_MAX];
+	storage_card_token_t token = {0};
+	if (!storage_card_try_admit(&token, root, sizeof(root)))
+		return errno == EAGAIN ? -EAGAIN : -1;
+	return gbdb_scan_admitted(out, root, &token, progress, user);
 }

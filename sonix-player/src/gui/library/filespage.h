@@ -25,4 +25,8 @@ void filespage_init(gui_config_t *cfg);
 // the player shows up without a restart.
 void filespage_open(void);
 
+// GUI owner consumes a finished operation even if its wake message was lost.
+void filespage_service_completion(void);
+void filespage_shutdown_completions(void);
+
 #endif /* FILESPAGE_H */

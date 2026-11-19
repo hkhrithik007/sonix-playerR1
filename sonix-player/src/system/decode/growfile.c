@@ -1,5 +1,6 @@
 #include "growfile.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@ typedef struct {
 	char path[512];
 	long done;	// bytes written so far
 	long total; // final size, 0 when the server did not say
+	uint32_t duration_ms;
 	bool active;
 	bool failed;
 } slot_t;
@@ -67,6 +69,7 @@ void growfile_announce(const char *path, long total) {
 		snprintf(slot->path, sizeof(slot->path), "%s", path);
 		slot->done = 0;
 		slot->total = total;
+		slot->duration_ms = 0;
 		slot->active = true;
 		slot->failed = false;
 		// Log the exact path being tracked: it is the reference when a caller
@@ -95,6 +98,15 @@ void growfile_progress(const char *path, long done) {
 	pthread_mutex_unlock(&lock);
 }
 
+void growfile_set_duration(const char *path, uint32_t duration_ms) {
+	pthread_mutex_lock(&lock);
+	slot_t *slot = find_locked(path);
+	if (slot) {
+		slot->duration_ms = duration_ms;
+	}
+	pthread_mutex_unlock(&lock);
+}
+
 void growfile_finish(const char *path, bool ok) {
 	pthread_mutex_lock(&lock);
 	slot_t *slot = find_locked(path);
@@ -104,6 +116,21 @@ void growfile_finish(const char *path, bool ok) {
 	}
 	pthread_cond_broadcast(&grew);
 	pthread_mutex_unlock(&lock);
+}
+
+int growfile_list(growfile_info_t *out, int max) {
+	int n = 0;
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < GROWFILE_MAX && n < max; i++) {
+		if (slots[i].active) {
+			snprintf(out[n].path, sizeof(out[n].path), "%.511s", slots[i].path);
+			out[n].done = slots[i].done;
+			out[n].total = slots[i].total;
+			n++;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return n;
 }
 
 bool growfile_prefix_is_growing(const char *prefix) {
@@ -205,8 +232,7 @@ static long wait_for_bytes_timeout(growfile_t *g, long need, int timeout_ms) {
 		waited_ms += 100;
 		if (waited_ms >= timeout_ms) {
 			if (timeout_ms >= 1000) {
-				fprintf(stderr, "growfile: %s stalled for %d s at %ld bytes; giving up waiting\n", g->path,
-						waited_ms / 1000, slot->done);
+				fprintf(stderr, "growfile: %s stalled for %d s at %ld bytes; giving up waiting\n", g->path, waited_ms / 1000, slot->done);
 			}
 			break;
 		}
@@ -224,8 +250,18 @@ static long wait_for_bytes_timeout(growfile_t *g, long need, int timeout_ms) {
 	return available;
 }
 
-static long wait_for_bytes(growfile_t *g, long need) {
-	return wait_for_bytes_timeout(g, need, GROWFILE_WAIT_TIMEOUT_MS);
+static long wait_for_bytes(growfile_t *g, long need) { return wait_for_bytes_timeout(g, need, GROWFILE_WAIT_TIMEOUT_MS); }
+
+long growfile_wait_path(const char *path, long need) {
+	if (!path) {
+		return -1;
+	}
+	// A throwaway handle: the wait only needs the path to find the writer's
+	// slot, and building it here keeps the slot logic in one place.
+	growfile_t g;
+	memset(&g, 0, sizeof(g));
+	snprintf(g.path, sizeof(g.path), "%s", path);
+	return wait_for_bytes_timeout(&g, need, GROWFILE_WAIT_TIMEOUT_MS);
 }
 
 size_t growfile_read(growfile_t *g, void *out, size_t bytes) {
@@ -233,6 +269,9 @@ size_t growfile_read(growfile_t *g, void *out, size_t bytes) {
 		return 0;
 	}
 
+	// The writer may have finished between two calls. A stale stdio EOF must
+	// not hide its final bytes just because the active slot has disappeared.
+	clearerr(g->f);
 	size_t got = fread(out, 1, bytes, g->f);
 	g->pos += (long)got;
 	if (got == bytes) {
@@ -261,9 +300,11 @@ size_t growfile_read(growfile_t *g, void *out, size_t bytes) {
 
 		long need = g->pos + (long)(bytes - got);
 		long available = wait_for_bytes(g, need);
-		if (available < 0 || available <= g->pos) {
-			break; // nobody is writing it any more, or it did not grow
+		if (available >= 0 && available <= g->pos) {
+			break; // the active writer did not grow
 		}
+		// A disappearing slot can mean the final chunk just committed. Read
+		// that tail once before accepting EOF, rather than dropping it.
 
 		// A short fread leaves the stream at end-of-file; without clearing it
 		// every later read returns zero no matter how much data arrived.
@@ -319,6 +360,32 @@ bool growfile_seek(growfile_t *g, long offset, int origin) {
 }
 
 long growfile_tell(growfile_t *g) { return g ? g->pos : 0; }
+
+uint32_t growfile_duration(growfile_t *g) {
+	if (!g) {
+		return 0;
+	}
+	pthread_mutex_lock(&lock);
+	slot_t *slot = find_locked(g->path);
+	uint32_t duration = slot ? slot->duration_ms : 0;
+	pthread_mutex_unlock(&lock);
+	return duration;
+}
+
+long growfile_available(growfile_t *g) {
+	if (!g) {
+		return -1;
+	}
+	long done = 0, total = 0;
+	if (growfile_span(g, &done, &total)) {
+		return done;
+	}
+	struct stat st;
+	if (fstat(fileno(g->f), &st) != 0 || st.st_size < 0) {
+		return -1;
+	}
+	return st.st_size > LONG_MAX ? LONG_MAX : (long)st.st_size;
+}
 
 bool growfile_take_starved(growfile_t *g) {
 	if (!g || !g->starved) {

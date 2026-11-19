@@ -1,4 +1,5 @@
 #include "tabbar.h"
+#include "src/gui/shell/sx_palette.h"
 
 #include <string.h>
 
@@ -100,7 +101,7 @@ void tabbar_set_active(tabbar_t *t, int index) {
 		// Pressed, an idle tab darkens as a row would.
 		lv_obj_set_style_bg_opa(t->tabs[i], LV_OPA_COVER, LV_STATE_PRESSED);
 		lv_obj_set_style_bg_color(t->tabs[i], on ? theme()->accent : theme()->surface_pressed, LV_STATE_PRESSED);
-		lv_obj_set_style_text_color(t->labels[i], on ? lv_color_white() : theme()->text_primary, 0);
+		lv_obj_set_style_text_color(t->labels[i], on ? sx_pal()->on_accent : theme()->text_primary, 0);
 		bool off = lv_obj_has_state(t->tabs[i], LV_STATE_DISABLED);
 		lv_obj_set_style_opa(t->tabs[i], off ? LV_OPA_40 : LV_OPA_COVER, 0);
 	}

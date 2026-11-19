@@ -9,10 +9,11 @@
 
 #include <errno.h>
 #include <netdb.h>
-#include <pthread.h>
-#include <resolv.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
+#include <resolv.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,32 @@ static __thread char last_final_url[2600];
 
 const char *http_last_final_url(void) { return last_final_url; }
 
+// The Content-Type of this thread's last answer (http_last_content_type), and
+// the headers its streams carry on top of the usual ones
+// (http_set_thread_stream_headers). Both per thread, like everything above.
+static __thread char last_content_type[64];
+static __thread const char *thread_stream_headers;
+
+const char *http_last_content_type(void) { return last_content_type; }
+
+void http_set_thread_stream_headers(const char *headers) { thread_stream_headers = headers; }
+
+// Whether a block of "Name: value\r\n" lines carries `name` (any case). A
+// caller that sends its own User-Agent or Accept means it to replace ours:
+// two of them in one request read as a bot to the filters that look (the
+// anti-bot in front of zvuk.com answers 418 to anything but a browser's).
+static bool carries_header(const char *headers, const char *name) {
+	size_t len = strlen(name);
+	for (const char *line = headers; line && *line;) {
+		if (strncasecmp(line, name, len) == 0 && line[len] == ':') {
+			return true;
+		}
+		line = strchr(line, '\n');
+		line = line ? line + 1 : NULL;
+	}
+	return false;
+}
+
 static void clear_last_error(void) {
 	last_error[0] = '\0';
 }
@@ -53,6 +80,63 @@ static void set_last_error(const char *fmt, ...) {
 
 const char *http_last_error(void) {
 	return last_error[0] ? last_error : NULL;
+}
+
+// ---------------------------------------------------------------------------
+// What became of the last request, for the caller to classify
+// ---------------------------------------------------------------------------
+//
+// last_error above is a sentence for the screen, and only when there is one
+// worth showing. This is the other half: the plain facts -- answered or not,
+// with what status, failing where -- which a caller needs to say "no Wi-Fi"
+// rather than "the server answered 503", and the log needs to say which
+// request it was. Per thread, for the same reason as last_error.
+
+static __thread http_outcome_t outcome;
+
+// The request now starting: host and path for the log, the query left out --
+// that is where Subsonic's token and salt travel, and a log is shared.
+static void outcome_begin(const char *host, const char *path) {
+	memset(&outcome, 0, sizeof(outcome));
+	snprintf(outcome.host, sizeof(outcome.host), "%.63s", host ? host : "");
+	size_t len = path ? strcspn(path, "?") : 0;
+	if (len >= sizeof(outcome.path)) {
+		len = sizeof(outcome.path) - 1;
+	}
+	if (len) {
+		memcpy(outcome.path, path, len);
+	}
+	outcome.path[len] = '\0';
+}
+
+static void outcome_fail(http_fail_t fail) {
+	outcome.fail = fail;
+}
+
+void http_last_outcome(http_outcome_t *out) {
+	if (out) {
+		*out = outcome;
+	}
+}
+
+void http_forget_outcome(void) {
+	memset(&outcome, 0, sizeof(outcome));
+}
+
+// The ceiling on this thread's API timeouts; see http_set_thread_timeout_cap().
+static __thread int timeout_cap;
+static __thread size_t body_cap;
+
+void http_set_thread_body_cap(size_t bytes) { body_cap = bytes; }
+
+void http_set_thread_timeout_cap(int secs) {
+	timeout_cap = secs > 0 ? secs : 0;
+}
+
+// The length of `path` up to its query, for the log lines below: the query is
+// where tokens travel.
+static int path_shown(const char *path) {
+	return (int)strcspn(path, "?");
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +292,7 @@ static int connect_to(const char *host, int port, int timeout_secs) {
 		// DNS, a downed network and a dead server do not all reach the caller
 		// as the same generic "cannot reach X".
 		set_last_error(tr("http_dns_failed"), host);
+		outcome_fail(HTTP_FAIL_DNS);
 		return -1;
 	}
 
@@ -234,6 +319,7 @@ static int connect_to(const char *host, int port, int timeout_secs) {
 		// The address resolved but the connection did not: a different fault
 		// from DNS, and worth its own message.
 		set_last_error(tr("http_connect_failed"), host, port);
+		outcome_fail(HTTP_FAIL_CONNECT);
 	}
 	return fd;
 }
@@ -313,6 +399,7 @@ static bool conn_open(conn_t *c, const url_t *u, int timeout_secs, char *err, si
 	c->tls = tls_client(c->fd, u->host, err, err_size);
 	if (!c->tls) {
 		fprintf(stderr, "http: TLS to %s failed: %s\n", u->host, (err && err[0]) ? err : "?");
+		outcome_fail(HTTP_FAIL_TLS);
 		if (err && err[0]) {
 			set_last_error("%s", err);
 		}
@@ -340,6 +427,10 @@ static int read_headers(conn_t *c, char *headers, size_t headers_size, char *bod
 	while (used + 1 < headers_size) {
 		int n = conn_read(c, headers + used, headers_size - used - 1);
 		if (n <= 0) {
+			// EAGAIN is the receive timeout: connected, and then silence --
+			// a server too busy or wedged to answer, which is worth telling
+			// apart from a connection that dropped.
+			outcome_fail(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? HTTP_FAIL_TIMEOUT : HTTP_FAIL_BROKEN);
 			return -1;
 		}
 		used += (size_t)n;
@@ -373,9 +464,11 @@ static int read_headers(conn_t *c, char *headers, size_t headers_size, char *bod
 	// "HTTP/1.1 200 OK", or shoutcast's own "ICY 200 OK".
 	const char *space = strchr(headers, ' ');
 	if (!space) {
+		outcome_fail(HTTP_FAIL_BROKEN);
 		return -1;
 	}
-	return atoi(space + 1);
+	outcome.status = atoi(space + 1);
+	return outcome.status;
 }
 
 // Copies the value of `name` (case-insensitive, without the trailing CR) out
@@ -416,10 +509,11 @@ typedef struct {
 	size_t used;
 	size_t cap;
 	size_t limit;
+	bool failed;
 } body_t;
 
 static bool body_reserve(body_t *b, size_t extra) {
-	if (b->used + extra + 1 <= b->cap) {
+	if (extra <= b->cap - b->used) {
 		return true;
 	}
 	if (b->cap >= b->limit) {
@@ -427,7 +521,9 @@ static bool body_reserve(body_t *b, size_t extra) {
 	}
 
 	size_t want = b->cap ? b->cap : 16 * 1024;
-	while (want < b->used + extra + 1) {
+	if (want > b->limit)
+		want = b->limit;
+	while (want < b->used + extra) {
 		want *= 2;
 		if (want >= b->limit) {
 			want = b->limit;
@@ -437,6 +533,7 @@ static bool body_reserve(body_t *b, size_t extra) {
 
 	char *grown = realloc(b->data, want + 1);
 	if (!grown) {
+		b->failed = true;
 		return false;
 	}
 	b->data = grown;
@@ -461,9 +558,13 @@ static bool body_append(body_t *b, const char *data, size_t len) {
 // connection (HTTP/1.0, or Connection: close with no length).
 static void read_until_close(conn_t *c, body_t *b) {
 	char buf[8192];
-	for (;;) {
+	while (b->used < b->limit) {
 		int got = conn_read(c, buf, sizeof(buf));
 		if (got <= 0) {
+			if (got < 0) {
+				b->failed = true;
+				outcome_fail(errno == EAGAIN || errno == EWOULDBLOCK ? HTTP_FAIL_TIMEOUT : HTTP_FAIL_BROKEN);
+			}
 			return;
 		}
 		if (!body_append(b, buf, (size_t)got)) {
@@ -496,7 +597,7 @@ static bool read_length(conn_t *c, body_t *b, size_t content_length) {
 			// limit is still usable because the URL it wants is at the top.
 			// Only the case above is a failure: the server stopped short of
 			// what it promised.
-			return true;
+			return !b->failed;
 		}
 	}
 	return true;
@@ -545,16 +646,15 @@ static bool source_read_line(source_t *src, char *out, size_t out_size) {
 		if (!source_read_exact(src, &c, 1)) {
 			return false;
 		}
-		if (c == '\n') {
-			while (n > 0 && (out[n - 1] == '\r')) {
-				n--;
-			}
+		if (c == '\r') {
+			if (!source_read_exact(src, &c, 1) || c != '\n')
+				return false;
 			out[n] = '\0';
 			return true;
 		}
-		if (n + 1 < out_size) {
-			out[n++] = c;
-		}
+		if (c == '\n' || c == '\0' || n + 1 >= out_size)
+			return false;
+		out[n++] = c;
 	}
 }
 
@@ -564,39 +664,61 @@ static bool source_read_line(source_t *src, char *out, size_t out_size) {
 // The API's own answers are not chunked, but a proxy in front of one of the
 // mirrors may chunk a long reply -- and a long reply is exactly what a list of
 // stations is.
-static void read_chunked(source_t *src, body_t *b) {
-	char line[64];
+static bool read_chunked(source_t *src, body_t *b) {
+	char line[1024];
 	for (;;) {
 		if (!source_read_line(src, line, sizeof(line))) {
-			return;
+			return false;
 		}
 
-		// The length may carry chunk extensions after a ';'.
-		char *semi = strchr(line, ';');
-		if (semi) {
-			*semi = '\0';
+		// Parse only hexadecimal digits: strtol also accepts signs and junk.
+		size_t len = 0;
+		const char *p = line;
+		for (;;) {
+			int digit = *p >= '0' && *p <= '9' ? *p - '0' : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10 : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
+			if (digit < 0)
+				break;
+			if (len > (SIZE_MAX - (size_t)digit) / 16)
+				return false;
+			len = len * 16 + (size_t)digit;
+			p++;
 		}
-		long len = strtol(line, NULL, 16);
-		if (len <= 0) {
-			return; // the last chunk (trailers, if any, are of no interest)
+		if (p == line || (*p && *p != ';'))
+			return false;
+		if (len == 0) {
+			// Consume the trailer section through its empty terminating line.
+			size_t trailers = 0;
+			do {
+				if (!source_read_line(src, line, sizeof(line)))
+					return false;
+				trailers += strlen(line) + 2;
+				if (trailers > HTTP_HEADER_BUFFER || (line[0] && !strchr(line, ':')))
+					return false;
+			} while (line[0]);
+			return true;
 		}
 
 		char buf[8192];
 		size_t left = (size_t)len;
 		while (left > 0) {
+			// An explicit caller limit permits a prefix (radio playlists).
+			if (b->used >= b->limit)
+				return !b->failed;
 			size_t want = left > sizeof(buf) ? sizeof(buf) : left;
+			if (want > b->limit - b->used)
+				want = b->limit - b->used;
 			if (!source_read_exact(src, buf, want)) {
-				return;
+				return false;
 			}
 			if (!body_append(b, buf, want)) {
-				return;
+				return false;
 			}
 			left -= want;
 		}
 
 		char crlf[2];
-		if (!source_read_exact(src, crlf, 2)) {
-			return;
+		if (!source_read_exact(src, crlf, 2) || crlf[0] != '\r' || crlf[1] != '\n') {
+			return false;
 		}
 	}
 }
@@ -629,6 +751,8 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 		body_len = req->body_len ? req->body_len : strlen(req->body);
 	}
 
+	outcome_begin(u->host, u->path);
+
 	conn_t conn;
 	if (!conn_open(&conn, u, timeout_secs, err, err_size)) {
 		return false;
@@ -658,20 +782,24 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 	int n = snprintf(request, sizeof(request),
 					 "%s %s HTTP/1.0\r\n"
 					 "Host: %s\r\n"
-					 "User-Agent: " HTTP_USER_AGENT "\r\n"
-					 "Accept: */*\r\n"
+					 "%s"
+					 "%s"
 					 "Accept-Encoding: identity\r\n"
 					 "Connection: close\r\n"
 					 "%s"
 					 "%s"
 					 "\r\n",
-					 method, u->path, host_header, body_headers, extra_headers ? extra_headers : "");
+					 method, u->path, host_header,
+					 carries_header(extra_headers, "User-Agent") ? "" : "User-Agent: " HTTP_USER_AGENT "\r\n",
+					 carries_header(extra_headers, "Accept") ? "" : "Accept: */*\r\n", body_headers,
+					 extra_headers ? extra_headers : "");
 	// Compare the length against the buffer, not just against zero: snprintf
 	// truncates but returns what it would have written, so an over-long
 	// request would put bytes from past the end of the stack on the wire. It
 	// fits with room today; this check keeps it fitting when someone adds a
 	// longer header.
 	if (n <= 0 || (size_t)n >= sizeof(request) || !conn_write_all(&conn, request, (size_t)n)) {
+		outcome_fail(HTTP_FAIL_BROKEN);
 		conn_close(&conn);
 		return false;
 	}
@@ -680,6 +808,7 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 	// `request`: a long body would overflow that buffer silently, and snprintf
 	// would truncate a request that has already declared its length.
 	if (body_len > 0 && !conn_write_all(&conn, req->body, body_len)) {
+		outcome_fail(HTTP_FAIL_BROKEN);
 		conn_close(&conn);
 		return false;
 	}
@@ -689,6 +818,9 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 	int lead_len = 0;
 	int status = read_headers(&conn, headers, sizeof(headers), lead, sizeof(lead), &lead_len);
 	*status_out = status;
+	if (!header_value(headers, "Content-Type", last_content_type, sizeof(last_content_type))) {
+		last_content_type[0] = '\0';
+	}
 
 	if (status >= 300 && status < 400) {
 		location[0] = '\0';
@@ -702,7 +834,7 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 	// success is read from the status code, and that code is 204.
 	bool ok_status = status == 200 || (req->allow_empty_body && status >= 200 && status < 300);
 	if (!ok_status && !(want_error_body && status >= 400 && status < 500)) {
-		fprintf(stderr, "http: %s%s -> status %d\n", u->host, u->path, status);
+		fprintf(stderr, "http: %s%.*s -> status %d\n", u->host, path_shown(u->path), u->path, status);
 		// The status goes into last_error as well as the log, so that a server
 		// that answered by saying no is not reported to the caller as silence.
 		if (!last_error[0]) {
@@ -720,7 +852,12 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 
 	if (chunked) {
 		source_t src = {.conn = &conn, .lead = lead, .lead_len = (size_t)lead_len, .lead_pos = 0};
-		read_chunked(&src, &body);
+		if (!read_chunked(&src, &body)) {
+			outcome_fail(HTTP_FAIL_BROKEN);
+			conn_close(&conn);
+			free(body.data);
+			return false;
+		}
 	} else {
 		if (lead_len > 0 && !body_append(&body, lead, (size_t)lead_len)) {
 			conn_close(&conn);
@@ -734,7 +871,8 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 				// Less than promised: the response is broken, not short.
 				// Delivering it anyway means half a JPEG or, worse, an audio
 				// segment with a hole in it, accepted as good and cached.
-				fprintf(stderr, "http: %s%s -> body cut short\n", u->host, u->path);
+				fprintf(stderr, "http: %s%.*s -> body cut short\n", u->host, path_shown(u->path), u->path);
+				outcome_fail(HTTP_FAIL_BROKEN);
 				conn_close(&conn);
 				free(body.data);
 				return false;
@@ -745,6 +883,10 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 	}
 
 	conn_close(&conn);
+	if (body.failed) {
+		free(body.data);
+		return false;
+	}
 
 	if (!body.data) {
 		// An empty 200 is not an answer to anything asked here, except for
@@ -757,7 +899,7 @@ static bool get_once(const url_t *u, const http_req_t *req, char **out, size_t *
 			}
 			body.used = 0;
 		} else {
-			fprintf(stderr, "http: %s%s -> %d with no body\n", u->host, u->path, status);
+			fprintf(stderr, "http: %s%.*s -> %d with no body\n", u->host, path_shown(u->path), u->path, status);
 			return false;
 		}
 	}
@@ -792,8 +934,14 @@ bool http_request(const char *url, const http_req_t *req, char **out, size_t *ou
 	if (status_out) {
 		*status_out = 0;
 	}
+	if (timeout_cap > 0 && timeout_secs > timeout_cap) {
+		timeout_secs = timeout_cap;
+	}
+	if (body_cap && limit > body_cap)
+		limit = body_cap;
 
 	clear_last_error();
+	http_forget_outcome();
 
 	char current[2600];
 	snprintf(current, sizeof(current), "%s", url);
@@ -806,6 +954,7 @@ bool http_request(const char *url, const http_req_t *req, char **out, size_t *ou
 		url_t u;
 		if (!url_parse(current, &u)) {
 			set_last_error(tr("http_bad_address"), current);
+			outcome_fail(HTTP_FAIL_ADDRESS);
 			return false;
 		}
 
@@ -867,12 +1016,13 @@ static conn_t stream_conn(http_stream_t *st) {
 	return c;
 }
 
-static bool stream_open_once(http_stream_t *st, const char *url, int timeout_secs, int *status_out,
-							 char *location, size_t location_size) {
+static bool stream_open_once(http_stream_t *st, const char *url, long range_from, int timeout_secs, int *status_out, char *location, size_t location_size) {
 	url_t u;
 	if (!url_parse(url, &u)) {
+		outcome_fail(HTTP_FAIL_ADDRESS);
 		return false;
 	}
+	outcome_begin(u.host, u.path);
 
 	conn_t conn;
 	char err[192] = "";
@@ -890,15 +1040,28 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 	char host_header[300];
 	host_header_value(&u, host_header, sizeof(host_header));
 
-	char request[2600];
+	// A ranged request is a file being resumed, never a radio: no ICY
+	// metadata is asked for, since interleaved metadata would make the byte
+	// positions on both sides of the Range meaningless.
+	char range[64] = "";
+	if (range_from > 0) {
+		snprintf(range, sizeof(range), "Range: bytes=%ld-\r\n", range_from);
+	}
+
+	const char *extra = thread_stream_headers;
+	char request[3200];
 	int n = snprintf(request, sizeof(request),
 					 "GET %s HTTP/1.0\r\n" // 1.0: no chunking, no keep-alive to argue about
 					 "Host: %s\r\n"
-					 "User-Agent: " HTTP_USER_AGENT "\r\n"
-					 "Icy-MetaData: 1\r\n"
-					 "Accept: */*\r\n"
+					 "%s"
+					 "%s"
+					 "%s"
+					 "%s"
 					 "\r\n",
-					 u.path, host_header);
+					 u.path, host_header,
+					 carries_header(extra, "User-Agent") ? "" : "User-Agent: " HTTP_USER_AGENT "\r\n",
+					 range_from > 0 ? range : "Icy-MetaData: 1\r\n",
+					 carries_header(extra, "Accept") ? "" : "Accept: */*\r\n", extra ? extra : "");
 	// As above: snprintf returns what it would have written, not what it did.
 	if (n <= 0 || (size_t)n >= sizeof(request) || !conn_write_all(&conn, request, (size_t)n)) {
 		conn_close(&conn);
@@ -915,7 +1078,39 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 		conn_close(&conn);
 		return false;
 	}
-	if (status != 200) {
+	// 206 only answers a Range, and only counts when it starts where asked:
+	// a server that sends some other slice would have it written at the
+	// wrong place in the file. 200 to a Range is legal (the server does not
+	// do ranges) and means the whole body from byte 0, which the caller
+	// learns from range_start.
+	long range_start = 0;
+	long range_total = 0;
+	if (status == 206 && range_from > 0) {
+		char cr[96] = "";
+		long first = -1;
+		if (header_value(headers, "Content-Range", cr, sizeof(cr))) {
+			const char *p = cr;
+			if (strncasecmp(p, "bytes", 5) == 0) {
+				p += 5;
+			}
+			while (*p == ' ' || *p == '=') {
+				p++;
+			}
+			char *end = NULL;
+			first = strtol(p, &end, 10);
+			const char *slash = end ? strchr(end, '/') : NULL;
+			if (slash && slash[1] != '*') {
+				range_total = strtol(slash + 1, NULL, 10);
+			}
+		}
+		if (first != range_from) {
+			fprintf(stderr, "http: %s%.*s -> 206 for \"%s\", wanted %ld-\n", u.host, path_shown(u.path), u.path, cr,
+					range_from);
+			conn_close(&conn);
+			return false;
+		}
+		range_start = range_from;
+	} else if (status != 200) {
 		conn_close(&conn);
 		return false;
 	}
@@ -933,6 +1128,10 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 	st->content_length = header_value(headers, "Content-Length", length_text, sizeof(length_text))
 							 ? strtol(length_text, NULL, 10)
 							 : 0;
+	st->range_start = range_start;
+	st->total_length = range_total > 0 ? range_total
+					   : st->content_length > 0 ? range_start + st->content_length
+												: 0;
 
 	header_value(headers, "icy-name", st->icy_name, sizeof(st->icy_name));
 	header_value(headers, "icy-genre", st->icy_genre, sizeof(st->icy_genre));
@@ -949,13 +1148,14 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 	return true;
 }
 
-bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) {
+static bool stream_open(http_stream_t *st, const char *url, long range_from, int timeout_secs) {
 	if (!st || !url) {
 		return false;
 	}
 	memset(st, 0, sizeof(*st));
 	st->fd = -1;
 	clear_last_error();
+	http_forget_outcome();
 
 	char current[2600];
 	snprintf(current, sizeof(current), "%s", url);
@@ -963,7 +1163,7 @@ bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) {
 	for (int hop = 0; hop <= HTTP_MAX_REDIRECTS; hop++) {
 		int status = 0;
 		char location[2048] = "";
-		if (stream_open_once(st, current, timeout_secs, &status, location, sizeof(location))) {
+		if (stream_open_once(st, current, range_from, timeout_secs, &status, location, sizeof(location))) {
 			return true;
 		}
 		if (status < 300 || status >= 400 || !location[0]) {
@@ -983,6 +1183,39 @@ bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) {
 		}
 	}
 	return false;
+}
+
+bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) { return stream_open(st, url, 0, timeout_secs); }
+
+bool http_stream_open_range(http_stream_t *st, const char *url, long from, int timeout_secs) { return stream_open(st, url, from > 0 ? from : 0, timeout_secs); }
+
+bool http_stream_skip(http_stream_t *st, long count) {
+	char sink[4096];
+	while (count > 0) {
+		int n = http_stream_read(st, sink, count < (long)sizeof(sink) ? (int)count : (int)sizeof(sink));
+		if (n <= 0) {
+			return false;
+		}
+		count -= n;
+		st->range_start += n;
+	}
+	return true;
+}
+
+bool http_stream_resume(http_stream_t *st, const char *url, long have, int timeout_secs) {
+	if (!http_stream_open_range(st, url, have, timeout_secs)) {
+		return false;
+	}
+	if (st->range_start != have) {
+		// A 200: the server ignored the Range and is sending everything
+		// again. See http_stream_skip() for why the bytes are read past.
+		fprintf(stderr, "http: no ranges from this server, skipping %ld bytes already held\n", have);
+		if (!http_stream_skip(st, have - st->range_start)) {
+			http_stream_close(st);
+			return false;
+		}
+	}
+	return true;
 }
 
 // Reads exactly `len` raw bytes (lead buffer first, then the socket).
@@ -1122,6 +1355,14 @@ int http_stream_read(http_stream_t *st, void *buf, int len) {
 
 	st->meta_countdown -= got;
 	return got;
+}
+
+void http_stream_set_read_timeout(http_stream_t *st, int secs) {
+	if (!st || st->fd < 0 || secs <= 0) {
+		return;
+	}
+	struct timeval tv = {.tv_sec = secs, .tv_usec = 0};
+	setsockopt(st->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 void http_stream_wake(http_stream_t *st) {

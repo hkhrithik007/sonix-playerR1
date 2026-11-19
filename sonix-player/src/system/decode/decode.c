@@ -8,22 +8,23 @@
 
 #include "aacdec.h"
 #include "alacdec.h"
+#include "apedec.h"
 #include "dsd.h"
 #include "mp4.h"
 #include "opusdec.h"
 #include "sndfile.h"
 #include "wavpackdec.h"
-#include "apedec.h"
 
 #include <fcntl.h>
 #include <math.h>
+#include <limits.h>
 #include <pthread.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define DR_MP3_IMPLEMENTATION
 #include "dr_mp3.h"
@@ -36,7 +37,7 @@
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
 
-#include "stb_vorbis_decl.h"
+#include "vorbisdec.h"
 
 // ---------------------------------------------------------------------------
 // Tables kept from one decoder to the next
@@ -66,10 +67,7 @@ static bool file_version_read(const char *path, file_version_t *out) {
 	return true;
 }
 
-static bool file_version_same(const file_version_t *a, const file_version_t *b) {
-	return a->path[0] && strcmp(a->path, b->path) == 0 && a->size == b->size && a->mtime.tv_sec == b->mtime.tv_sec &&
-		   a->mtime.tv_nsec == b->mtime.tv_nsec;
-}
+static bool file_version_same(const file_version_t *a, const file_version_t *b) { return a->path[0] && strcmp(a->path, b->path) == 0 && a->size == b->size && a->mtime.tv_sec == b->mtime.tv_sec && a->mtime.tv_nsec == b->mtime.tv_nsec; }
 
 // ---------------------------------------------------------------------------
 // AAC-in-MP4
@@ -94,7 +92,7 @@ typedef struct {
 	unsigned char *au; // the access unit being handed to the decoder
 	uint32_t au_capacity;
 
-	short *pcm;	   // what came out of the last one
+	short *pcm; // what came out of the last one
 	int pcm_frames;
 	int pcm_read;
 
@@ -157,10 +155,10 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 #define ADTS_HEADER_BYTES 7
-#define ADTS_MARK_STRIDE 32		 // one bookmark every so many frames
-#define ADTS_MAX_MARKS 8192		 // ~7 hours at 1024 samples: past that, thin out
-#define ADTS_SEEK_RUNUP 2		 // frames of run-up after a seek
-#define ADTS_IN_CHUNK 8192		 // how much is fed to the decoder at a time
+#define ADTS_MARK_STRIDE 32			 // one bookmark every so many frames
+#define ADTS_MAX_MARKS 8192			 // ~7 hours at 1024 samples: past that, thin out
+#define ADTS_SEEK_RUNUP 2			 // frames of run-up after a seek
+#define ADTS_IN_CHUNK 8192			 // how much is fed to the decoder at a time
 #define ADTS_PCM_CAPACITY (2048 * 8) // one HE-AAC frame, eight channels
 
 typedef struct {
@@ -169,7 +167,7 @@ typedef struct {
 
 	long first_frame_at; // where the stream starts (past any ID3 tag)
 	uint32_t frame_total;
-	int header_rate;	 // the rate the header declares
+	int header_rate; // the rate the header declares
 	int header_channels;
 
 	long *marks; // offset of frame number i * mark_stride
@@ -189,8 +187,7 @@ typedef struct {
 } adts_state_t;
 
 // The rates the ADTS index can name.
-static const int ADTS_RATES[16] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
-								   16000, 12000, 11025, 8000,  7350,  0,	 0,	    0};
+static const int ADTS_RATES[16] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0, 0, 0};
 
 // Returns the frame's total length (header included) if the header is valid,
 // otherwise 0.
@@ -228,8 +225,7 @@ static long adts_skip_id3(FILE *f) {
 		rewind(f);
 		return 0;
 	}
-	long size = (long)(((uint32_t)(head[6] & 0x7F) << 21) | ((uint32_t)(head[7] & 0x7F) << 14) |
-					   ((uint32_t)(head[8] & 0x7F) << 7) | (uint32_t)(head[9] & 0x7F));
+	long size = (long)(((uint32_t)(head[6] & 0x7F) << 21) | ((uint32_t)(head[7] & 0x7F) << 14) | ((uint32_t)(head[8] & 0x7F) << 7) | (uint32_t)(head[9] & 0x7F));
 	long at = 10 + size;
 	if (size < 0 || fseek(f, at, SEEK_SET) != 0) {
 		rewind(f);
@@ -371,8 +367,7 @@ static bool adts_from_kept(adts_state_t *s, const char *path) {
 	}
 	bool ok = false;
 	pthread_mutex_lock(&adts_kept_lock);
-	if (adts_kept.marks && file_version_same(&adts_kept.file, &version) &&
-		adts_kept.first_frame_at == s->first_frame_at) {
+	if (adts_kept.marks && file_version_same(&adts_kept.file, &version) && adts_kept.first_frame_at == s->first_frame_at) {
 		long *marks = malloc((size_t)adts_kept.mark_count * sizeof(*marks));
 		if (marks) {
 			memcpy(marks, adts_kept.marks, (size_t)adts_kept.mark_count * sizeof(*marks));
@@ -402,9 +397,7 @@ static bool adts_from_kept(adts_state_t *s, const char *path) {
 // enumerations for the seek origin; they mean the same thing.
 // ---------------------------------------------------------------------------
 
-static size_t grow_read_flac(void *user, void *out, size_t bytes) {
-	return growfile_read((growfile_t *)user, out, bytes);
-}
+static size_t grow_read_flac(void *user, void *out, size_t bytes) { return growfile_read((growfile_t *)user, out, bytes); }
 
 static drflac_bool32 grow_seek_flac(void *user, int offset, drflac_seek_origin origin) {
 	// DRFLAC_SEEK_END never arrives on a growing file -- the end is not
@@ -413,8 +406,7 @@ static drflac_bool32 grow_seek_flac(void *user, int offset, drflac_seek_origin o
 	if (origin == DRFLAC_SEEK_END) {
 		return DRFLAC_FALSE;
 	}
-	return growfile_seek((growfile_t *)user, (long)offset, origin == DRFLAC_SEEK_CUR ? 1 : 0) ? DRFLAC_TRUE
-																							 : DRFLAC_FALSE;
+	return growfile_seek((growfile_t *)user, (long)offset, origin == DRFLAC_SEEK_CUR ? 1 : 0) ? DRFLAC_TRUE : DRFLAC_FALSE;
 }
 
 static drflac_bool32 grow_tell_flac(void *user, drflac_int64 *cursor) {
@@ -425,16 +417,13 @@ static drflac_bool32 grow_tell_flac(void *user, drflac_int64 *cursor) {
 	return DRFLAC_TRUE;
 }
 
-static size_t grow_read_mp3(void *user, void *out, size_t bytes) {
-	return growfile_read((growfile_t *)user, out, bytes);
-}
+static size_t grow_read_mp3(void *user, void *out, size_t bytes) { return growfile_read((growfile_t *)user, out, bytes); }
 
 static drmp3_bool32 grow_seek_mp3(void *user, int offset, drmp3_seek_origin origin) {
 	if (origin == DRMP3_SEEK_END) {
 		return DRMP3_FALSE;
 	}
-	return growfile_seek((growfile_t *)user, (long)offset, origin == DRMP3_SEEK_CUR ? 1 : 0) ? DRMP3_TRUE
-																							: DRMP3_FALSE;
+	return growfile_seek((growfile_t *)user, (long)offset, origin == DRMP3_SEEK_CUR ? 1 : 0) ? DRMP3_TRUE : DRMP3_FALSE;
 }
 
 static drmp3_bool32 grow_tell_mp3(void *user, drmp3_int64 *cursor) {
@@ -551,7 +540,7 @@ struct decoder {
 		// value it would set the size of every decoder, of every format.
 		drmp3 *mp3;
 		drflac *flac;
-		stb_vorbis *vorbis;
+		vorbisdec_t *vorbis;
 		aac_state_t *aac;
 		alac_state_t *alac;
 		dsd_file_t *dsd;
@@ -571,9 +560,9 @@ struct decoder {
 	// branch, so everything above -- duration, progress, seeking, the
 	// cut-short guard -- sees an ordinary track that starts at zero.
 	// cue_frames is 0 when the file is played whole.
-	uint64_t cue_begin;  // first frame of the track inside the file
+	uint64_t cue_begin;	 // first frame of the track inside the file
 	uint64_t cue_frames; // how many frames the track lasts
-	uint64_t cue_read;   // frames handed out since the window opened
+	uint64_t cue_read;	 // frames handed out since the window opened
 };
 
 // ".alac" is a label, not a container.
@@ -612,8 +601,7 @@ static off_t past_id3(FILE *f) {
 		if (fseeko(f, at, SEEK_SET) != 0 || fread(h, 1, sizeof(h), f) != sizeof(h) || memcmp(h, "ID3", 3) != 0) {
 			break;
 		}
-		uint32_t size = ((uint32_t)(h[6] & 0x7F) << 21) | ((uint32_t)(h[7] & 0x7F) << 14) |
-						((uint32_t)(h[8] & 0x7F) << 7) | (uint32_t)(h[9] & 0x7F);
+		uint32_t size = ((uint32_t)(h[6] & 0x7F) << 21) | ((uint32_t)(h[7] & 0x7F) << 14) | ((uint32_t)(h[8] & 0x7F) << 7) | (uint32_t)(h[9] & 0x7F);
 		at += 10 + (off_t)size + ((h[3] >= 4 && (h[5] & 0x10)) ? 10 : 0);
 	}
 	return at;
@@ -738,8 +726,7 @@ decode_format_t decode_detect_format(const char *filepath) {
 	decode_format_t named = format_by_name(filepath);
 	// Only the formats a decoder here reads are second-guessed, and only for a
 	// real path: albumart.c passes bare names, with nothing to open.
-	if (named == DECODE_FORMAT_UNKNOWN || named == DECODE_FORMAT_SNDFILE || has_extension(filepath, ".alac") ||
-		!strchr(filepath, '/')) {
+	if (named == DECODE_FORMAT_UNKNOWN || named == DECODE_FORMAT_SNDFILE || has_extension(filepath, ".alac") || !strchr(filepath, '/')) {
 		return named;
 	}
 	bool by_sync = false;
@@ -1037,14 +1024,14 @@ static void mp3_index_free(mp3_index_t *ix) {
 // What a scan of the headers needs to know about the stream, and where it is.
 typedef struct {
 	mp3_window_t *w;
-	long avail;				 // how far the file can be read
-	unsigned char first[4];	 // the first header, which every other one must match
-	uint64_t delay;			 // the encoder's priming samples, as dr_mp3 counts them
-	uint64_t spacing;		 // samples between points
-	volatile int *cancel;	 // NULL, or set from another thread to stop
-	long pos;				 // where the next header is
-	uint64_t pcm;			 // samples from the start of the audio to `pos`
-	uint64_t stop_pcm;		 // 0, or stop once this many samples have gone by
+	long avail;				// how far the file can be read
+	unsigned char first[4]; // the first header, which every other one must match
+	uint64_t delay;			// the encoder's priming samples, as dr_mp3 counts them
+	uint64_t spacing;		// samples between points
+	volatile int *cancel;	// NULL, or set from another thread to stop
+	long pos;				// where the next header is
+	uint64_t pcm;			// samples from the start of the audio to `pos`
+	uint64_t stop_pcm;		// 0, or stop once this many samples have gone by
 } mp3_scan_t;
 
 // Walks the headers from sc->pos, noting a point every sc->spacing samples from
@@ -1193,9 +1180,7 @@ static uint64_t mp3_spacing(int sample_rate, uint64_t total_pcm_frames) {
 // The table comes back in *points_out (owned by the caller) with its size in
 // *count_out and how far it read in *scanned_out. False when no point past the
 // start could be noted.
-static bool mp3_index_scan(const char *path, long start, long avail, uint64_t delay, uint64_t spacing,
-						   uint64_t stop_pcm, volatile int *cancel, bool drop_cache,
-						   drmp3_seek_point **points_out, drmp3_uint32 *count_out, long *scanned_out) {
+static bool mp3_index_scan(const char *path, long start, long avail, uint64_t delay, uint64_t spacing, uint64_t stop_pcm, volatile int *cancel, bool drop_cache, drmp3_seek_point **points_out, drmp3_uint32 *count_out, long *scanned_out) {
 	mp3_window_t *w = calloc(1, sizeof(*w));
 	if (!w) {
 		return false;
@@ -1217,8 +1202,7 @@ static bool mp3_index_scan(const char *path, long start, long avail, uint64_t de
 	}
 	pts[0] = mp3_start_point(start);
 
-	mp3_scan_t sc = {
-		.w = w, .avail = avail, .delay = delay, .spacing = spacing, .cancel = cancel, .pos = start, .stop_pcm = stop_pcm};
+	mp3_scan_t sc = {.w = w, .avail = avail, .delay = delay, .spacing = spacing, .cancel = cancel, .pos = start, .stop_pcm = stop_pcm};
 	drmp3_uint32 count = 1 + mp3_scan(&sc, spacing, pts + 1, MP3_INDEX_MAX_POINTS - 1);
 
 	if (drop_cache && sc.pos > w->dropped) {
@@ -1267,8 +1251,7 @@ static struct {
 
 // `before` is the file as it was when the scan began: a file that changed
 // while it was read keeps nothing.
-static void mp3_index_keep(const file_version_t *before, long start, const drmp3_seek_point *points,
-						   drmp3_uint32 count, long scanned) {
+static void mp3_index_keep(const file_version_t *before, long start, const drmp3_seek_point *points, drmp3_uint32 count, long scanned) {
 	file_version_t version;
 	if (count == 0 || !file_version_read(before->path, &version) || !file_version_same(before, &version)) {
 		return;
@@ -1299,8 +1282,7 @@ static bool mp3_index_from_kept(decoder_t *dec) {
 	drmp3_uint32 count = 0;
 	long scanned = 0;
 	pthread_mutex_lock(&mp3_kept_lock);
-	if (mp3_kept.points && file_version_same(&mp3_kept.file, &version) &&
-		mp3_kept.start == (long)dec->impl.mp3->streamStartOffset) {
+	if (mp3_kept.points && file_version_same(&mp3_kept.file, &version) && mp3_kept.start == (long)dec->impl.mp3->streamStartOffset) {
 		copy = malloc(sizeof(*copy) * mp3_kept.count);
 		if (copy) {
 			memcpy(copy, mp3_kept.points, sizeof(*copy) * mp3_kept.count);
@@ -1337,9 +1319,7 @@ static bool mp3_index_build(decoder_t *dec) {
 	drmp3_seek_point *pts = NULL;
 	drmp3_uint32 count = 0;
 	long scanned = 0;
-	if (!mp3_index_scan(dec->file, start, avail, dec->impl.mp3->delayInPCMFrames,
-						mp3_spacing(dec->sample_rate, dec->total_pcm_frames), 0, NULL, false, &pts, &count,
-						&scanned)) {
+	if (!mp3_index_scan(dec->file, start, avail, dec->impl.mp3->delayInPCMFrames, mp3_spacing(dec->sample_rate, dec->total_pcm_frames), 0, NULL, false, &pts, &count, &scanned)) {
 		ix->failed = true;
 		return false;
 	}
@@ -1390,8 +1370,7 @@ static void *mp3_index_thread(void *arg) {
 	drmp3_seek_point *pts = NULL;
 	drmp3_uint32 count = 0;
 	long scanned = 0;
-	bool ok = mp3_index_scan(job->path, job->start, job->avail, job->delay, job->spacing, 0, &ix->cancel, true,
-							 &pts, &count, &scanned);
+	bool ok = mp3_index_scan(job->path, job->start, job->avail, job->delay, job->spacing, 0, &ix->cancel, true, &pts, &count, &scanned);
 	if (ok && job->keep && !ix->cancel) {
 		mp3_index_keep(&job->before, job->start, pts, count, scanned);
 	}
@@ -1549,8 +1528,7 @@ static bool mp3_xing_toc(mp3_window_t *w, long avail, mp3_toc_t *out) {
 	long pos = 0;
 	const unsigned char *h = mp3_window_at(w, 0, 10, avail);
 	if (h && h[0] == 'I' && h[1] == 'D' && h[2] == '3') {
-		long size = ((long)(h[6] & 0x7f) << 21) | ((long)(h[7] & 0x7f) << 14) | ((long)(h[8] & 0x7f) << 7) |
-					(long)(h[9] & 0x7f);
+		long size = ((long)(h[6] & 0x7f) << 21) | ((long)(h[7] & 0x7f) << 14) | ((long)(h[8] & 0x7f) << 7) | (long)(h[9] & 0x7f);
 		pos = 10 + size + ((h[5] & 0x10) ? 10 : 0);
 	}
 	h = mp3_window_at(w, pos, 4, avail);
@@ -1727,8 +1705,7 @@ static void mp3_cue_prepare(decoder_t *dec) {
 	drmp3_seek_point *pts = NULL;
 	drmp3_uint32 count = 0;
 	long scanned = 0;
-	if (mp3_index_scan(dec->file, start, avail, delay, mp3_spacing(dec->sample_rate, dec->total_pcm_frames),
-					   dec->cue_begin + delay, NULL, true, &pts, &count, &scanned)) {
+	if (mp3_index_scan(dec->file, start, avail, delay, mp3_spacing(dec->sample_rate, dec->total_pcm_frames), dec->cue_begin + delay, NULL, true, &pts, &count, &scanned)) {
 		mp3_index_install(dec, pts, count, scanned);
 		return;
 	}
@@ -1752,8 +1729,7 @@ static int mp3_first_frame_kbps(decoder_t *dec) {
 	}
 	unsigned char h[4] = {0};
 	int kbps = 0;
-	if (fseek(f, (long)dec->impl.mp3->streamStartOffset, SEEK_SET) == 0 && fread(h, 1, 4, f) == 4 &&
-		drmp3_hdr_valid(h)) {
+	if (fseek(f, (long)dec->impl.mp3->streamStartOffset, SEEK_SET) == 0 && fread(h, 1, 4, f) == 4 && drmp3_hdr_valid(h)) {
 		kbps = (int)drmp3_hdr_bitrate_kbps(h);
 	}
 	fclose(f);
@@ -1907,8 +1883,7 @@ static uint64_t mp3_cbr_estimate(decoder_t *dec) {
 	}
 	// An APEv2 footer: "APETAGEX", version, then the size of the items and the
 	// footer, little-endian, and a header of 32 more bytes when flag bit 31 is set.
-	if (end > 32 && fseek(f, end - 32, SEEK_SET) == 0 && fread(tail, 1, 32, f) == 32 &&
-		memcmp(tail, "APETAGEX", 8) == 0) {
+	if (end > 32 && fseek(f, end - 32, SEEK_SET) == 0 && fread(tail, 1, 32, f) == 32 && memcmp(tail, "APETAGEX", 8) == 0) {
 		uint32_t size = (uint32_t)tail[12] | (uint32_t)tail[13] << 8 | (uint32_t)tail[14] << 16 | (uint32_t)tail[15] << 24;
 		uint32_t flags = (uint32_t)tail[20] | (uint32_t)tail[21] << 8 | (uint32_t)tail[22] << 16 | (uint32_t)tail[23] << 24;
 		long whole = (long)size + ((flags & 0x80000000u) ? 32 : 0);
@@ -1996,13 +1971,41 @@ static decoder_t *decoder_open_cue(const char *sheet_path, int track, decode_for
 	return dec;
 }
 
+// Tells the kernel that a track about to be played will be read front to back.
+//
+// The card's read-ahead window is 128 KB by default; for a file marked
+// sequential the kernel doubles it, so the decoder's reads are served from
+// memory for twice as long and the card is woken half as often over a track
+// -- the same bytes read, in fewer, larger requests, with the card idle in
+// between. Per open file and not for the whole card (read_ahead_kb in sysfs):
+// the library scan, the tag reader and the covers read a few kilobytes here
+// and there, and a larger window everywhere would read far more than they
+// ask for. FLAC and MP3 only, the two read through a FILE* of their own that
+// can be reached; a file still being downloaded is left alone. Advice only:
+// nothing depends on it being taken.
+static void decoder_advise_sequential(decoder_t *dec) {
+	if (!dec || dec->growing) {
+		return;
+	}
+	FILE *f = NULL;
+	// Only a native FLAC stream reads the FILE* directly: for Ogg-FLAC
+	// dr_flac's user data is its own Ogg reader, which merely holds the file.
+	if (dec->format == DECODE_FORMAT_FLAC && dec->impl.flac && dec->impl.flac->container == drflac_container_native) {
+		f = (FILE *)dec->impl.flac->bs.pUserData;
+	} else if (dec->format == DECODE_FORMAT_MP3 && dec->impl.mp3) {
+		f = (FILE *)dec->impl.mp3->pUserData;
+	}
+	if (f) {
+		posix_fadvise(fileno(f), 0, 0, POSIX_FADV_SEQUENTIAL);
+	}
+}
+
 decoder_t *decoder_open(const char *filepath, decode_format_t format) {
 	char sheet[512];
 	int track = cue_split_path(filepath, sheet, sizeof(sheet));
-	if (track > 0) {
-		return decoder_open_cue(sheet, track, format, true);
-	}
-	return decoder_open_file(filepath, format);
+	decoder_t *dec = track > 0 ? decoder_open_cue(sheet, track, format, true) : decoder_open_file(filepath, format);
+	decoder_advise_sequential(dec);
+	return dec;
 }
 
 decoder_t *decoder_open_info(const char *filepath, decode_format_t format) {
@@ -2012,6 +2015,20 @@ decoder_t *decoder_open_info(const char *filepath, decode_format_t format) {
 		return decoder_open_cue(sheet, track, format, false);
 	}
 	return decoder_open_file(filepath, format);
+}
+
+// A complete local file may declare no encoded bitrate (FLAC, VBR MP3).
+// Calculate its average once at open, never from a still-growing cache or on
+// the UI poll path. CUE opens reach this before narrowing the track duration.
+static int complete_file_bitrate(const char *filepath, int rate, uint64_t frames, bool growing) {
+	if (growing || rate <= 0 || frames == UINT64_MAX || frames <= (unsigned)rate / 2 ||
+		growfile_is_growing(filepath))
+		return 0;
+	struct stat info;
+	if (stat(filepath, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0)
+		return 0;
+	double kbps = (double)info.st_size * 8.0 * rate / (double)frames / 1000.0;
+	return isfinite(kbps) && kbps > 0 && kbps < INT_MAX - 0.5 ? (int)(kbps + 0.5) : 0;
 }
 
 static decoder_t *decoder_open_file(const char *filepath, decode_format_t format) {
@@ -2051,8 +2068,7 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		// instead of counting -- see mp3_growing_estimate().
 		if (dec->growing && dec->impl.mp3->totalPCMFrameCount == DRMP3_UINT64_MAX) {
 			dec->total_pcm_frames = mp3_growing_estimate(dec);
-		} else if (dec->impl.mp3->totalPCMFrameCount == DRMP3_UINT64_MAX &&
-				   (dec->total_pcm_frames = mp3_cbr_estimate(dec)) > 0) {
+		} else if (dec->impl.mp3->totalPCMFrameCount == DRMP3_UINT64_MAX && (dec->total_pcm_frames = mp3_cbr_estimate(dec)) > 0) {
 			// A constant stream with no header: its size says its length.
 		} else {
 			dec->total_pcm_frames = drmp3_get_pcm_frame_count(dec->impl.mp3);
@@ -2063,8 +2079,7 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 	case DECODE_FORMAT_FLAC:
 		if (growfile_is_growing(filepath)) {
 			dec->growing = growfile_open(filepath);
-			dec->impl.flac =
-				dec->growing ? drflac_open(grow_read_flac, grow_seek_flac, grow_tell_flac, dec->growing, NULL) : NULL;
+			dec->impl.flac = dec->growing ? drflac_open(grow_read_flac, grow_seek_flac, grow_tell_flac, dec->growing, NULL) : NULL;
 		} else {
 			dec->impl.flac = drflac_open_file(filepath, NULL);
 		}
@@ -2079,26 +2094,36 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		break;
 
 	case DECODE_FORMAT_OGG_VORBIS: {
-		int error = 0;
 		// From the first page: an ID3v2 tag in front, which a tagger that knows
 		// only MP3 may have put there, is not part of the stream.
-		FILE *vf = fopen(filepath, "rb");
+		bool growing = growfile_is_growing(filepath);
+		if (growing) {
+			dec->growing = growfile_open(filepath);
+			if (!dec->growing) {
+				free(dec);
+				return NULL;
+			}
+		}
+		growstdio_t *io = growing ? growstdio_open(dec->growing) : NULL;
+		FILE *vf = growing ? growstdio_file(io) : fopen(filepath, "rb");
 		if (vf) {
 			off_t first_page = past_id3(vf);
 			if (fseeko(vf, first_page, SEEK_SET) == 0) {
-				dec->impl.vorbis = stb_vorbis_open_file(vf, 1, &error, NULL);
+				dec->impl.vorbis = vorbisdec_open(vf, io, dec->growing);
+			} else if (io) {
+				growstdio_close(io);
 			} else {
 				fclose(vf);
 			}
 		}
 		if (!dec->impl.vorbis) {
+			growfile_close(dec->growing);
 			free(dec);
 			return NULL;
 		}
-		stb_vorbis_info info = stb_vorbis_get_info(dec->impl.vorbis);
-		dec->channels = info.channels;
-		dec->sample_rate = (int)info.sample_rate;
-		dec->total_pcm_frames = stb_vorbis_stream_length_in_samples(dec->impl.vorbis);
+		dec->channels = vorbisdec_channels(dec->impl.vorbis);
+		dec->sample_rate = vorbisdec_rate(dec->impl.vorbis);
+		dec->total_pcm_frames = vorbisdec_length(dec->impl.vorbis);
 		break;
 	}
 
@@ -2157,9 +2182,7 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		// read.
 		if (fseek(s->f, 0, SEEK_END) == 0) {
 			long end = ftell(s->f);
-			double seconds = dec->sample_rate > 0
-								 ? (double)dec->total_pcm_frames / (double)dec->sample_rate
-								 : 0;
+			double seconds = dec->sample_rate > 0 ? (double)dec->total_pcm_frames / (double)dec->sample_rate : 0;
 			if (seconds > 0.5 && end > s->first_frame_at) {
 				dec->bitrate_kbps = (int)(((double)(end - s->first_frame_at) * 8.0) / seconds / 1000.0);
 			}
@@ -2339,8 +2362,7 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		// rules that differ between encoders.
 		uint64_t priming = 0, length = 0;
 		uint32_t timescale = 0;
-		if (mp4_audio_gapless(s->mp4, &priming, &length, &timescale) && timescale == (uint32_t)dec->sample_rate &&
-			priming < (uint64_t)dec->sample_rate && length > 0 && priming + length <= dec->total_pcm_frames + 4096) {
+		if (mp4_audio_gapless(s->mp4, &priming, &length, &timescale) && timescale == (uint32_t)dec->sample_rate && priming < (uint64_t)dec->sample_rate && length > 0 && priming + length <= dec->total_pcm_frames + 4096) {
 			s->priming = priming;
 			s->limit = length;
 			uint64_t queued = (uint64_t)(s->pcm_frames - s->pcm_read);
@@ -2361,6 +2383,8 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		decoder_close(dec);
 		return NULL;
 	}
+	if (dec->bitrate_kbps <= 0)
+		dec->bitrate_kbps = complete_file_bitrate(filepath, dec->sample_rate, dec->total_pcm_frames, dec->growing != NULL);
 
 	return dec;
 }
@@ -2444,9 +2468,7 @@ const char *decoder_codec_name(const decoder_t *dec) {
 	}
 }
 
-bool decoder_passthrough(const decoder_t *dec) {
-	return dec && dec->format == DECODE_FORMAT_DSD && !dsd_is_pcm(dec->impl.dsd);
-}
+bool decoder_passthrough(const decoder_t *dec) { return dec && dec->format == DECODE_FORMAT_DSD && !dsd_is_pcm(dec->impl.dsd); }
 
 bool decoder_dsd_to_pcm(decoder_t *dec) {
 	if (!dec || dec->format != DECODE_FORMAT_DSD || !dsd_to_pcm(dec->impl.dsd)) {
@@ -2457,9 +2479,7 @@ bool decoder_dsd_to_pcm(decoder_t *dec) {
 	return true;
 }
 
-int decoder_dsd_multiple(const decoder_t *dec) {
-	return (dec && dec->format == DECODE_FORMAT_DSD) ? dsd_multiple(dec->impl.dsd) : 0;
-}
+int decoder_dsd_multiple(const decoder_t *dec) { return (dec && dec->format == DECODE_FORMAT_DSD) ? dsd_multiple(dec->impl.dsd) : 0; }
 
 int decoder_sample_rate(const decoder_t *dec) { return dec->sample_rate; }
 
@@ -2478,9 +2498,7 @@ bool decoder_source_span(const decoder_t *dec, char *file, size_t size, double *
 	return true;
 }
 
-uint64_t decoder_total_pcm_frames(const decoder_t *dec) {
-	return dec->cue_frames ? dec->cue_frames : dec->total_pcm_frames;
-}
+uint64_t decoder_total_pcm_frames(const decoder_t *dec) { return dec->cue_frames ? dec->cue_frames : dec->total_pcm_frames; }
 
 static uint64_t decoder_read_s16_inner(decoder_t *dec, uint64_t frame_count, short *pBuffer);
 static uint64_t decoder_read_s32_inner(decoder_t *dec, uint64_t frame_count, int32_t *pBuffer);
@@ -2518,14 +2536,8 @@ static uint64_t decoder_read_s16_inner(decoder_t *dec, uint64_t frame_count, sho
 	case DECODE_FORMAT_FLAC:
 		return drflac_read_pcm_frames_s16(dec->impl.flac, frame_count, pBuffer);
 
-	case DECODE_FORMAT_OGG_VORBIS: {
-		int frames_read = stb_vorbis_get_samples_short_interleaved(
-			dec->impl.vorbis,
-			dec->channels,
-			pBuffer,
-			(int)(frame_count * (uint64_t)dec->channels));
-		return frames_read > 0 ? (uint64_t)frames_read : 0;
-	}
+	case DECODE_FORMAT_OGG_VORBIS:
+		return vorbisdec_read(dec->impl.vorbis, frame_count, pBuffer);
 
 	case DECODE_FORMAT_SNDFILE:
 		return sndfile_read_s16(dec->impl.snd, frame_count, pBuffer);
@@ -2573,8 +2585,7 @@ static uint64_t decoder_read_s16_inner(decoder_t *dec, uint64_t frame_count, sho
 			uint64_t take = frame_count - written;
 			if (take > available)
 				take = available;
-			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels,
-				   (size_t)take * dec->channels * sizeof(short));
+			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels, (size_t)take * dec->channels * sizeof(short));
 			s->pcm_read += (int)take;
 			written += take;
 		}
@@ -2596,8 +2607,7 @@ static uint64_t decoder_read_s16_inner(decoder_t *dec, uint64_t frame_count, sho
 			uint64_t take = frame_count - written;
 			if (take > available)
 				take = available;
-			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels,
-				   (size_t)take * dec->channels * sizeof(short));
+			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels, (size_t)take * dec->channels * sizeof(short));
 			s->pcm_read += (int)take;
 			written += take;
 		}
@@ -2652,8 +2662,7 @@ static uint64_t decoder_read_s32_inner(decoder_t *dec, uint64_t frame_count, int
 			uint64_t take = frame_count - written;
 			if (take > available)
 				take = available;
-			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels,
-				   (size_t)take * dec->channels * sizeof(int32_t));
+			memcpy(pBuffer + written * (uint64_t)dec->channels, s->pcm + (size_t)s->pcm_read * dec->channels, (size_t)take * dec->channels * sizeof(int32_t));
 			s->pcm_read += (int)take;
 			written += take;
 		}
@@ -2668,7 +2677,7 @@ static uint64_t decoder_read_s32_inner(decoder_t *dec, uint64_t frame_count, int
 		uint64_t frames_read = decoder_read_pcm_frames_s16(dec, frame_count, narrow);
 		uint64_t got = frames_read * (uint64_t)dec->channels;
 		for (uint64_t i = got; i-- > 0;) {
-			int32_t wide = (int32_t)narrow[i] << 16;
+			int32_t wide = (int32_t)narrow[i] * 65536;
 			pBuffer[i] = wide;
 		}
 		return frames_read;
@@ -2763,8 +2772,7 @@ int decoder_seek_to_frame(decoder_t *dec, uint64_t frame_index) {
 		if (ix->count == 0 && !ix->thread_started) {
 			mp3_index_from_kept(dec);
 		}
-		bool stale = ix->count > 0 && dec->growing && frame_index > ix->points[ix->count - 1].pcmFrameIndex &&
-					 mp3_available_bytes(dec) > ix->scanned_bytes;
+		bool stale = ix->count > 0 && dec->growing && frame_index > ix->points[ix->count - 1].pcmFrameIndex && mp3_available_bytes(dec) > ix->scanned_bytes;
 		long start = (long)dec->impl.mp3->streamStartOffset;
 		long avail = ix->count == 0 && !dec->growing ? mp3_available_bytes(dec) : 0;
 		if (ix->count == 0 && avail - start > MP3_ASYNC_BYTES) {
@@ -2794,7 +2802,7 @@ int decoder_seek_to_frame(decoder_t *dec, uint64_t frame_index) {
 		return (int)drflac_seek_to_pcm_frame(dec->impl.flac, frame_index);
 
 	case DECODE_FORMAT_OGG_VORBIS:
-		return stb_vorbis_seek(dec->impl.vorbis, (unsigned int)frame_index);
+		return vorbisdec_seek(dec->impl.vorbis, frame_index);
 
 	case DECODE_FORMAT_DSD:
 		return dsd_seek(dec->impl.dsd, frame_index) ? 1 : 0;
@@ -2930,7 +2938,7 @@ void decoder_close(decoder_t *dec) {
 		drflac_close(dec->impl.flac);
 		break;
 	case DECODE_FORMAT_OGG_VORBIS:
-		stb_vorbis_close(dec->impl.vorbis);
+		vorbisdec_close(dec->impl.vorbis);
 		break;
 	case DECODE_FORMAT_AAC_MP4:
 		aac_state_free(dec->impl.aac);

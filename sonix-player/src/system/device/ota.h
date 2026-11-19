@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 
-// Firmware update over the network: the newest stable release on the
+// Firmware update over the network: the newest eligible release on the
 // project's GitHub page that carries this model's .upt, downloaded to the card
 // under the name firmware.h looks for. Installing it is then the same step as
 // an update from the card.
@@ -11,10 +11,16 @@
 // The repository is "ota-repo" in system-info.json, "owner/name";
 // Jepl4r/sonix-player when the file does not say.
 //
-// A release counts when it is neither a draft nor a pre-release, its tag reads
-// as a version above OS_version in system-info.json ("1.0.2", "v1.0.2"), and
-// one of its assets is named "<update_stem>.upt" in any case. The highest such
-// tag wins.
+// A release needs an uploaded "<update_stem>.upt" asset for this model. Its
+// version comes from a whole "Sonix-Version: 1.3.0-ui3-alpha26" body line (also
+// accepted inside a one-line HTML comment), or a numeric tag when no marker
+// exists. Duplicate or malformed markers fail closed. Titles and dates never
+// decide version order. The UI generation and alpha/beta/rc counters count;
+// the highest version above OS_version wins. Stable installations skip
+// prereleases; an alpha/beta/rc installation can receive them. Drafts never count.
+// When no newer usable release was found, an unversioned compatible release
+// is a check error, not "up to date". Body metadata is read in full within the
+// response budget; OTA_NOTES_MAX limits only the displayed notes preview.
 //
 // Both steps run on a worker thread, one at a time. The interface polls
 // ota_state() and the rest; nothing here calls back into it.
@@ -39,17 +45,15 @@ typedef enum {
 	OTA_CANCELLED,
 } ota_result_t;
 
-// The longest description kept, in bytes. GitHub allows 125,000 characters;
-// a changelog that long would take the card a while to lay out.
-#define OTA_NOTES_MAX (64 * 1024)
+#define OTA_NOTES_MAX 6000
 
 typedef struct {
 	char tag[32];
-	char name[128];		// the release title, the tag when it has none
-	const char *notes;	// the release description, Markdown as written, cut at OTA_NOTES_MAX; never NULL
-	long size;			// bytes
-	char url[512];		// browser_download_url of the asset
-	char sha256[65];	// from the asset's "digest", "" when GitHub gives none
+	char name[128];			  // the release title, the tag when it has none
+	char notes[OTA_NOTES_MAX]; // the release description, Markdown as written, cut at OTA_NOTES_MAX
+	long size;				  // bytes
+	char url[512];			  // browser_download_url of the asset
+	char sha256[65];		  // from the asset's "digest", "" when GitHub gives none
 } ota_release_t;
 
 // Starts looking for a release. False when a check or a download is already

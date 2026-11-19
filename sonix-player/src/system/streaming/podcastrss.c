@@ -47,9 +47,7 @@ static uint64_t fnv1a(const char *a, const char *b) {
 	return h;
 }
 
-static long long make_id(const char *a, const char *b) {
-	return PODCASTRSS_ID_BASE | (long long)(fnv1a(a, b) & (uint64_t)(PODCASTRSS_ID_BASE - 1));
-}
+static long long make_id(const char *a, const char *b) { return PODCASTRSS_ID_BASE | (long long)(fnv1a(a, b) & (uint64_t)(PODCASTRSS_ID_BASE - 1)); }
 
 bool podcastrss_is_id(long long id) { return id >= PODCASTRSS_ID_BASE; }
 
@@ -181,10 +179,7 @@ static void decode_entities(char *s) {
 		const char *name;
 		const char *text;
 	} NAMED[] = {
-		{"amp", "&"},		{"lt", "<"},			{"gt", ">"},			 {"quot", "\""},
-		{"apos", "'"},		{"nbsp", " "},			{"rsquo", "\xE2\x80\x99"}, {"lsquo", "\xE2\x80\x98"},
-		{"rdquo", "\xE2\x80\x9D"}, {"ldquo", "\xE2\x80\x9C"}, {"ndash", "\xE2\x80\x93"}, {"mdash", "\xE2\x80\x94"},
-		{"hellip", "\xE2\x80\xA6"},
+		{"amp", "&"}, {"lt", "<"}, {"gt", ">"}, {"quot", "\""}, {"apos", "'"}, {"nbsp", " "}, {"rsquo", "\xE2\x80\x99"}, {"lsquo", "\xE2\x80\x98"}, {"rdquo", "\xE2\x80\x9D"}, {"ldquo", "\xE2\x80\x9C"}, {"ndash", "\xE2\x80\x93"}, {"mdash", "\xE2\x80\x94"}, {"hellip", "\xE2\x80\xA6"},
 	};
 	char *w = s;
 	for (char *r = s; *r;) {
@@ -350,8 +345,7 @@ static bool first_text(const char *p, const char *end, const char *name, char *o
 // ---------------------------------------------------------------------------
 
 static int month_of(const char *s) {
-	static const char *const MONTHS[12] = {"jan", "feb", "mar", "apr", "may", "jun",
-										   "jul", "aug", "sep", "oct", "nov", "dec"};
+	static const char *const MONTHS[12] = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
 	for (int i = 0; i < 12; i++) {
 		if (strncasecmp(s, MONTHS[i], 3) == 0) {
 			return i;
@@ -522,7 +516,7 @@ static bool parse(const char *url, const char *body, size_t len, parsed_t *out) 
 				int grown = capacity ? capacity * 2 : 64;
 				podcast_episode_t *bigger = realloc(out->episodes, (size_t)grown * sizeof(*bigger));
 				if (!bigger) {
-					break;
+					return false;
 				}
 				out->episodes = bigger;
 				capacity = grown;
@@ -570,8 +564,7 @@ static bool fetch(const char *url, parsed_t *out) {
 	char *body = NULL;
 	size_t len = 0;
 	int status = 0;
-	if (!http_get_ex(url, "User-Agent: " HTTP_USER_AGENT "\r\n", false, &body, &len, RSS_BODY_MAX, RSS_TIMEOUT_SECS,
-					 &status)) {
+	if (!http_get_ex(url, "User-Agent: " HTTP_USER_AGENT "\r\n", false, &body, &len, RSS_BODY_MAX, RSS_TIMEOUT_SECS, &status)) {
 		const char *why = http_last_error();
 		podcast_set_last_error(why && why[0] ? why : tr("podcast_rss_unreachable"));
 		free(body);
@@ -628,13 +621,10 @@ static bool cache_hold(long long feed_id) {
 	if (!fetch(url, &fresh)) {
 		return false;
 	}
-	cache_store(&fresh);
 	pthread_mutex_lock(&lock);
-	if (cache.feed.id != feed_id) {
-		pthread_mutex_unlock(&lock); // replaced meanwhile by another reader
-		podcast_set_last_error(tr("podcast_gone"));
-		return false;
-	}
+	free(cache.episodes);
+	cache = fresh;
+	clock_gettime(CLOCK_MONOTONIC, &cache_at);
 	return true;
 }
 

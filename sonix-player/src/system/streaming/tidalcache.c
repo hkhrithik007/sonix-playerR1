@@ -654,6 +654,8 @@ typedef struct {
 	// FILE
 	http_stream_t http;
 	bool http_open;
+	int resumes; // dropped connections picked up (streamturn_resume)
+	long resumed_at;
 
 	// DASH
 	mp4flac_t unwrap;
@@ -774,6 +776,32 @@ static void download_end(download_t *d, bool ok) {
 
 // --- the FILE shape --------------------------------------------------------
 
+// The connection dropped mid-download: pick it up where it stopped, in the
+// same file. See streamturn_resume() for the care taken with the stream an
+// abandon may be waking at the same moment. (DASH needs none of this: each
+// segment is its own small request, retried as a whole in pump_dash.)
+static bool resume_file(download_t *d) {
+	char who[64];
+	snprintf(who, sizeof(who), "tidalcache: %ld", d->track_id);
+	streamturn_resume_t r = {
+		.stream = &d->http,
+		.active_lock = &active_lock,
+		.active_stream = &active_stream,
+		.generation = current_generation,
+		.started_generation = d->generation,
+		.url = d->stream.url,
+		.have = d->done,
+		.total = d->total,
+		.timeout_secs = FETCH_TIMEOUT_SECS,
+		.who = who,
+	};
+	if (!streamturn_resume(&r, &d->resumes)) {
+		return false;
+	}
+	d->resumed_at = d->done;
+	return true;
+}
+
 static bool pump_file(download_t *d, long until, bool *finished) {
 	char buf[FETCH_CHUNK];
 	*finished = false;
@@ -784,7 +812,12 @@ static bool pump_file(download_t *d, long until, bool *finished) {
 		}
 
 		int n = http_stream_read(&d->http, buf, (int)sizeof(buf));
-		if (n < 0) {
+		// An error, or an end before the promised length: the connection
+		// dropped. Reconnect for the rest rather than lose what is here.
+		if (n < 0 || (n == 0 && d->total > 0 && d->done < d->total)) {
+			if (resume_file(d)) {
+				continue;
+			}
 			return false;
 		}
 		if (n == 0) {
@@ -799,9 +832,15 @@ static bool pump_file(download_t *d, long until, bool *finished) {
 		// Push out what was written before announcing it: without the fflush a
 		// reader would go looking on the card for bytes still sitting in the
 		// stdio buffer.
-		fflush(d->f);
+		if (fflush(d->f) != 0) {
+			fprintf(stderr, "tidalcache: flush failed (card full?)\n");
+			return false;
+		}
 		d->done += n;
 		growfile_progress(d->path, d->done);
+		if (d->resumes && d->done - d->resumed_at >= STREAM_RESUME_GOOD_BYTES) {
+			d->resumes = 0;
+		}
 	}
 	return true;
 }
@@ -833,9 +872,27 @@ static bool pump_dash(download_t *d, int count, bool *finished) {
 			return false;
 		}
 
+		// A segment is a small request of its own, so a dropped connection
+		// is recovered by asking for the same segment again -- nothing of it
+		// has been written yet. Same budget and pauses as a FILE resume.
 		char *body = NULL;
 		size_t len = 0;
-		if (!http_get(url, &body, &len, SEGMENT_LIMIT, FETCH_TIMEOUT_SECS) || !body) {
+		bool got = false;
+		for (int attempt = 0; !got && attempt <= STREAM_RESUME_ATTEMPTS; attempt++) {
+			if (attempt > 0) {
+				fprintf(stderr, "tidalcache: segment %d again (attempt %d)\n", d->next_segment, attempt);
+				for (int i = 0; i < (10 << (attempt - 1)); i++) {
+					if (current_generation() != d->generation) {
+						return false;
+					}
+					usleep(100 * 1000);
+				}
+			}
+			free(body);
+			body = NULL;
+			got = http_get(url, &body, &len, SEGMENT_LIMIT, FETCH_TIMEOUT_SECS) && body;
+		}
+		if (!got) {
 			fprintf(stderr, "tidalcache: segment %d did not arrive\n", d->next_segment);
 			free(body);
 			return false;
@@ -855,7 +912,10 @@ static bool pump_dash(download_t *d, int count, bool *finished) {
 			return false;
 		}
 
-		fflush(d->f);
+		if (fflush(d->f) != 0) {
+			fprintf(stderr, "tidalcache: flush failed (card full?)\n");
+			return false;
+		}
 		d->done = d->unwrap.written;
 		growfile_progress(d->path, d->done);
 
@@ -866,9 +926,11 @@ static bool pump_dash(download_t *d, int count, bool *finished) {
 }
 
 static void *download_thread(void *arg) {
-	// In the background like every other worker: there is only one core, and a
-	// thread writing to the card at full priority takes it from the interface.
-	thread_be_background("tidal download");
+	// Below the interface and the audio threads, but not idle class: playback
+	// reads this file as it grows, and an idle-class thread gets almost
+	// nothing while music plays (see qobuzcache.c, and yandexcache.c since
+	// 1.2.4).
+	thread_be_low_priority("tidal download");
 
 	download_t *d = arg;
 	bool finished = false;
@@ -995,6 +1057,9 @@ static bool start_file(download_t *d, bool *consumed, int duration_secs, char *o
 		return false;
 	}
 	d->http_open = true;
+	// Reads from here on time out sooner than the open: see
+	// STREAM_READ_TIMEOUT_SECS.
+	http_stream_set_read_timeout(&d->http, STREAM_READ_TIMEOUT_SECS);
 	d->total = d->http.content_length;
 	prune(d->total > 0 ? d->total : 0);
 

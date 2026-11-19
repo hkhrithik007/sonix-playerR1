@@ -3,38 +3,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "lvgl/lvgl.h"
 
+#include "src/gui/bluetooth/btsettings.h"
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/gui.h"
-#include "src/gui/shell/icons.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/library/playlistpage.h"
-#include "src/gui/settings/musicsettings.h"
-#include "src/gui/shell/toast.h"
 #include "src/gui/nowplaying/player.h"
-#include "src/gui/nowplaying/trackmenu.h"
+#include "src/gui/settings/musicsettings.h"
+#include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/toast.h"
 #include "src/gui/wireless/wifisettings.h"
-#include "src/gui/bluetooth/btsettings.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/audio/audio.h"
 #include "src/system/bluetooth/bluetooth.h"
-#include "src/system/device/power.h"
-#include "src/system/playback/device_state.h"
 #include "src/system/core/lang.h"
+#include "src/system/device/power.h"
 #include "src/system/library/library.h"
 #include "src/system/library/playlists.h"
+#include "src/system/net/wifi.h"
+#include "src/system/playback/device_state.h"
 #include "src/system/playback/playlist.h"
 #include "src/system/remote/sonixlink.h"
-#include "src/system/net/wifi.h"
+#include "src/system/streaming/provider.h"
 
 lv_obj_t *sonixlink_screen;
+
+static void remote_favourite_done(bool ok, const char *error, void *user) {
+	const stream_provider_t *provider = user;
+	if (!ok)
+		gui_notify_popup(error && error[0] ? error : tr(provider->fav_failed_key));
+}
 
 // The pump is not the page's timer: commands arrive while the page is closed,
 // and that is when a remote control has to work at all.
@@ -259,7 +264,6 @@ static void publish_state(void) {
 	s.queue_position = playlist_current_index();
 	s.queue_count = playlist_count();
 	s.queue_revision = playlist_revision();
-	s.history_revision = library_history_revision();
 
 	medialist_sort_prefs(&s.sort_desc, &s.sort_added, &s.artist_by_album, &s.favourites_reversed);
 	player_queue_position(&s.display_position, &s.display_count);
@@ -358,8 +362,7 @@ static void play_all(const sonixlink_command_t *cmd) {
 	bool shuffled = cmd->arg == SONIXLINK_PLAY_SHUFFLE;
 	// Mode first, as on the player: with shuffle on, the queue deals its random
 	// order as it is loaded.
-	playback_mode_t shuffle_mode =
-		musicsettings_endless_shuffle() ? PLAYBACK_MODE_SHUFFLE_REPEAT : PLAYBACK_MODE_SHUFFLE;
+	playback_mode_t shuffle_mode = musicsettings_endless_shuffle() ? PLAYBACK_MODE_SHUFFLE_REPEAT : PLAYBACK_MODE_SHUFFLE;
 	playlist_set_mode(shuffled ? shuffle_mode : PLAYBACK_MODE_NORMAL);
 	playlist_set_album("");
 	int start = shuffled && count > 1 ? (int)lv_rand(0, (uint32_t)(count - 1)) : 0;
@@ -411,15 +414,20 @@ static void apply_selection(const sonixlink_command_t *cmd) {
 		break;
 	}
 	case SONIXLINK_CMD_PLAYLIST_ADD:
-		playlistpage_add_tracks_to(cmd->value, paths, cmd->path_count);
+		if (!playlistpage_add_tracks_to(cmd->value, paths, cmd->path_count))
+			toast_error("playlist_cannot_add_the_tracks");
 		break;
 	case SONIXLINK_CMD_PLAYLIST_REMOVE: {
 		int removed = 0;
 		for (int i = 0; i < cmd->path_count; i++) {
 			removed += playlists_remove_track(cmd->value, paths[i]) ? 1 : 0;
 		}
-		if (removed > 0) {
+		if (removed == cmd->path_count) {
 			toast_success(removed == 1 ? "medialist_track_removed" : "medialist_tracks_removed");
+		} else if (removed > 0) {
+			toast_error("medialist_some_tracks_not_removed");
+		} else {
+			toast_error("medialist_remove_failed");
 		}
 		break;
 	}
@@ -428,8 +436,6 @@ static void apply_selection(const sonixlink_command_t *cmd) {
 	}
 	free(paths);
 }
-
-static void apply_queue_edit(const sonixlink_command_t *cmd);
 
 static void apply_command(const sonixlink_command_t *cmd) {
 	switch (cmd->kind) {
@@ -580,7 +586,7 @@ static void apply_command(const sonixlink_command_t *cmd) {
 		if (!cmd->path[0]) {
 			break;
 		}
-		bool starred = library_fav_contains(cmd->path);
+		bool starred = track_favourite_get(cmd->path);
 		bool want = cmd->arg < 0 ? !starred : (cmd->arg != 0);
 		if (want != starred) {
 			// The name and artist are stored at star time so the favourites
@@ -594,7 +600,13 @@ static void apply_command(const sonixlink_command_t *cmd) {
 				name = d.metadata.title;
 				artist = d.metadata.artist;
 			}
-			library_fav_toggle(cmd->path, name, artist);
+			const stream_provider_t *owner = stream_provider_for_path(cmd->path);
+			if (!track_favourite_set(cmd->path, name, artist, want, owner ? remote_favourite_done : NULL, (void *)owner)) {
+				const stream_provider_t *p = stream_provider_for_path(cmd->path);
+				if (p && p->fav_failed_key)
+					gui_notify_popup(tr(p->fav_failed_key));
+				break;
+			}
 			forget_favourite_memory();
 			player_refresh_now_playing();
 		}
@@ -615,130 +627,11 @@ static void apply_command(const sonixlink_command_t *cmd) {
 	case SONIXLINK_CMD_PLAYLIST_REMOVE:
 		apply_selection(cmd);
 		break;
-	case SONIXLINK_CMD_QUEUE_REMOVE:
-	case SONIXLINK_CMD_QUEUE_MOVE:
-	case SONIXLINK_CMD_HISTORY_PLAY:
-	case SONIXLINK_CMD_HISTORY_INSERT:
-		apply_queue_edit(cmd);
-		break;
 	case SONIXLINK_CMD_NONE:
 	default:
 		break;
 	}
 	sonixlink_command_free((sonixlink_command_t *)cmd);
-}
-
-// The phone's queue page, doing what the player's does (trackmenu.c): only
-// what comes after the track playing can be taken out, moved or put in, and a
-// command worked out against a queue that has changed since is dropped rather
-// than applied to the wrong entries.
-static bool queue_still_as_seen(const sonixlink_command_t *cmd) {
-	if (cmd->has_revision && cmd->revision != playlist_revision()) {
-		printf("sonixlink: queue command for an older queue (%u, now %u); dropped\n", cmd->revision, playlist_revision());
-		return false;
-	}
-	return true;
-}
-
-// The file of an entry of the history, if it is still there. Says so when it
-// is not, as the player's page does.
-static bool history_file(long long id, char *path, size_t size) {
-	struct stat st;
-	if (!library_history_entry(id, path, size, NULL, 0) || stat(path, &st) != 0) {
-		toast_error("history_track_gone");
-		return false;
-	}
-	return true;
-}
-
-static int compare_ints(const void *a, const void *b) {
-	int x = *(const int *)a, y = *(const int *)b;
-	return (x > y) - (x < y);
-}
-
-static void apply_queue_edit(const sonixlink_command_t *cmd) {
-	int count = playlist_count();
-	int current = playlist_current_index();
-	char path[SONIXLINK_PATH_MAX];
-	unsigned revision = playlist_revision();
-
-	switch (cmd->kind) {
-	case SONIXLINK_CMD_QUEUE_REMOVE: {
-		if (!queue_still_as_seen(cmd) || !cmd->paths || cmd->path_count <= 0) {
-			return;
-		}
-		int *indices = malloc((size_t)cmd->path_count * sizeof(*indices));
-		if (!indices) {
-			return;
-		}
-		int n = 0;
-		const char *at = cmd->paths;
-		for (int i = 0; i < cmd->path_count; i++) {
-			int index = atoi(at);
-			if (index > current && index < count) {
-				indices[n++] = index;
-			}
-			at += strlen(at) + 1;
-		}
-		// In order and each once, as the player's selection hands them over.
-		qsort(indices, (size_t)n, sizeof(*indices), compare_ints);
-		int unique = 0;
-		for (int i = 0; i < n; i++) {
-			if (unique == 0 || indices[unique - 1] != indices[i]) {
-				indices[unique++] = indices[i];
-			}
-		}
-		bool removed = unique > 0 && playlist_remove(indices, unique);
-		free(indices);
-		if (!removed) {
-			return;
-		}
-		device_state_queue_changed();
-		toast_success("queue_tracks_removed");
-		break;
-	}
-	case SONIXLINK_CMD_QUEUE_MOVE: {
-		int from = cmd->arg, to = cmd->arg2;
-		if (!queue_still_as_seen(cmd) || from == to || from <= current || to <= current || from >= count || to >= count) {
-			return;
-		}
-		playlist_move(from, to);
-		if (playlist_revision() != revision) {
-			device_state_queue_changed();
-		}
-		break;
-	}
-	case SONIXLINK_CMD_HISTORY_PLAY: {
-		// Right after the track playing, so what was coming still comes
-		// after it.
-		if (!history_file(cmd->id, path, sizeof(path))) {
-			return;
-		}
-		int index = count > 0 ? current + 1 : 0;
-		if (!playlist_insert_at(path, index)) {
-			return;
-		}
-		if (device_state_play_queue_index(index)) {
-			player_refresh_now_playing();
-		}
-		break;
-	}
-	case SONIXLINK_CMD_HISTORY_INSERT: {
-		int slot = cmd->arg;
-		if (!queue_still_as_seen(cmd) || slot <= current || slot > count) {
-			return;
-		}
-		if (!history_file(cmd->id, path, sizeof(path)) || !playlist_insert_at(path, slot)) {
-			return;
-		}
-		device_state_queue_changed();
-		break;
-	}
-	default:
-		return;
-	}
-	// The player's own queue page, if it is up, lays itself out again.
-	trackmenu_notify_now_playing();
 }
 
 // The rate the current state calls for: fast enough that the app sees a

@@ -16,12 +16,16 @@
 // that shows the picture does not work it out again every time it opens.
 typedef struct {
 	lv_image_dsc_t dsc;	 // hand this straight to lv_image_set_src()
-	uint8_t *pixels;	 // pixel buffer referenced by dsc.data
+	uint32_t display_generation; // nonzero after a complete pixel replacement
+	uint8_t *pixels;			 // pixel buffer referenced by dsc.data
 	bool has_tone;		 // the three below are filled in
 	uint32_t tone;		 // cover_page_tone() at COVER_PAGE_LIGHT_FROM: the sleeve's colour,
 	int16_t tone_luma;	 // its brightness as a whole,
 	bool tone_light;	 // and whether a page in it is a light one
 } cover_image_t;
+
+// Worker-safe. Call only after replacement pixels are fully ready.
+uint32_t cover_new_display_generation(void);
 
 // How bright a sleeve has to be for a page in its colour to be a light one,
 // written in dark ink. The colour kept with a picture is worked out at this

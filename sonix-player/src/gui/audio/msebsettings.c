@@ -4,8 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "src/gui/shell/sx_mini.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/popover.h"
@@ -13,6 +15,9 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
+#include "src/gui/shell/touch.h"
+#include "src/gui/shell/sx_tokens.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/system/audio/eq.h"
 #include "src/system/core/lang.h"
 
@@ -56,7 +61,7 @@ static void refresh_range_buttons(void) {
 		bool on = RANGE_VALUES[i] == active;
 		lv_obj_set_style_bg_color(range_buttons[i], on ? theme()->accent : theme()->surface_pressed, 0);
 		lv_obj_set_style_text_color(lv_obj_get_child(range_buttons[i], 0),
-									on ? lv_color_white() : theme()->text_primary, 0);
+									on ? theme()->on_accent : theme()->text_primary, 0);
 	}
 }
 
@@ -162,7 +167,7 @@ static bool add_preset_row(const char *name, void *user) {
 	lv_obj_set_size(row, lv_pct(100), 84);
 	lv_obj_add_style(row, &theme_style_card, 0);
 	lv_obj_add_style(row, &theme_style_card_pressed, LV_STATE_PRESSED);
-	lv_obj_set_style_radius(row, 12, 0);
+	lv_obj_set_style_radius(row, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_shadow_width(row, 0, 0);
 	lv_obj_set_style_pad_hor(row, 16, 0);
@@ -191,6 +196,8 @@ static bool add_preset_row(const char *name, void *user) {
 
 	lv_obj_t *menu_btn = lv_btn_create(row);
 	lv_obj_set_size(menu_btn, 44, 44);
+	// A fingertip's worth (touch.h), kept within the row's own padding.
+	touch_grow(menu_btn, 44, 44, 14);
 	lv_obj_set_style_bg_opa(menu_btn, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(menu_btn, 0, 0);
 	lv_obj_set_style_shadow_width(menu_btn, 0, 0);
@@ -232,6 +239,7 @@ static void open_preset_list_cb(lv_event_t *e) {
 static void name_layer_hide(void) {
 	if (name_layer) {
 		lv_obj_set_hidden(name_layer, true);
+		sx_mini_update_visibility(); // its keyboard comes or goes with it
 	}
 }
 
@@ -274,6 +282,7 @@ static void open_name_dialog_cb(lv_event_t *e) {
 	lv_obj_add_state(name_field, LV_STATE_FOCUSED);
 	lv_obj_send_event(name_field, LV_EVENT_FOCUSED, NULL);
 	lv_obj_set_hidden(name_layer, false);
+	sx_mini_update_visibility(); // its keyboard comes or goes with it
 	lv_obj_move_foreground(name_layer);
 }
 
@@ -317,10 +326,13 @@ static void build_name_dialog(gui_config_t *cfg) {
 	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_align(name_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
 	lv_obj_add_style(name_field, &theme_style_card, 0);
-	lv_obj_set_style_radius(name_field, 12, 0);
+	// The 2.0 input: a pill on the surface.
+	lv_obj_add_style(name_field, &sx_style_surface, 0);
+	lv_obj_set_style_radius(name_field, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_border_width(name_field, 0, 0);
 	lv_obj_set_style_shadow_width(name_field, 0, 0);
 	lv_obj_set_style_pad_all(name_field, 14, 0);
+	lv_obj_set_style_pad_hor(name_field, 22, 0);
 	lv_obj_set_style_text_font(name_field, &font_ui_24, 0);
 	keyboard_style_caret(name_field);
 
@@ -347,10 +359,7 @@ static void build_list_page(gui_config_t *cfg) {
 	switcher_attach_back_gesture(list_screen);
 }
 
-void msebsettings_init(gui_config_t *cfg) {
-	config = cfg;
-
-	settings_screen = lv_obj_create(NULL);
+static void build(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(settings_screen, cfg, "mseb_settings");
 
 	settingsrow_action(container, "save_preset", open_name_dialog_cb, NULL);
@@ -361,7 +370,7 @@ void msebsettings_init(gui_config_t *cfg) {
 	lv_obj_set_width(card, lv_pct(100));
 	lv_obj_set_height(card, LV_SIZE_CONTENT);
 	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 12, 0);
+	lv_obj_set_style_radius(card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 16, 0);
@@ -395,5 +404,17 @@ void msebsettings_init(gui_config_t *cfg) {
 	build_name_dialog(cfg);
 
 	switcher_attach_back_gesture(settings_screen);
+	// Registered here, not in _init(): the pills it repaints exist from now on.
 	theme_register_refresh(refresh_range_buttons);
+}
+
+// The screen exists from boot -- musicsettings asks for it to hang the gear off
+// the MSEB page -- and the rows, the preset list page and the name dialog with
+// its keyboard are built on the first visit (see gui_page_defer). Nothing else
+// reaches in: the reload callback musicsettings hands over is ours to call, and
+// the list page is only reached from a row on this one.
+void msebsettings_init(gui_config_t *cfg) {
+	config = cfg;
+	settings_screen = lv_obj_create(NULL);
+	gui_page_defer(settings_screen, build);
 }

@@ -8,9 +8,8 @@
 #include "src/system/core/utils.h"
 
 #include <dirent.h>
-#include <stdint.h>
 #include <errno.h>
-#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +47,11 @@
 // second full set beside the list's own, which on a large library is megabytes
 // for a queue nobody is looking at.
 static char **paths; // full path per entry, each its own allocation
+// One byte beside each of `paths`: set while that entry is a "play next" that
+// has not come up yet. See pending_take() for what it is for.
+static uint8_t *next_flags;
+// Allocate only for an explicit library-row promise: one bit per index.
+static uint8_t *indexed_next_flags;
 static library_index_t *source_ix;
 // How many entries the handle serves. The rest -- what "add to queue" put
 // there after the fact -- are in `paths`, starting at zero, so a library queue
@@ -126,8 +130,8 @@ static const char *entry_path(size_t entry) {
 	return path_cache[oldest].path;
 }
 
-static size_t *order;	// permutation of [0, entry_count)
-static size_t pos = 0;	// where playback is, as an index into `order`
+static size_t *order;  // permutation of [0, entry_count)
+static size_t pos = 0; // where playback is, as an index into `order`
 
 static bool custom_queue = false;
 static playback_mode_t mode = PLAYBACK_MODE_NORMAL;
@@ -146,20 +150,19 @@ static bool ordered_queue = false;
 // Shuffle only applies to a queue that does not carry an order of its own. Both
 // shuffled modes are shuffling here: they are dealt the same, and differ only
 // in what happens when the deal runs out.
-static bool shuffling(void) {
-	return (mode == PLAYBACK_MODE_SHUFFLE || mode == PLAYBACK_MODE_SHUFFLE_REPEAT) && !ordered_queue;
-}
+static bool shuffling(void) { return (mode == PLAYBACK_MODE_SHUFFLE || mode == PLAYBACK_MODE_SHUFFLE_REPEAT) && !ordered_queue; }
 
 // Bumped by everything that changes the entries or the order. The on-disk
 // mirror of the queue only rewrites its list when this moves.
 static unsigned revision = 0;
+static unsigned source_revision;
 
 // Where the last "add to queue" landed, so the next one goes after it rather
 // than in front of it. Only valid while playback still sits on the track the
 // chain started from: `chain_from` is that position, and anything that moves
 // `pos` breaks the chain by no longer matching.
-static size_t chain_from;  // the pos the chain was anchored at
-static size_t chain_slot;  // order-index of the last track added
+static size_t chain_from; // the pos the chain was anchored at
+static size_t chain_slot; // order-index of the last track added
 static bool chain_valid;
 
 // The album this queue is, when it is one. See playlist.h.
@@ -189,9 +192,7 @@ void playlist_set_album(const char *album) {
 
 // After a restore: the label came off the card, so putting it back is not a
 // change to write down again.
-void playlist_note_album_restored(void) {
-	snprintf(persisted_album, sizeof(persisted_album), "%s", queue_album);
-}
+void playlist_note_album_restored(void) { snprintf(persisted_album, sizeof(persisted_album), "%s", queue_album); }
 
 const char *playlist_album(void) { return queue_album; }
 
@@ -209,10 +210,15 @@ bool playlist_is_junk_name(const char *name) {
 		return true;
 	}
 
+	// FAT recovery directories are not music. The file manager can explicitly
+	// reveal service entries without deleting or changing their contents.
+	if (!strcasecmp(name, "LOST.DIR") || (strlen(name) == 9 && !strncasecmp(name, "FOUND.", 6) && name[6] >= '0' && name[6] <= '9' && name[7] >= '0' && name[7] <= '9' && name[8] >= '0' && name[8] <= '9')) {
+		return true;
+	}
+
 	// And the rest of what a desktop scatters over a card. Nothing here is a
 	// track, and a folder of them is not a folder of music.
-	static const char *const JUNK[] = {".DS_Store", "__MACOSX", ".Spotlight-V100", ".Trashes",
-									   ".fseventsd", "$RECYCLE.BIN", "System Volume Information"};
+	static const char *const JUNK[] = {".DS_Store", "__MACOSX", ".Spotlight-V100", ".Trashes", ".fseventsd", "$RECYCLE.BIN", "System Volume Information"};
 	for (size_t i = 0; i < sizeof(JUNK) / sizeof(JUNK[0]); i++) {
 		if (strcasecmp(name, JUNK[i]) == 0) {
 			return true;
@@ -224,9 +230,7 @@ bool playlist_is_junk_name(const char *name) {
 bool playlist_is_playable_file(const char *name) {
 	// .m4b and .m4a joined the list when AAC did: an audiobook is a file like
 	// any other in the browser, and a folder of them has to queue.
-	static const char *const playable_exts[] = {".wav",  ".mp3",  ".flac", ".ogg", ".m4b", ".m4a",
-												 ".alac", ".aac",  ".dsf",  ".dff", ".aif", ".aiff",
-												 ".aifc", ".caf",  ".opus", ".wv",   ".ape"};
+	static const char *const playable_exts[] = {".wav", ".mp3", ".flac", ".ogg", ".m4b", ".m4a", ".alac", ".aac", ".dsf", ".dff", ".aif", ".aiff", ".aifc", ".caf", ".opus", ".wv", ".ape"};
 
 	if (!name || playlist_is_junk_name(name)) {
 		return false;
@@ -304,16 +308,21 @@ static void sort_folder(const char *folder) {
 }
 
 void playlist_clear(void) {
+	source_revision++;
 	for (size_t i = 0; i < appended_count(); i++) {
 		free(paths ? paths[i] : NULL);
 	}
 	free(paths);
+	free(next_flags);
+	free(indexed_next_flags);
 	free(order);
 	library_index_close(source_ix);
 	source_ix = NULL;
 	ix_count = 0;
 	path_cache_clear();
 	paths = NULL;
+	next_flags = NULL;
+	indexed_next_flags = NULL;
 	order = NULL;
 	entry_count = 0;
 	capacity = 0;
@@ -334,12 +343,19 @@ static bool push_path(const char *path) {
 		if (!grown)
 			return false; // keep the entries already gathered rather than crashing
 		paths = grown;
+		// The flags grow with the paths. Should they fail to, `capacity` stays
+		// where it was and the next push simply tries both again.
+		uint8_t *grown_flags = realloc(next_flags, grown_cap);
+		if (!grown_flags)
+			return false;
+		next_flags = grown_flags;
 		capacity = grown_cap;
 	}
 
 	paths[held] = strdup(path);
 	if (!paths[held])
 		return false;
+	next_flags[held] = 0;
 	entry_count++;
 	return true;
 }
@@ -368,7 +384,9 @@ static void order_identity(size_t start_entry) {
 			free(paths[i]);
 		}
 		free(paths);
+		free(next_flags);
 		paths = NULL;
+		next_flags = NULL;
 		capacity = 0;
 		entry_count = 0;
 		ix_count = 0;
@@ -481,6 +499,145 @@ static void order_shuffle_upcoming(void) {
 }
 
 // ---------------------------------------------------------------------------
+// "Play next" across a change of order
+//
+// A track queued with "Play next" is a promise: it comes after the one playing,
+// whatever the queue does around it. Inserting it at pos + 1 keeps that promise
+// until something re-deals the order -- shuffle switched on deals everything
+// ahead of playback, shuffle switched off goes back to the order the entries
+// are stored in (where an addition sits at the very end), a rescan rebuilds a
+// library queue from its query. Each of those would quietly send the queued
+// tracks somewhere into the middle of an album, or behind it.
+//
+// So the entries keep a flag while they are still to come, and the re-dealing
+// paths take the flagged ones out before they reorder and put them back right
+// after the playing track afterwards, in the order they had. The flag only
+// ever exists on entries "add to queue" put there (the library's own rows are
+// never queued that way), so it costs a byte per added track and nothing on a
+// library-sized queue. A flagged entry that has come up -- it sits at or
+// behind playback -- has kept its promise and loses the flag the next time
+// anybody looks.
+// ---------------------------------------------------------------------------
+
+static bool indexed_next_prepare(size_t entry) {
+	if (entry >= ix_count || indexed_next_flags)
+		return true;
+	indexed_next_flags = calloc((ix_count + 7) / 8, 1);
+	return indexed_next_flags != NULL;
+}
+
+static bool entry_queued_next(size_t entry) {
+	if (entry < ix_count)
+		return indexed_next_flags && (indexed_next_flags[entry / 8] & (1u << (entry % 8)));
+	return next_flags && entry - ix_count < appended_count() && next_flags[entry - ix_count];
+}
+
+static void entry_mark_queued_next(size_t entry, bool on) {
+	if (entry < ix_count) {
+		if (indexed_next_flags) {
+			if (on)
+				indexed_next_flags[entry / 8] |= 1u << (entry % 8);
+			else
+				indexed_next_flags[entry / 8] &= ~(1u << (entry % 8));
+		}
+		return;
+	}
+	if (next_flags && entry >= ix_count && entry - ix_count < appended_count()) {
+		next_flags[entry - ix_count] = on ? 1 : 0;
+	}
+}
+
+// The "play next" entries still ahead of playback, in the order they would
+// play, as storage indices. The ones that already played lose their flag here.
+// The caller frees the list. Zero, and no list, when there are none -- which is
+// the case on every queue nobody has queued anything into.
+static size_t pending_take(size_t **out) {
+	*out = NULL;
+	if (!order || (!next_flags && !indexed_next_flags)) {
+		return 0;
+	}
+	size_t n = 0;
+	for (size_t s = 0; s < entry_count; s++) {
+		size_t entry = order[s];
+		if (!entry_queued_next(entry)) {
+			continue;
+		}
+		if (s <= pos) {
+			entry_mark_queued_next(entry, false); // it came up: the promise is kept
+			continue;
+		}
+		n++;
+	}
+	if (n == 0) {
+		return 0;
+	}
+	size_t *list = malloc(n * sizeof(*list));
+	if (!list) {
+		return 0; // out of memory: the order is re-dealt without them, as before
+	}
+	size_t k = 0;
+	for (size_t s = pos + 1; s < entry_count && k < n; s++) {
+		if (entry_queued_next(order[s])) {
+			list[k++] = order[s];
+		}
+	}
+	*out = list;
+	return k;
+}
+
+// Puts `list` (storage indices) straight after the playing track, in that
+// order, and leaves everything else in the order it is in now. The playing
+// track is never in the list: it came from the slots ahead of playback, and
+// every reorder that calls this keeps the playing entry where playback is.
+static void pending_place(const size_t *list, size_t n) {
+	if (!list || n == 0 || !order || entry_count == 0) {
+		return;
+	}
+	uint8_t *mark = calloc(entry_count, 1);
+	size_t *fresh = malloc(entry_count * sizeof(*fresh));
+	if (!mark || !fresh) {
+		free(mark);
+		free(fresh);
+		return;
+	}
+	for (size_t k = 0; k < n; k++) {
+		if (list[k] < entry_count) {
+			mark[list[k]] = 1;
+		}
+	}
+	size_t at = 0;
+	for (size_t s = 0; s <= pos && s < entry_count; s++) {
+		if (!mark[order[s]]) {
+			fresh[at++] = order[s];
+		}
+	}
+	size_t new_pos = at ? at - 1 : 0;
+	for (size_t k = 0; k < n; k++) {
+		if (list[k] < entry_count) {
+			fresh[at++] = list[k];
+		}
+	}
+	for (size_t s = pos + 1; s < entry_count; s++) {
+		if (!mark[order[s]]) {
+			fresh[at++] = order[s];
+		}
+	}
+	free(mark);
+	if (at != entry_count) {
+		free(fresh); // a list naming an entry twice: leave the order as it was
+		return;
+	}
+	free(order);
+	order = fresh;
+	pos = new_pos;
+	// The block is one run again, so the next "play next" can join its end.
+	chain_from = pos;
+	chain_slot = pos + n;
+	chain_valid = true;
+	revision++;
+}
+
+// ---------------------------------------------------------------------------
 // loading
 // ---------------------------------------------------------------------------
 
@@ -567,8 +724,7 @@ void playlist_load_folder(const char *folder, const char *selected_filename) {
 	// A readdir() that stops early leaves a queue missing most of the album,
 	// which shows up as playback ending after the first track.
 	if (errno != 0) {
-		fprintf(stderr, "playlist: readdir stopped after %zu entries in '%s': %s\n", entry_count, folder,
-				strerror(errno));
+		fprintf(stderr, "playlist: readdir stopped after %zu entries in '%s': %s\n", entry_count, folder, strerror(errno));
 	}
 
 	closedir(dir);
@@ -621,64 +777,201 @@ void playlist_load_paths_ordered(const char *const *list, int count, int start_i
 	order_identity(start);
 }
 
-bool playlist_insert_next(const char *path) {
-	if (!path || !path[0]) {
-		return false;
+bool playlist_insert_next(const char *path) { return playlist_queue_paths(&path, 1, PLAYLIST_QUEUE_NEXT) == 1; }
+
+static bool rebuild_without(const uint8_t *gone);
+static int queue_insert(const char *const *list, int count, playlist_queue_where_t where);
+
+// The paths a "play next" is about, for the walk over a library list's rows.
+typedef struct {
+	const char *const *set;
+	int count;
+	uint8_t *hit; // one per row of the list, set where the row is one of `set`
+	size_t at;
+} dedup_walk_t;
+
+static bool path_in_set(const char *path, const char *const *set, int count) {
+	for (int i = 0; path && i < count; i++) {
+		if (set[i] && set[i][0] && strcmp(set[i], path) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool dedup_walk_cb(const char *name, const char *path, const char *artist, void *user) {
+	(void)name;
+	(void)artist;
+	dedup_walk_t *w = user;
+	if (path_in_set(path, w->set, w->count)) {
+		w->hit[w->at] = 1;
+	}
+	w->at++;
+	return true;
+}
+
+// The rule the 2.0 handoff gives "Play next": the tracks are taken out of
+// what is still to come before they go in after the playing one, so a track
+// already further down is moved up rather than queued twice. Only ahead of
+// playback: what has played stays in the history as it was. Rebuilds the queue
+// (as a removal does) when anything is taken out; the "play next" block right
+// after the playing track keeps being one, so the next addition still joins
+// its end.
+static void dedup_upcoming(const char *const *set, int count) {
+	if (!order || entry_count == 0 || pos + 1 >= entry_count || ix_count > PLAYLIST_DEDUP_IX_MAX) {
+		return;
+	}
+	uint8_t *gone = calloc(entry_count, 1);
+	uint8_t *hit = ix_count ? calloc(ix_count, 1) : NULL;
+	if (!gone || (ix_count && !hit)) {
+		free(gone);
+		free(hit);
+		return;
+	}
+	if (ix_count) {
+		dedup_walk_t w = {set, count, hit, 0};
+		library_index_window(source_ix, 0, (int)ix_count, dedup_walk_cb, &w);
+	}
+	size_t taken = 0;
+	for (size_t s = pos + 1; s < entry_count; s++) {
+		size_t entry = order[s];
+		bool same = entry < ix_count ? hit[entry] != 0 : path_in_set(entry_path(entry), set, count);
+		if (same) {
+			gone[entry] = 1;
+			taken++;
+		}
+	}
+	free(hit);
+	if (taken == 0) {
+		free(gone);
+		return;
+	}
+	bool chained = chain_valid && chain_from == pos;
+	if (rebuild_without(gone) && chained) {
+		// The chain, found again from the marks the rebuild carried over: the
+		// run of "play next" entries straight after the playing track.
+		size_t last = pos;
+		while (last + 1 < entry_count && entry_queued_next(order[last + 1])) {
+			last++;
+		}
+		if (last > pos) {
+			chain_from = pos;
+			chain_slot = last;
+			chain_valid = true;
+		}
+	}
+	free(gone);
+}
+
+int playlist_queue_paths(const char *const *list, int count, playlist_queue_where_t where) {
+	if (!list || count <= 0) {
+		return 0;
+	}
+
+	// "Play next" on what is playing is not a track to queue after itself, and
+	// copies of the set further down go before the set comes in (see above).
+	const char **picked = NULL;
+	if (where == PLAYLIST_QUEUE_NEXT && order && entry_count > 0) {
+		char playing[512] = "";
+		const char *at = entry_path(order[pos]);
+		if (at) {
+			snprintf(playing, sizeof(playing), "%s", at);
+		}
+		picked = malloc((size_t)count * sizeof(*picked));
+		if (picked) {
+			int kept = 0;
+			for (int i = 0; i < count; i++) {
+				if (list[i] && list[i][0] && strcmp(list[i], playing) != 0) {
+					picked[kept++] = list[i];
+				}
+			}
+			if (kept == 0) {
+				free(picked);
+				return 0;
+			}
+			dedup_upcoming(picked, kept);
+			list = picked;
+			count = kept;
+		}
+	}
+
+	int queued = queue_insert(list, count, where);
+	free(picked);
+	return queued;
+}
+
+static int queue_insert(const char *const *list, int count, playlist_queue_where_t where) {
+	bool was_empty = entry_count == 0 || !order;
+	size_t first_new = entry_count; // push_path appends: the new entries start here
+	size_t added = 0;
+	for (int i = 0; i < count; i++) {
+		if (list[i] && list[i][0] && push_path(list[i])) {
+			added++;
+		}
+	}
+	if (added == 0) {
+		return 0;
 	}
 
 	// Nothing playing: there is no "after the current track" to speak of, so
-	// the addition simply becomes the queue.
-	if (entry_count == 0 || !order) {
-		if (!push_path(path)) {
-			return false;
-		}
+	// the additions simply become the queue, whichever way they were added.
+	if (was_empty) {
 		custom_queue = true;
 		order_identity(0);
 		chain_valid = false;
-		return true;
+		return order ? (int)added : 0;
 	}
-
-	if (!push_path(path)) {
-		return false;
-	}
-	size_t entry = entry_count - 1; // push_path appended it
 
 	size_t *grown = realloc(order, entry_count * sizeof(*order));
 	if (!grown) {
-		// The path is in `paths` but has no slot in the order, which would
-		// leave playlist_path_at() reading past the end. Drop it again.
-		entry_count--;
-		free(paths[appended_count()]);
-		return false;
+		// The paths are in `paths` but have no slot in the order, which would
+		// leave playlist_path_at() reading past the end. Drop them again.
+		for (size_t k = 0; k < added; k++) {
+			entry_count--;
+			free(paths[appended_count()]);
+		}
+		return 0;
 	}
 	order = grown;
+	size_t old_count = entry_count - added;
 
-	// After the previous addition when the chain still holds, otherwise
-	// straight after whatever is playing.
-	size_t slot = (chain_valid && chain_from == pos && chain_slot > pos && chain_slot < entry_count) ? chain_slot + 1
-																									 : pos + 1;
-	if (slot > entry_count - 1) {
-		slot = entry_count - 1; // append
+	// Where they go. "Next": after the previous addition while the chain still
+	// holds, otherwise straight after whatever is playing. "End": after
+	// everything, which moves nothing already there -- so a chain, if there is
+	// one, stays valid.
+	size_t slot;
+	if (where == PLAYLIST_QUEUE_END) {
+		slot = old_count;
+	} else {
+		slot = (chain_valid && chain_from == pos && chain_slot > pos && chain_slot < old_count) ? chain_slot + 1 : pos + 1;
+	}
+	if (slot > old_count) {
+		slot = old_count; // append
 	}
 
-	// `entry_count` already counts the new entry, so the tail to move ends at
-	// entry_count - 1.
-	for (size_t i = entry_count - 1; i > slot; i--) {
-		order[i] = order[i - 1];
+	// One move of the tail for the whole set. One insert per track would be a
+	// pass over the whole order per track, and the order can be a library's.
+	memmove(&order[slot + added], &order[slot], (old_count - slot) * sizeof(*order));
+	for (size_t k = 0; k < added; k++) {
+		order[slot + k] = first_new + k;
 	}
-	order[slot] = entry;
 
-	// Re-anchor the chain on the slot just filled. `pos` needs no adjustment for
-	// the shift above, since slot is always greater than it.
-	chain_from = pos;
-	chain_slot = slot;
-	chain_valid = true;
+	if (where == PLAYLIST_QUEUE_NEXT) {
+		for (size_t k = 0; k < added; k++) {
+			entry_mark_queued_next(first_new + k, true);
+		}
+		// Re-anchor the chain on the last slot just filled. `pos` needs no
+		// adjustment for the shift above, since slot is always greater than it.
+		chain_from = pos;
+		chain_slot = slot + added - 1;
+		chain_valid = true;
+	}
 
 	// A folder queue would be rebuilt from the directory the next time
-	// device_state resynced, taking the addition with it.
+	// device_state resynced, taking the additions with it.
 	custom_queue = true;
 	revision++;
-	return true;
+	return (int)added;
 }
 
 bool playlist_insert_at(const char *path, int slot) {
@@ -737,21 +1030,28 @@ bool playlist_insert_at(const char *path, int slot) {
 	return true;
 }
 
-bool playlist_enqueue_at_end(void) { return config_get_int("player", "queue_add_end", 0) != 0; }
-
-void playlist_set_enqueue_at_end(bool at_end) {
-	config_set_int("player", "queue_add_end", at_end ? 1 : 0);
-	config_save();
-}
-
-bool playlist_enqueue(const char *path) {
-	if (!playlist_enqueue_at_end()) {
-		return playlist_insert_next(path);
+int playlist_replace_path(const char *old_path, const char *new_path) {
+	if (!old_path || !new_path || !new_path[0] || strcmp(old_path, new_path) == 0) {
+		return 0;
 	}
-	// A slot past the last appends: the end of the queue in playing order,
-	// which with shuffle on is the end of the order dealt. Ahead of playback
-	// unless the queue is empty, when the track simply becomes the queue.
-	return playlist_insert_at(path, INT_MAX);
+	int changed = 0;
+	for (size_t i = 0; paths && i < appended_count(); i++) {
+		if (paths[i] && strcmp(paths[i], old_path) == 0) {
+			char *copy = strdup(new_path);
+			if (!copy) {
+				break; // the entry keeps its old name: the caller's prepare finds it
+			}
+			free(paths[i]);
+			paths[i] = copy;
+			changed++;
+		}
+	}
+	// The revision stays: the queue is the same tracks in the same order, and
+	// a new revision rewrites the whole copy on the card -- thousands of
+	// entries, at every track of a long streaming queue. The copy keeps the
+	// guessed names, which is what a restart wants anyway: the cache they
+	// point into is emptied at shutdown, and the tracks are fetched again.
+	return changed;
 }
 
 static void refresh_stale_source(void);
@@ -760,6 +1060,7 @@ typedef struct {
 	char **out;
 	size_t want;
 	size_t got;
+	const uint8_t *gone; // rows not to keep: visited, but not copied
 } collect_t;
 
 static bool collect_cb(const char *name, const char *path, const char *artist, void *user) {
@@ -769,31 +1070,42 @@ static bool collect_cb(const char *name, const char *path, const char *artist, v
 	if (c->got >= c->want) {
 		return false;
 	}
-	c->out[c->got] = strdup(path ? path : "");
-	if (!c->out[c->got]) {
-		return false;
+	// A row that is going is only counted. Clearing what is ahead in "All
+	// tracks" would otherwise copy the whole library to throw nearly all of it
+	// away again.
+	if (!c->gone || !c->gone[c->got]) {
+		c->out[c->got] = strdup(path ? path : "");
+		if (!c->out[c->got]) {
+			return false;
+		}
 	}
 	c->got++;
 	return true;
 }
 
-// Rebuilds the queue as a list of paths in the order it is played, without the
-// entries `gone` marks (by where they are stored), and with playback on the
-// track it was on. Takes `gone`, and frees it whatever happens.
-static bool rebuild_as_paths(uint8_t *gone) {
-	// Every entry becomes a path: the rows of a library list are read in one
-	// pass rather than one lookup each. What is left of the queue is no longer
-	// that list, so it is not held as one either.
+// Builds the queue again as a plain list of paths, without the entries marked
+// in `gone` (by storage index), in the order it is in now and with playback on
+// the same track. What is left of a library queue is no longer that list, so it
+// is not held as one either. The playing entry is never in `gone`.
+static bool rebuild_without(const uint8_t *gone) {
+	// Every entry that stays becomes a path: the rows of a library list are read
+	// in one pass rather than one lookup each.
 	size_t total = entry_count;
 	char **stored = calloc(total, sizeof(*stored));
 	size_t *old_order = malloc(total * sizeof(*old_order));
-	bool ok = stored && old_order;
+	uint8_t *was_next = calloc(total, 1);
+	bool ok = stored && old_order && was_next;
+	for (size_t i = 0; ok && i < total; i++)
+		was_next[i] = entry_queued_next(i) ? 1 : 0;
 	if (ok && ix_count > 0) {
-		collect_t c = {stored, ix_count, 0};
+		collect_t c = {stored, ix_count, 0, gone};
 		library_index_window(source_ix, 0, (int)ix_count, collect_cb, &c);
 		ok = c.got == ix_count;
 	}
 	for (size_t i = ix_count; ok && i < total; i++) {
+		if (gone && gone[i]) {
+			continue;
+		}
 		stored[i] = strdup(paths[i - ix_count]);
 		ok = stored[i] != NULL;
 	}
@@ -803,7 +1115,7 @@ static bool rebuild_as_paths(uint8_t *gone) {
 		}
 		free(stored);
 		free(old_order);
-		free(gone);
+		free(was_next);
 		return false;
 	}
 	memcpy(old_order, order, total * sizeof(*old_order));
@@ -817,7 +1129,7 @@ static bool rebuild_as_paths(uint8_t *gone) {
 		}
 		free(stored);
 		free(old_order);
-		free(gone);
+		free(was_next);
 		return false;
 	}
 
@@ -830,11 +1142,13 @@ static bool rebuild_as_paths(uint8_t *gone) {
 	for (size_t i = 0; i < total; i++) {
 		kept_at[i] = (size_t)-1;
 		// A row of the library gone meanwhile comes back blank.
-		if (gone[i] || !stored[i][0]) {
+		if ((gone && gone[i]) || !stored[i] || !stored[i][0]) {
 			continue;
 		}
 		if (push_path(stored[i])) {
 			kept_at[i] = kept++;
+			// Still a "play next" if it was one: the flags follow the entries.
+			entry_mark_queued_next(kept_at[i], was_next[i] != 0);
 		}
 	}
 	custom_queue = true;
@@ -845,7 +1159,7 @@ static bool rebuild_as_paths(uint8_t *gone) {
 		size_t at = 0;
 		for (size_t i = 0; i < total; i++) {
 			size_t entry = old_order[i];
-			if (gone[entry] || kept_at[entry] == (size_t)-1) {
+			if ((gone && gone[entry]) || kept_at[entry] == (size_t)-1) {
 				continue;
 			}
 			if (i == old_pos) {
@@ -863,7 +1177,7 @@ static bool rebuild_as_paths(uint8_t *gone) {
 	free(stored);
 	free(old_order);
 	free(kept_at);
-	free(gone);
+	free(was_next);
 	return true;
 }
 
@@ -887,63 +1201,309 @@ bool playlist_remove(const int *indices, int count) {
 		gone[order[at]] = 1;
 		removed++;
 	}
-	if (removed == 0) {
-		free(gone);
-		return false;
-	}
-
-	return rebuild_as_paths(gone);
+	bool ok = removed > 0 && rebuild_without(gone);
+	free(gone);
+	return ok;
 }
 
-bool playlist_move(int from, int to) {
-	if (!order || from < 0 || to < 0 || (size_t)from >= entry_count || (size_t)to >= entry_count || from == to) {
-		return false;
-	}
-	// The library list under the queue read again: the positions the caller
-	// counted may stand for other tracks now.
-	unsigned seen = revision;
+bool playlist_clear_upcoming(void) {
 	refresh_stale_source();
-	if (revision != seen) {
+	if (!order || entry_count == 0 || pos + 1 >= entry_count) {
 		return false;
 	}
-
-	// An order of its own is something the query a library list is kept as
-	// cannot say: the queue becomes the paths, as a removal makes it.
-	if (ix_count > 0) {
-		size_t before = entry_count;
-		uint8_t *none = calloc(entry_count, 1);
-		if (!none || !rebuild_as_paths(none)) {
-			return false;
-		}
-		// A row of the library that has gone meanwhile was dropped, and the
-		// positions the caller counted are off by it.
-		if (entry_count != before) {
-			return false;
-		}
+	uint8_t *gone = calloc(entry_count, 1);
+	if (!gone) {
+		return false;
 	}
-
-	size_t entry = order[from];
-	if (from < to) {
-		memmove(&order[from], &order[from + 1], (size_t)(to - from) * sizeof(*order));
-	} else {
-		memmove(&order[to + 1], &order[to], (size_t)(from - to) * sizeof(*order));
+	for (size_t s = pos + 1; s < entry_count; s++) {
+		gone[order[s]] = 1;
 	}
-	order[to] = entry;
+	bool ok = rebuild_without(gone);
+	free(gone);
+	return ok;
+}
 
-	// Playback stays on its track, wherever that has gone.
-	size_t f = (size_t)from, t = (size_t)to;
-	if (pos == f) {
-		pos = t;
-	} else if (f < pos && t >= pos) {
-		pos--;
-	} else if (f > pos && t <= pos) {
-		pos++;
+bool playlist_move(int index, int delta) {
+	if (!order || (delta != 1 && delta != -1) || index < 0 || (size_t)index >= entry_count) {
+		return false;
 	}
-
+	int target = index + delta;
+	// Only among what is still to come: above playback is what has played, and
+	// moving a track there is a slower way of removing it.
+	if ((size_t)index <= pos || target < 0 || (size_t)target <= pos || (size_t)target >= entry_count) {
+		return false;
+	}
+	size_t tmp = order[index];
+	order[index] = order[target];
+	order[target] = tmp;
+	// The chain describes slots, and two of them just changed hands.
 	chain_valid = false;
 	custom_queue = true;
 	revision++;
 	return true;
+}
+
+bool playlist_move_to(int from, int to) {
+	if (!order || from < 0 || to < 0 || from == to || (size_t)from <= pos || (size_t)to <= pos || (size_t)from >= entry_count || (size_t)to >= entry_count)
+		return false;
+	unsigned seen = revision;
+	refresh_stale_source();
+	if (seen != revision)
+		return false;
+	if (source_ix) {
+		playlist_snapshot_t *saved = playlist_snapshot_take();
+		if (!saved)
+			return false;
+		size_t before = entry_count;
+		char playing[512];
+		playlist_current_path(playing, sizeof(playing));
+		if (!rebuild_without(NULL) || entry_count != before) {
+			playlist_snapshot_restore(saved, playing);
+			return false;
+		}
+		playlist_snapshot_free(saved);
+	}
+	size_t entry = order[from];
+	if (from < to)
+		memmove(order + from, order + from + 1, (size_t)(to - from) * sizeof(*order));
+	else
+		memmove(order + to + 1, order + to, (size_t)(from - to) * sizeof(*order));
+	order[to] = entry;
+	chain_valid = false;
+	custom_queue = true;
+	revision++;
+	return true;
+}
+
+bool playlist_shuffle_upcoming(void) {
+	if (!order || entry_count < 3 || pos + 2 >= entry_count) {
+		return false;
+	}
+	// Asked for in so many words, so the "play next" promises give way: they
+	// are dealt with the rest, and a later change of mode must not lift them
+	// back to the front of a queue the user has just mixed.
+	for (size_t s = pos + 1; s < entry_count; s++) {
+		entry_mark_queued_next(order[s], false);
+	}
+	order_shuffle_upcoming();
+	chain_valid = false;
+	custom_queue = true;
+	revision++;
+	return true;
+}
+
+bool playlist_move_next(int index) {
+	if (!order || index < 0 || (size_t)index >= entry_count || (size_t)index == pos) {
+		return false;
+	}
+	size_t entry = order[index];
+	// OOM must leave the old order intact, before the first memmove.
+	if (!indexed_next_prepare(entry))
+		return false;
+	if ((size_t)index > pos) {
+		// Still to come: the ones between the playing track and it move down
+		// a place.
+		if ((size_t)index > pos + 1) {
+			memmove(&order[pos + 2], &order[pos + 1], ((size_t)index - pos - 1) * sizeof(*order));
+			order[pos + 1] = entry;
+		}
+	} else {
+		// From what has played: the ones after it, the playing track included,
+		// move up a place, and playback with them.
+		memmove(&order[index], &order[index + 1], (pos - (size_t)index) * sizeof(*order));
+		pos--;
+		order[pos + 1] = entry;
+	}
+	// A "play next" like any other: a change of shuffle does not move it away.
+	entry_mark_queued_next(entry, true);
+	chain_valid = false;
+	custom_queue = true;
+	revision++;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// snapshots (playlist.h)
+// ---------------------------------------------------------------------------
+
+struct playlist_snapshot {
+	library_index_t *ix; // a clone of the list's handle, or NULL for a queue of paths
+	size_t ix_count;
+	size_t appended;
+	char **paths;	// the appended entries' paths, `appended` of them
+	uint8_t *flags; // their "play next" marks
+	uint8_t *indexed_flags;
+	size_t *order;	// entry_count of them
+	size_t entry_count;
+	size_t pos;
+	bool custom;
+	bool ordered;
+	bool chain_valid;
+	size_t chain_from, chain_slot;
+	char album[sizeof(queue_album)];
+	size_t bytes;
+};
+
+void playlist_snapshot_free(playlist_snapshot_t *snap) {
+	if (!snap) {
+		return;
+	}
+	for (size_t i = 0; snap->paths && i < snap->appended; i++) {
+		free(snap->paths[i]);
+	}
+	free(snap->paths);
+	free(snap->flags);
+	free(snap->indexed_flags);
+	free(snap->order);
+	library_index_close(snap->ix);
+	free(snap);
+}
+
+size_t playlist_snapshot_bytes(const playlist_snapshot_t *snap) { return snap ? snap->bytes : 0; }
+
+int playlist_snapshot_count(const playlist_snapshot_t *snap) { return snap ? (int)snap->entry_count : 0; }
+
+int playlist_snapshot_position(const playlist_snapshot_t *snap) { return snap ? (int)snap->pos : -1; }
+
+bool playlist_snapshot_path_at(const playlist_snapshot_t *snap, int index, char *out, size_t size) {
+	if (!snap || !snap->order || index < 0 || (size_t)index >= snap->entry_count || !out || size == 0) {
+		return false;
+	}
+	size_t entry = snap->order[index];
+	if (entry >= snap->ix_count) {
+		size_t appended = entry - snap->ix_count;
+		if (appended >= snap->appended || !snap->paths) {
+			return false;
+		}
+		snprintf(out, size, "%s", snap->paths[appended]);
+		return true;
+	}
+	char resolved[512] = {0};
+	if (library_index_window(snap->ix, (int)entry, 1, resolve_cb, resolved) != 1 || !resolved[0]) {
+		return false;
+	}
+	snprintf(out, size, "%s", resolved);
+	return true;
+}
+
+playlist_snapshot_t *playlist_snapshot_take(void) {
+	if (!order || entry_count == 0) {
+		return NULL;
+	}
+	playlist_snapshot_t *snap = calloc(1, sizeof(*snap));
+	if (!snap) {
+		return NULL;
+	}
+	snap->bytes = sizeof(*snap);
+	bool ok = true;
+	if (source_ix) {
+		snap->ix = library_index_clone(source_ix);
+		ok = snap->ix != NULL;
+		snap->bytes += ix_count * 4;
+	}
+	snap->ix_count = ix_count;
+	snap->appended = appended_count();
+	if (ok && indexed_next_flags) {
+		size_t bytes = (ix_count + 7) / 8;
+		snap->indexed_flags = malloc(bytes);
+		ok = snap->indexed_flags != NULL;
+		if (ok) {
+			memcpy(snap->indexed_flags, indexed_next_flags, bytes);
+			snap->bytes += bytes;
+		}
+	}
+	if (ok && snap->appended) {
+		snap->paths = calloc(snap->appended, sizeof(*snap->paths));
+		snap->flags = malloc(snap->appended);
+		ok = snap->paths && snap->flags;
+		for (size_t i = 0; ok && i < snap->appended; i++) {
+			snap->paths[i] = strdup(paths[i]);
+			ok = snap->paths[i] != NULL;
+			snap->flags[i] = next_flags ? next_flags[i] : 0;
+			if (ok) {
+				snap->bytes += strlen(paths[i]) + 1 + sizeof(char *) + 1;
+			}
+		}
+	}
+	if (ok) {
+		snap->order = malloc(entry_count * sizeof(*snap->order));
+		ok = snap->order != NULL;
+		if (ok) {
+			memcpy(snap->order, order, entry_count * sizeof(*snap->order));
+			snap->bytes += entry_count * sizeof(*snap->order);
+		}
+	}
+	if (!ok) {
+		playlist_snapshot_free(snap);
+		return NULL;
+	}
+	snap->entry_count = entry_count;
+	snap->pos = pos;
+	snap->custom = custom_queue;
+	snap->ordered = ordered_queue;
+	snap->chain_valid = chain_valid;
+	snap->chain_from = chain_from;
+	snap->chain_slot = chain_slot;
+	snprintf(snap->album, sizeof(snap->album), "%s", queue_album);
+	return snap;
+}
+
+bool playlist_snapshot_restore(playlist_snapshot_t *snap, const char *playing_path) {
+	if (!snap || !snap->order || snap->entry_count != snap->ix_count + snap->appended) {
+		playlist_snapshot_free(snap);
+		return false;
+	}
+
+	// The arrays are taken over rather than copied: the snapshot is consumed.
+	playlist_clear();
+	source_ix = snap->ix;
+	snap->ix = NULL;
+	ix_count = snap->ix_count;
+	indexed_next_flags = snap->indexed_flags;
+	snap->indexed_flags = NULL;
+	entry_count = snap->ix_count;
+	path_cache_clear();
+	if (snap->appended) {
+		paths = snap->paths;
+		next_flags = snap->flags;
+		snap->paths = NULL;
+		snap->flags = NULL;
+		capacity = snap->appended;
+		entry_count += snap->appended;
+	}
+	order = snap->order;
+	snap->order = NULL;
+	pos = snap->pos < entry_count ? snap->pos : 0;
+	custom_queue = snap->custom;
+	ordered_queue = snap->ordered;
+	chain_valid = snap->chain_valid;
+	chain_from = snap->chain_from;
+	chain_slot = snap->chain_slot;
+	revision++;
+	playlist_set_album(snap->album);
+	snap->appended = 0; // the paths belong to the queue now
+	playlist_snapshot_free(snap);
+
+	// Playback stays on the track that is loaded: the toast may have been up
+	// across a track change.
+	if (playing_path && playing_path[0]) {
+		const char *at = entry_path(order[pos]);
+		if (!at || strcmp(at, playing_path) != 0) {
+			size_t was = pos;
+			if (!playlist_locate(playing_path)) {
+				pos = was;
+			}
+			chain_valid = false;
+		}
+	}
+	return true;
+}
+
+bool playlist_is_queued_next(int index) {
+	if (!order || index < 0 || (size_t)index >= entry_count || (size_t)index <= pos) {
+		return false;
+	}
+	return entry_queued_next(order[index]);
 }
 
 bool playlist_is_custom(void) { return custom_queue; }
@@ -951,6 +1511,7 @@ bool playlist_is_custom(void) { return custom_queue; }
 void playlist_set_custom(bool custom) { custom_queue = custom; }
 
 unsigned playlist_revision(void) { return revision; }
+unsigned playlist_source_revision(void) { return source_revision; }
 
 // How far either side of where playback is a library-backed queue will look
 // for a track. A queue of paths is walked whole -- the strings are right there
@@ -1145,8 +1706,38 @@ static void refresh_stale_source(void) {
 		start = (int)order[pos];
 	}
 
+	// Remap indexed promises by path and appended promises by their offset.
+	// Storage indices move with the number of rows the query now returns.
+	size_t *pending = NULL;
+	size_t pending_count = pending_take(&pending);
+	uint8_t *fresh_flags = NULL;
+	size_t kept_pending = 0;
+	for (size_t k = 0; k < pending_count; k++) {
+		if (pending[k] >= ix_count) {
+			pending[kept_pending++] = pending[k] - ix_count + (size_t)fresh_count;
+			continue;
+		}
+		const char *path = entry_path(pending[k]);
+		int at = path ? library_index_find_path(fresh, path) : -1;
+		if (at < 0)
+			continue;
+		if (!fresh_flags) {
+			fresh_flags = calloc(((size_t)fresh_count + 7) / 8, 1);
+			if (!fresh_flags) {
+				free(pending);
+				library_index_close(fresh);
+				return; // retry later, retaining the current order and promises
+			}
+		}
+		fresh_flags[(size_t)at / 8] |= 1u << ((size_t)at % 8);
+		pending[kept_pending++] = (size_t)at;
+	}
+	pending_count = kept_pending;
+
 	size_t appended = appended_count();
 	library_index_close(source_ix);
+	free(indexed_next_flags);
+	indexed_next_flags = fresh_flags;
 	source_ix = fresh;
 	ix_count = (size_t)fresh_count;
 	entry_count = ix_count + appended;
@@ -1160,6 +1751,8 @@ static void refresh_stale_source(void) {
 	if (shuffling()) {
 		order_shuffle_from(start_entry);
 	}
+	pending_place(pending, pending_count);
+	free(pending);
 	revision++;
 }
 
@@ -1194,13 +1787,77 @@ bool playlist_current_path(char *out, size_t out_size) {
 	return true;
 }
 
+bool playlist_export_begin(playlist_export_t *state) {
+	if (!state)
+		return false;
+	memset(state, 0, sizeof(*state));
+	state->revision = revision;
+	state->count = (int)entry_count;
+	state->library_backed = source_ix != NULL;
+	if (source_ix) {
+		if (!library_index_export_source(source_ix, &state->source))
+			return false;
+	}
+	return state->count > 0;
+}
+
+static bool export_current(const playlist_export_t *state) {
+	if (!state || state->revision != revision || state->count != (int)entry_count || state->library_backed != (source_ix != NULL))
+		return false;
+	if (source_ix) {
+		library_export_source_t current;
+		return library_index_export_source(source_ix, &current) && current.generation == state->source.generation && current.database_epoch == state->source.database_epoch;
+	}
+	return true;
+}
+
+bool playlist_export_batch(const playlist_export_t *state, int offset, playlist_export_item_t *items, int capacity, int *count) {
+	if (count)
+		*count = 0;
+	if (!items || !count || capacity <= 0 || capacity > 16 || offset < 0 || !export_current(state) || offset > state->count)
+		return false;
+	int n = state->count - offset;
+	if (n > capacity)
+		n = capacity;
+	for (int i = 0; i < n; i++) {
+		if (!order)
+			return false;
+		memset(&items[i], 0, sizeof(items[i]));
+		size_t entry = order[offset + i];
+		if (entry < ix_count) {
+			items[i].indexed = true;
+			if (!library_index_export_id(source_ix, (int)entry, &items[i].row_id))
+				return false;
+		} else {
+			const char *path = paths ? paths[entry - ix_count] : NULL;
+			if (!path || strlen(path) >= sizeof(items[i].path))
+				return false;
+			snprintf(items[i].path, sizeof(items[i].path), "%s", path);
+		}
+	}
+	if (!export_current(state))
+		return false;
+	*count = n;
+	return true;
+}
+
+bool playlist_export_ack(const playlist_export_t *state, const library_export_receipt_t *receipt) {
+	if (!receipt || !receipt->valid || !export_current(state) || !state->library_backed || state->source.generation != receipt->source.generation || state->source.database_epoch != receipt->source.database_epoch || state->source.spec.valid != receipt->source.spec.valid || state->source.spec.kind != receipt->source.spec.kind || state->source.spec.filter != receipt->source.spec.filter || state->source.spec.order != receipt->source.spec.order || state->source.spec.desc != receipt->source.spec.desc || strcmp(state->source.spec.value, receipt->source.spec.value) != 0)
+		return false;
+	return library_index_export_ack(source_ix, receipt);
+}
+
 // ---------------------------------------------------------------------------
 // advancing
 // ---------------------------------------------------------------------------
 
-bool playlist_at_end(void) { return entry_count == 0 || pos + 1 >= entry_count; }
+bool playlist_at_end(void) {
+	refresh_stale_source();
+	return entry_count == 0 || pos + 1 >= entry_count;
+}
 
 bool playlist_advance_auto(char *out, size_t out_size) {
+	refresh_stale_source();
 	if (entry_count == 0)
 		return false;
 
@@ -1253,6 +1910,7 @@ bool playlist_advance_auto(char *out, size_t out_size) {
 }
 
 bool playlist_peek_auto(char *out, size_t out_size) {
+	refresh_stale_source();
 	if (entry_count == 0 || !out) {
 		return false;
 	}
@@ -1287,6 +1945,10 @@ bool playlist_peek_auto(char *out, size_t out_size) {
 }
 
 bool playlist_next(char *out, size_t out_size) {
+	// Rebuild around the current track before applying the requested step.
+	// Otherwise a stale handle can anchor the rebuilt list to a numeric offset
+	// that already refers to the next entry, and land on an unrelated track.
+	refresh_stale_source();
 	if (entry_count == 0)
 		return false;
 	// Pressing next past the end of a shuffled deal asks for more, so it deals
@@ -1303,6 +1965,7 @@ bool playlist_next(char *out, size_t out_size) {
 }
 
 bool playlist_prev(char *out, size_t out_size) {
+	refresh_stale_source();
 	if (entry_count == 0)
 		return false;
 	pos = (pos + entry_count - 1) % entry_count;
@@ -1325,19 +1988,32 @@ static void apply_mode_change(playback_mode_t old_mode) {
 	bool shuffling = mode == PLAYBACK_MODE_SHUFFLE || mode == PLAYBACK_MODE_SHUFFLE_REPEAT;
 	bool was_shuffling = old_mode == PLAYBACK_MODE_SHUFFLE || old_mode == PLAYBACK_MODE_SHUFFLE_REPEAT;
 
-	if (shuffling && !was_shuffling) {
+	// Between the two shuffled modes nothing is re-dealt: the difference is
+	// only what happens at the end of the deal.
+	if (shuffling == was_shuffling) {
+		return;
+	}
+
+	// Whatever was queued with "Play next" and has not played yet is lifted
+	// out first and put back right after the playing track afterwards: either
+	// way of re-dealing would otherwise scatter it (see pending_take()).
+	size_t *pending = NULL;
+	size_t pending_count = pending_take(&pending);
+
+	if (shuffling) {
 		// Deal the random order now, so the queue page can show exactly what is
 		// coming. Only what is coming: the tracks already played keep their
 		// places, because the page shows those too and a switch of mode is not
 		// a reason to forget where the listening has been.
 		order_shuffle_upcoming();
-	} else if (was_shuffling && !shuffling) {
+	} else {
 		// Back to the listed order, without moving off the playing track.
 		size_t current_entry = order ? order[pos] : 0;
 		order_identity(current_entry);
 	}
-	// Between the two shuffled modes nothing is re-dealt: the difference is
-	// only what happens at the end of the deal.
+
+	pending_place(pending, pending_count);
+	free(pending);
 }
 
 // The chosen mode survives a power cycle: saved on every change, applied
@@ -1678,4 +2354,86 @@ bool playlist_next_folder(const char *root, const char *folder, char *out, size_
 
 	fprintf(stderr, "playlist: %d folders after '%s' and none of them holds a track\n", FOLDER_WALK_MAX, folder);
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Undoing an addition (UI 2.0's toast with "Undo")
+// ---------------------------------------------------------------------------
+
+int playlist_queue_paths_undoable(const char *const *list, int count, playlist_queue_where_t where, playlist_queue_undo_t *undo) {
+	if (undo) {
+		memset(undo, 0, sizeof(*undo));
+		undo->was_empty = entry_count == 0 || !order;
+		undo->first_new = entry_count;
+		undo->custom = custom_queue;
+		undo->chain_valid = chain_valid;
+		undo->chain_from = chain_from;
+		undo->chain_slot = chain_slot;
+	}
+	int added = playlist_queue_paths(list, count, where);
+	if (undo) {
+		undo->added = added > 0 ? (size_t)added : 0;
+		undo->revision = revision;
+		undo->valid = added > 0 && !undo->was_empty;
+	}
+	return added;
+}
+
+bool playlist_queue_undo(const playlist_queue_undo_t *undo) {
+	// Only the very change it was made for: anything since -- another addition,
+	// a removal, a new deal, a new queue -- has moved the revision, and the
+	// entries it would take out may no longer be the ones it added.
+	if (!undo || !undo->valid || undo->added == 0 || undo->revision != revision || !order || undo->first_new + undo->added != entry_count || undo->first_new < ix_count) {
+		return false;
+	}
+	size_t first = undo->first_new;
+	size_t last = first + undo->added; // exclusive
+
+	// None of them may have come up yet: the one playing cannot be taken out,
+	// and one already heard is history the queue page shows.
+	for (size_t s = 0; s <= pos && s < entry_count; s++) {
+		if (order[s] >= first && order[s] < last) {
+			return false;
+		}
+	}
+
+	size_t kept = 0;
+	for (size_t s = 0; s < entry_count; s++) {
+		if (order[s] < first || order[s] >= last) {
+			order[kept++] = order[s];
+		}
+	}
+	// `pos` stays: everything taken out was after it.
+	for (size_t k = first; k < last; k++) {
+		free(paths[k - ix_count]);
+		paths[k - ix_count] = NULL;
+	}
+	entry_count = first;
+	for (int i = 0; i < PATH_CACHE_SLOTS; i++) {
+		if (path_cache[i].valid && path_cache[i].entry >= first) {
+			path_cache[i].valid = false;
+		}
+	}
+	custom_queue = undo->custom;
+	chain_valid = undo->chain_valid;
+	chain_from = undo->chain_from;
+	chain_slot = undo->chain_slot;
+	revision++;
+	return true;
+}
+bool playlist_enqueue_at_end(void) { return config_get_int("player", "queue_add_end", -1) == 1; }
+bool playlist_enqueue_ask(void) { return config_get_int("player", "queue_add_end", -1) < 0; }
+void playlist_set_enqueue_ask(void) {
+	config_set_int("player", "queue_add_end", -1);
+	config_save();
+}
+
+void playlist_set_enqueue_at_end(bool at_end) {
+	config_set_int("player", "queue_add_end", at_end ? 1 : 0);
+	config_save();
+}
+
+bool playlist_enqueue(const char *path) {
+	const char *items[] = {path};
+	return path && playlist_queue_paths(items, 1, playlist_enqueue_at_end() ? PLAYLIST_QUEUE_END : PLAYLIST_QUEUE_NEXT) == 1;
 }

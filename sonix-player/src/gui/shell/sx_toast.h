@@ -1,0 +1,71 @@
+#ifndef GUI_SX_TOAST_H
+#define GUI_SX_TOAST_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "lvgl/lvgl.h"
+
+// ---------------------------------------------------------------------------
+// Sonix UI 2.0: the toast
+//
+// Principle 6, "a change is a toast with Undo": a light line near the bottom
+// of the screen -- above the mini player, above the player's controls when
+// the player is up -- saying what just happened, for SX_TOAST_MS (6 s).
+// With an undo callback it carries "Undo" on
+// the right and a 3 px bar under the text counting the time down; tapping
+// "Undo" calls back and takes the toast away.
+//
+// One instance on lv_layer_top(), built once; a new toast replaces the one up
+// (an undo not taken is simply dropped). A pull down of SX_TOAST_DISMISS_PX
+// puts it away early; so does a tap on its body. Holding pauses its timeout.
+// A replacement cannot consume the previous notification's unfinished touch.
+// It does not block the page -- a tap off it goes to the
+// page -- except the busy toast that may not be put away (sx_toast_busy).
+//
+// The older toasts (toast.h: success, error, plain, busy) and the notices
+// (gui_notify_popup) are this toast now, with a glyph at the start where they
+// had one.
+//
+// Strings are shown as given: translate first. UI thread only (from another
+// thread, gui_notify_popup() posts). Nothing runs while it is not shown; while
+// it is, a timer for the end and, with "Undo", the bar's animation.
+// ---------------------------------------------------------------------------
+
+// Builds it, hidden. gui_init(); safe to call again.
+void sx_toast_init(void);
+
+// A plain toast.
+void sx_toast(const char *text);
+
+// With "Undo": `undo(user)` runs if it is tapped before the toast goes.
+void sx_toast_undo(const char *text, void (*undo)(void *user), void *user);
+
+// With a glyph at the start, recoloured to `colour` (a glyph larger than the
+// line is scaled down to fit).
+void sx_toast_glyph(const lv_image_dsc_t *glyph, lv_color_t colour, const char *text);
+
+// A toast that stays, with a spinner, until sx_toast_busy_end() or the next
+// toast. `dismissable`: a pull down may put it away (the work goes on), and
+// the page stays usable; otherwise the page takes no taps until it ends, as
+// the busy card before 2.0 held it.
+void sx_toast_busy(const char *text, bool dismissable);
+void sx_toast_busy_end(void);
+bool sx_toast_busy_showing(void);
+
+// UI thread only. A replacement/dismissal invalidates the returned owner ID.
+// Ending an old owner leaves a newer toast untouched; existing APIs are unchanged.
+uint64_t sx_toast_busy_owned(const char *text, bool dismissable);
+bool sx_toast_busy_end_owned(uint64_t owner);
+
+// Takes whatever is up away now (no undo).
+void sx_toast_dismiss(void);
+
+bool sx_toast_showing(void);
+
+// The bottom slot or the player changed under a toast that is up (the player
+// collapsed, the mini player came or went): it moves to stand over what is
+// there now. From sx_frame_slot_changed(); cheap when no toast is up.
+void sx_toast_follow_slot(void);
+
+#endif /* GUI_SX_TOAST_H */

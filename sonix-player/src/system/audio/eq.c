@@ -3,6 +3,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,28 +19,24 @@
 // bands the stock player's geq carries).
 const int eq_band_freq[EQ_BANDS] = {31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000};
 
-// The bands' Q for each width (eq_set_width): about an octave and a half, an
-// octave (the natural "graphic EQ" shape), two thirds of one.
-static const double EQ_WIDTH_Q[EQ_WIDTHS] = {0.7, 1.1, 2.0};
+// Peaking filters one octave wide read as the natural "graphic EQ" shape.
+#define EQ_BAND_Q 1.1f
 
 // ---------------------------------------------------------------------------
-// Shared settings. Written by the UI thread, read by the audio thread; every
-// write bumps `settings_version`, and eq_process() rebuilds its coefficients
-// when the number it last saw is stale. Torn reads are harmless: the very
-// next buffer rebuilds again from the settled values.
+// Numeric coefficient settings are GUI-owned. Audio reads only a complete
+// accepted publication; the three atomic enables also serve cold format
+// selection through the existing getters. Volatile numeric fields are not a
+// synchronization mechanism.
 // ---------------------------------------------------------------------------
 
-static volatile int band_tenths[EQ_BANDS]; // tenths of a dB, in steps of EQ_STEP_TENTHS
-static volatile int eq_enabled;
-static volatile int eq_width = EQ_WIDTH_NORMAL;
+static volatile int band_gain_db[EQ_BANDS];
+static atomic_int eq_enabled;
 static volatile int mseb_value[MSEB_BANDS];
 
-// PEQ. The bands are not `volatile`: they are structs, and a volatile struct is
-// not an atomic access in C, only slower code. The module's usual rule applies:
-// the audio thread may read one mid-update, and the next buffer reads it whole,
-// because settings_version is the last thing the UI thread bumps.
+// GUI editable PEQ values. Publication, not volatile access, makes the copy
+// coherent for audio; UI curves and configuration retain these live values.
 static peq_band_t peq_bands[PEQ_BANDS];
-static volatile int peq_enabled;
+static atomic_int peq_enabled;
 static volatile int peq_preamp_tenths;
 
 // How far the sliders may travel. The stock player's own sliders run to 20;
@@ -52,8 +50,55 @@ static volatile int mseb_range = MSEB_RANGE_DEFAULT;
 static char mseb_preset_dir[512];
 static char eq_preset_dir[512];
 static char peq_preset_dir[512];
-static volatile int mseb_enabled;
-static volatile unsigned settings_version = 1;
+static atomic_int mseb_enabled;
+static atomic_uint settings_version = 1;
+_Static_assert(sizeof(unsigned) == 4 && ATOMIC_INT_LOCK_FREE == 2, "EQ requires lock-free 32-bit version/enables");
+
+typedef struct {
+	unsigned version;
+	int eq_on, mseb_on, peq_on;
+	int eq_gain[EQ_BANDS], mseb_value[MSEB_BANDS];
+	peq_band_t peq_band[PEQ_BANDS];
+	int preamp_tenths;
+} eq_settings_t;
+
+static pthread_mutex_t settings_lock = PTHREAD_MUTEX_INITIALIZER;
+static eq_settings_t published_settings = {.version = 1};
+// Same logical DSP owner as chain/pass buffers; startup seeds this before audio.
+static eq_settings_t audio_settings = {.version = 1};
+static void mseb_weights_build(void);
+
+// GUI/startup only. Does not assign version or touch persistence/audio state.
+static void settings_capture_live(eq_settings_t *out) {
+	out->eq_on = eq_get_enabled();
+	out->mseb_on = mseb_get_enabled();
+	out->peq_on = peq_get_enabled();
+	for (int i = 0; i < EQ_BANDS; i++)
+		out->eq_gain[i] = band_gain_db[i];
+	for (int i = 0; i < MSEB_BANDS; i++)
+		out->mseb_value[i] = mseb_value[i];
+	memcpy(out->peq_band, peq_bands, sizeof(out->peq_band));
+	out->preamp_tenths = peq_preamp_tenths;
+}
+
+// The only critical work is bounded capture/copy and version publication.
+static void settings_publish(void) {
+	pthread_mutex_lock(&settings_lock);
+	settings_capture_live(&published_settings);
+	published_settings.version++;
+	atomic_store_explicit(&settings_version, published_settings.version, memory_order_release);
+	pthread_mutex_unlock(&settings_lock);
+}
+
+// The hint does not synchronize payload reads; a successful trylock does.
+// A miss retains the prior complete input, including its exact version.
+static void settings_accept(void) {
+	unsigned wanted = atomic_load_explicit(&settings_version, memory_order_relaxed);
+	if (wanted != audio_settings.version && pthread_mutex_trylock(&settings_lock) == 0) {
+		audio_settings = published_settings;
+		pthread_mutex_unlock(&settings_lock);
+	}
+}
 
 // Soundfield: on/off and the stereo width in hundredths (100 = untouched).
 // It sits outside `settings_version` on purpose -- it has no coefficients to
@@ -216,8 +261,33 @@ static void peq_save_band(int index) {
 	config_save();
 }
 
+// The PEQ preset the bands came from, for the EQ-per-output profiles
+// (eqprofile.c): set when a preset is loaded or saved, cleared by any edit by
+// hand, which makes the bands no longer that preset. Kept in [peq] preset_name
+// so it outlives a restart. UI thread.
+static char peq_preset_name[104];
+
+static void peq_name_set(const char *name) {
+	snprintf(peq_preset_name, sizeof(peq_preset_name), "%s", name ? name : "");
+	config_set("peq", "preset_name", peq_preset_name);
+}
+
+static void peq_name_forget(void) {
+	if (peq_preset_name[0]) {
+		peq_name_set("");
+	}
+}
+
+const char *peq_current_preset(void) { return peq_preset_name; }
+
+void peq_set_preset_name(const char *name) {
+	peq_name_set(name);
+	config_save();
+}
+
 static void peq_load(void) {
-	peq_enabled = (int)config_get_int("peq", "enabled", 0);
+	atomic_store_explicit(&peq_enabled, (int)config_get_int("peq", "enabled", 0), memory_order_relaxed);
+	snprintf(peq_preset_name, sizeof(peq_preset_name), "%s", config_get_copy("peq", "preset_name", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE));
 	peq_preamp_tenths =
 		clamp_int((int)config_get_int("peq", "preamp", 0), PEQ_PREAMP_MIN_TENTHS, PEQ_PREAMP_MAX_TENTHS);
 
@@ -241,49 +311,20 @@ static void peq_load(void) {
 	}
 }
 
-// A gain in tenths of a dB, inside the range and on a step.
-static int band_clamp(long tenths) {
-	if (tenths < EQ_GAIN_MIN_DB * 10) {
-		tenths = EQ_GAIN_MIN_DB * 10;
-	}
-	if (tenths > EQ_GAIN_MAX_DB * 10) {
-		tenths = EQ_GAIN_MAX_DB * 10;
-	}
-	long half = EQ_STEP_TENTHS / 2;
-	tenths = tenths >= 0 ? (tenths + half) / EQ_STEP_TENTHS : -((-tenths + half) / EQ_STEP_TENTHS);
-	return (int)(tenths * EQ_STEP_TENTHS);
-}
-
-// A band in whole dB, rounded half away from zero.
-static int band_whole_db(int tenths) { return (tenths >= 0 ? tenths + 5 : tenths - 5) / 10; }
-
-// "t<band>" in tenths of a dB; "band<band>" in whole dB, which is all an older
-// configuration has.
-#define NO_TENTHS 100000
-
-// Both keys of a band, so an older build reading the file still finds its own.
-static void band_store(int i) {
-	char key[16];
-	snprintf(key, sizeof(key), "band%d", i);
-	config_set_int("eq", key, band_whole_db(band_tenths[i]));
-	snprintf(key, sizeof(key), "t%d", i);
-	config_set_int("eq", key, band_tenths[i]);
-}
-
 void eq_init(void) {
-	eq_enabled = (int)config_get_int("eq", "enabled", 0);
+	atomic_store_explicit(&eq_enabled, (int)config_get_int("eq", "enabled", 0), memory_order_relaxed);
 	for (int i = 0; i < EQ_BANDS; i++) {
 		char key[16];
-		snprintf(key, sizeof(key), "t%d", i);
-		long t = config_get_int("eq", key, NO_TENTHS);
-		if (t == NO_TENTHS) {
-			snprintf(key, sizeof(key), "band%d", i);
-			t = config_get_int("eq", key, 0) * 10;
+		snprintf(key, sizeof(key), "band%d", i);
+		long g = config_get_int("eq", key, 0);
+		if (g < EQ_GAIN_MIN_DB) {
+			g = EQ_GAIN_MIN_DB;
 		}
-		band_tenths[i] = band_clamp(t);
+		if (g > EQ_GAIN_MAX_DB) {
+			g = EQ_GAIN_MAX_DB;
+		}
+		band_gain_db[i] = (int)g;
 	}
-	long width = config_get_int("eq", "width", EQ_WIDTH_NORMAL);
-	eq_width = width >= 0 && width < EQ_WIDTHS ? (int)width : EQ_WIDTH_NORMAL;
 	sf_enabled = (int)config_get_int("soundfield", "enabled", 0);
 	sf_width = clamp_width((int)config_get_int("soundfield", "width", SOUNDFIELD_WIDTH_DEFAULT));
 
@@ -301,7 +342,7 @@ void eq_init(void) {
 	cf_ready_rate = 0;
 	crossfeed_reset();
 
-	mseb_enabled = (int)config_get_int("mseb", "enabled", 0);
+	atomic_store_explicit(&mseb_enabled, (int)config_get_int("mseb", "enabled", 0), memory_order_relaxed);
 	mseb_range = (int)config_get_int("mseb", "range", MSEB_RANGE_DEFAULT);
 	if (mseb_range != 20 && mseb_range != 40 && mseb_range != 100) {
 		mseb_range = MSEB_RANGE_DEFAULT;
@@ -321,47 +362,47 @@ void eq_init(void) {
 
 	peq_load();
 
-	settings_version++;
+	// Constants become immutable before any UI/audio query can race their build.
+	mseb_weights_build();
+	settings_publish();
+	pthread_mutex_lock(&settings_lock);
+	audio_settings = published_settings;
+	pthread_mutex_unlock(&settings_lock);
 }
 
 void eq_set_enabled(bool enabled) {
-	eq_enabled = enabled ? 1 : 0;
-	settings_version++;
-	config_set_int("eq", "enabled", eq_enabled);
+	atomic_store_explicit(&eq_enabled, enabled ? 1 : 0, memory_order_relaxed);
+	settings_publish();
+	config_set_int("eq", "enabled", enabled ? 1 : 0);
 	config_save();
 }
 
-bool eq_get_enabled(void) { return eq_enabled != 0; }
+bool eq_get_enabled(void) { return atomic_load_explicit(&eq_enabled, memory_order_relaxed) != 0; }
 
-void eq_set_band_tenths(int band, int tenths) {
+void eq_adjust_band(int band, int gain_db) {
 	if (band < 0 || band >= EQ_BANDS) {
 		return;
 	}
-	band_tenths[band] = band_clamp(tenths);
-	settings_version++;
-	band_store(band);
+	if (gain_db < EQ_GAIN_MIN_DB) {
+		gain_db = EQ_GAIN_MIN_DB;
+	}
+	if (gain_db > EQ_GAIN_MAX_DB) {
+		gain_db = EQ_GAIN_MAX_DB;
+	}
+	band_gain_db[band] = gain_db;
+	settings_publish();
+
+	char key[16];
+	snprintf(key, sizeof(key), "band%d", band);
+	config_set_int("eq", key, gain_db);
 }
-
-int eq_get_band_tenths(int band) { return (band >= 0 && band < EQ_BANDS) ? band_tenths[band] : 0; }
-
-void eq_save(void) { config_save(); }
 
 void eq_set_band(int band, int gain_db) {
-	eq_set_band_tenths(band, gain_db * 10);
+	eq_adjust_band(band, gain_db);
 	config_save();
 }
 
-void eq_set_width(int width) {
-	if (width < 0 || width >= EQ_WIDTHS) {
-		return;
-	}
-	eq_width = width;
-	settings_version++;
-	config_set_int("eq", "width", width);
-	config_save();
-}
-
-int eq_get_width(void) { return eq_width; }
+int eq_get_band(int band) { return (band >= 0 && band < EQ_BANDS) ? band_gain_db[band] : 0; }
 
 // ---------------------------------------------------------------------------
 // MSEB settings. Same contract as the graphic EQ's: UI writes, audio thread
@@ -379,13 +420,13 @@ const char *const mseb_band_name[MSEB_BANDS] = {
 };
 
 void mseb_set_enabled(bool enabled) {
-	mseb_enabled = enabled ? 1 : 0;
-	settings_version++;
-	config_set_int("mseb", "enabled", mseb_enabled);
+	atomic_store_explicit(&mseb_enabled, enabled ? 1 : 0, memory_order_relaxed);
+	settings_publish();
+	config_set_int("mseb", "enabled", enabled ? 1 : 0);
 	config_save();
 }
 
-bool mseb_get_enabled(void) { return mseb_enabled != 0; }
+bool mseb_get_enabled(void) { return atomic_load_explicit(&mseb_enabled, memory_order_relaxed) != 0; }
 
 void mseb_set_value(int band, int value) {
 	if (band < 0 || band >= MSEB_BANDS) {
@@ -398,7 +439,7 @@ void mseb_set_value(int band, int value) {
 		value = mseb_range;
 	}
 	mseb_value[band] = value;
-	settings_version++;
+	settings_publish();
 }
 
 int mseb_get_value(int band) { return (band >= 0 && band < MSEB_BANDS) ? mseb_value[band] : 0; }
@@ -468,41 +509,6 @@ static void mkdir_with_parent(const char *dir) {
 	mkdir(dir, 0777);
 }
 
-// The bands of the preset file at `path` in tenths of a dB, and its width (-1
-// when it names none). "t<band>" in tenths wins over "b<band>" in whole dB,
-// which is all a file from an older build has. False when the file cannot be
-// read or holds no band.
-static bool preset_read(const char *path, int tenths[EQ_BANDS], int *width) {
-	FILE *f = fopen(path, "r");
-	if (!f) {
-		return false;
-	}
-	bool fine[EQ_BANDS] = {false};
-	bool any = false;
-	*width = -1;
-	for (int i = 0; i < EQ_BANDS; i++) {
-		tenths[i] = 0;
-	}
-	char line[128];
-	while (fgets(line, sizeof(line), f)) {
-		int index = 0, value = 0;
-		if (sscanf(line, "t%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
-			tenths[index] = band_clamp(value);
-			fine[index] = true;
-			any = true;
-		} else if (sscanf(line, "b%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
-			if (!fine[index]) {
-				tenths[index] = band_clamp((long)value * 10);
-			}
-			any = true;
-		} else if (sscanf(line, "w=%d", &value) == 1) {
-			*width = value;
-		}
-	}
-	fclose(f);
-	return any;
-}
-
 bool eq_preset_save(const char *name) {
 	if (!eq_preset_dir[0] || !name_is_usable(name)) {
 		return false;
@@ -519,12 +525,8 @@ bool eq_preset_save(const char *name) {
 	}
 	fputs("# equalizer preset\n", f);
 	for (int i = 0; i < EQ_BANDS; i++) {
-		fprintf(f, "b%d=%d\n", i, band_whole_db(band_tenths[i]));
+		fprintf(f, "b%d=%d\n", i, band_gain_db[i]);
 	}
-	for (int i = 0; i < EQ_BANDS; i++) {
-		fprintf(f, "t%d=%d\n", i, band_tenths[i]);
-	}
-	fprintf(f, "w=%d\n", eq_width);
 	fclose(f);
 	return true;
 }
@@ -537,20 +539,19 @@ bool eq_preset_load(const char *name) {
 	char path[700];
 	snprintf(path, sizeof(path), "%s/%s.ini", eq_preset_dir, name);
 
-	int tenths[EQ_BANDS], width;
-	if (!preset_read(path, tenths, &width)) {
+	FILE *f = fopen(path, "r");
+	if (!f) {
 		return false;
 	}
-	for (int i = 0; i < EQ_BANDS; i++) {
-		band_tenths[i] = tenths[i];
-		band_store(i);
+
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		int index = 0, value = 0;
+		if (sscanf(line, "b%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
+			eq_set_band(index, value);
+		}
 	}
-	if (width >= 0 && width < EQ_WIDTHS) {
-		eq_width = width;
-		config_set_int("eq", "width", width);
-	}
-	settings_version++;
-	config_save();
+	fclose(f);
 	return true;
 }
 
@@ -602,13 +603,13 @@ void eq_reset(void) {
 // ---------------------------------------------------------------------------
 
 void peq_set_enabled(bool enabled) {
-	peq_enabled = enabled ? 1 : 0;
-	settings_version++;
-	config_set_int("peq", "enabled", peq_enabled);
+	atomic_store_explicit(&peq_enabled, enabled ? 1 : 0, memory_order_relaxed);
+	settings_publish();
+	config_set_int("peq", "enabled", enabled ? 1 : 0);
 	config_save();
 }
 
-bool peq_get_enabled(void) { return peq_enabled != 0; }
+bool peq_get_enabled(void) { return atomic_load_explicit(&peq_enabled, memory_order_relaxed) != 0; }
 
 void peq_get_band(int index, peq_band_t *out) {
 	if (!out) {
@@ -632,7 +633,8 @@ void peq_set_band(int index, const peq_band_t *band) {
 
 	// Version bumped after the value: it is what the audio thread watches to
 	// know there is something new to read.
-	settings_version++;
+	settings_publish();
+	peq_name_forget();
 	peq_save_band(index);
 }
 
@@ -640,7 +642,8 @@ int peq_get_preamp(void) { return peq_preamp_tenths; }
 
 void peq_set_preamp(int tenths) {
 	peq_preamp_tenths = clamp_int(tenths, PEQ_PREAMP_MIN_TENTHS, PEQ_PREAMP_MAX_TENTHS);
-	settings_version++;
+	settings_publish();
+	peq_name_forget();
 	config_set_int("peq", "preamp", peq_preamp_tenths);
 	config_save();
 }
@@ -856,11 +859,7 @@ static apo_filter_t apo_parse_filter(char *rest, peq_band_t *out) {
 // the file are left at their defaults. `*ignored` counts the filters that were
 // in the file and could not come along. False when the file cannot be opened
 // or holds no filter this chain can play.
-static bool peq_read_apo(const char *path, peq_band_t *bands, int *preamp_tenths, int *ignored) {
-	FILE *f = fopen(path, "r");
-	if (!f) {
-		return false;
-	}
+static bool peq_parse_apo(FILE *f, peq_band_t *bands, int *preamp_tenths, int *ignored) {
 	for (int i = 0; i < PEQ_BANDS; i++) {
 		bands[i] = peq_default_band(i);
 	}
@@ -918,8 +917,50 @@ static bool peq_read_apo(const char *path, peq_band_t *bands, int *preamp_tenths
 			}
 		}
 	}
-	fclose(f);
-	return count > 0;
+	return count > 0 && !ferror(f);
+}
+
+static bool peq_read_apo(const char *path, peq_band_t *bands, int *preamp_tenths, int *ignored) {
+	FILE *file = fopen(path, "r");
+	if (!file)
+		return false;
+	bool ok = peq_parse_apo(file, bands, preamp_tenths, ignored);
+	if (fclose(file) != 0)
+		ok = false;
+	return ok;
+}
+
+bool peq_preset_parse_text(const char *text, size_t length, peq_preset_data_t *out) {
+	if (!text || !length || !out)
+		return false;
+	FILE *file = fmemopen((void *)text, length, "r");
+	if (!file)
+		return false;
+	peq_preset_data_t parsed;
+	bool ok = peq_parse_apo(file, parsed.bands, &parsed.preamp_tenths, &parsed.ignored);
+	if (fclose(file) != 0)
+		ok = false;
+	if (ok)
+		*out = parsed;
+	return ok;
+}
+
+bool peq_preset_apply_parsed(const char *name, const peq_preset_data_t *data, bool enabled) {
+	if (!data || !name_is_usable(name))
+		return false;
+	for (int i = 0; i < PEQ_BANDS; i++) {
+		peq_bands[i] = data->bands[i];
+		peq_clamp_band(&peq_bands[i]);
+		peq_store_band(i);
+	}
+	peq_preamp_tenths = clamp_int(data->preamp_tenths, PEQ_PREAMP_MIN_TENTHS, PEQ_PREAMP_MAX_TENTHS);
+	atomic_store_explicit(&peq_enabled, enabled ? 1 : 0, memory_order_relaxed);
+	config_set_int("peq", "preamp", peq_preamp_tenths);
+	config_set_int("peq", "enabled", enabled ? 1 : 0);
+	peq_name_set(name);
+	config_save();
+	settings_publish();
+	return true;
 }
 
 // The .ini of the presets saved before the move to the APO format.
@@ -1010,7 +1051,11 @@ bool peq_preset_save(const char *name) {
 
 	char path[700];
 	snprintf(path, sizeof(path), "%s/%s.txt", peq_preset_dir, name);
-	return peq_write_apo(path, peq_bands, peq_preamp_tenths);
+	if (!peq_write_apo(path, peq_bands, peq_preamp_tenths)) {
+		return false;
+	}
+	peq_set_preset_name(name);
+	return true;
 }
 
 bool peq_preset_load(const char *name, int *ignored) {
@@ -1031,20 +1076,12 @@ bool peq_preset_load(const char *name, int *ignored) {
 		return false;
 	}
 
-	// Into the chain and the config together, with one write to the card at
-	// the end rather than one per band.
-	for (int i = 0; i < PEQ_BANDS; i++) {
-		peq_bands[i] = bands[i];
-		peq_store_band(i);
-	}
-	peq_preamp_tenths = preamp;
-	config_set_int("peq", "preamp", peq_preamp_tenths);
-	config_save();
-	settings_version++;
-
-	if (ignored) {
+	peq_preset_data_t parsed = {.preamp_tenths = preamp, .ignored = dropped};
+	memcpy(parsed.bands, bands, sizeof(bands));
+	if (!peq_preset_apply_parsed(name, &parsed, peq_get_enabled()))
+		return false;
+	if (ignored)
 		*ignored = dropped;
-	}
 	return true;
 }
 
@@ -1107,8 +1144,9 @@ void peq_reset_band(int index) {
 		return;
 	}
 	peq_bands[index] = peq_default_band(index);
+	peq_name_forget();
 	peq_save_band(index);
-	settings_version++;
+	settings_publish();
 }
 
 void peq_reset(void) {
@@ -1116,7 +1154,7 @@ void peq_reset(void) {
 		peq_reset_band(i);
 	}
 	peq_set_preamp(0);
-	settings_version++;
+	settings_publish();
 }
 
 
@@ -1138,7 +1176,7 @@ void mseb_set_range(int range) {
 			mseb_value[i] = -range;
 		}
 	}
-	settings_version++;
+	settings_publish();
 
 	config_set_int("mseb", "range", range);
 	mseb_save();
@@ -1148,7 +1186,7 @@ void mseb_reset(void) {
 	for (int i = 0; i < MSEB_BANDS; i++) {
 		mseb_value[i] = 0;
 	}
-	settings_version++;
+	settings_publish();
 	mseb_save();
 }
 
@@ -1505,65 +1543,6 @@ static double biquad_gain_db_at(const biquad_t *f, double w) {
 	return 10.0 * log10(ratio);
 }
 
-// The graphic equaliser's ten filters at `rate`, for measuring its curve:
-// `live[i]` false for a band at 0 dB, which adds nothing. False when the rate
-// is unusable.
-static bool graphic_filters(biquad_t f[EQ_BANDS], bool live[EQ_BANDS], int rate) {
-	if (rate <= 0) {
-		return false;
-	}
-	for (int i = 0; i < EQ_BANDS; i++) {
-		int tenths = band_tenths[i];
-		memset(&f[i], 0, sizeof(f[i]));
-		live[i] = tenths != 0 &&
-				  biquad_set_coeffs(&f[i], F_PEAK, eq_band_freq[i], (double)tenths / 10.0, EQ_WIDTH_Q[eq_width], rate);
-	}
-	return true;
-}
-
-// The curve of those filters at `freq`, in dB.
-static double graphic_db_at(const biquad_t f[EQ_BANDS], const bool live[EQ_BANDS], double freq, int rate) {
-	if (freq * 2.0 >= (double)rate) {
-		return 0.0;
-	}
-	double w = 2.0 * M_PI * freq / (double)rate;
-	double total = 0.0;
-	for (int i = 0; i < EQ_BANDS; i++) {
-		if (live[i]) {
-			total += biquad_gain_db_at(&f[i], w);
-		}
-	}
-	return total;
-}
-
-// The curve's highest point, 20 Hz to 20 kHz, never below 0 dB.
-#define GRAPHIC_PEAK_POINTS 72
-static double graphic_peak_db(int rate) {
-	biquad_t f[EQ_BANDS];
-	bool live[EQ_BANDS];
-	if (!graphic_filters(f, live, rate)) {
-		return 0.0;
-	}
-	double peak = 0.0;
-	for (int i = 0; i <= GRAPHIC_PEAK_POINTS; i++) {
-		double db = graphic_db_at(f, live, 20.0 * pow(1000.0, (double)i / GRAPHIC_PEAK_POINTS), rate);
-		if (db > peak) {
-			peak = db;
-		}
-	}
-	return peak;
-}
-
-void eq_response_curve(const int *freqs, int count, int sample_rate, int *out_tenths) {
-	biquad_t f[EQ_BANDS];
-	bool live[EQ_BANDS];
-	bool ok = graphic_filters(f, live, sample_rate);
-	for (int i = 0; i < count; i++) {
-		double db = ok ? graphic_db_at(f, live, (double)freqs[i], sample_rate) : 0.0;
-		out_tenths[i] = (int)(db >= 0 ? db * 10.0 + 0.5 : db * 10.0 - 0.5);
-	}
-}
-
 // ---------------------------------------------------------------------------
 // MSEB's own pre-gain
 //
@@ -1625,13 +1604,13 @@ static void mseb_weights_build(void) {
 // the settings page, which runs on the interface thread while the audio thread
 // is using those same filters -- and which is asked with nothing playing at
 // all, when the chain holds whatever the last track left in it.
-static int mseb_bank_build(biquad_t *out, int rate) {
+static int mseb_bank_build(biquad_t *out, int rate, const eq_settings_t *settings) {
 	int count = 0;
-	if (!mseb_enabled) {
+	if (!settings->mseb_on) {
 		return 0;
 	}
 	for (int i = 0; i < MSEB_FILTERS; i++) {
-		double gain = (double)mseb_value[MSEB_DEFS[i].slider] * (double)MSEB_DEFS[i].db_per_step;
+		double gain = (double)settings->mseb_value[MSEB_DEFS[i].slider] * (double)MSEB_DEFS[i].db_per_step;
 		memset(&out[count], 0, sizeof(out[count]));
 		if (biquad_set_coeffs(&out[count], MSEB_DEFS[i].type, MSEB_DEFS[i].freq, gain, (double)MSEB_DEFS[i].q, rate)) {
 			count++;
@@ -1640,9 +1619,9 @@ static int mseb_bank_build(biquad_t *out, int rate) {
 	return count;
 }
 
-static float mseb_auto_preamp_db(int rate) {
+static float mseb_auto_preamp_db(int rate, const eq_settings_t *settings) {
 	biquad_t bank[MSEB_FILTERS];
-	int count = mseb_bank_build(bank, rate);
+	int count = mseb_bank_build(bank, rate, settings);
 	if (count == 0) {
 		return 0.0f; // nothing to normalise: unity, the way the stock leaves it
 	}
@@ -1706,7 +1685,7 @@ static float mseb_auto_preamp_db(int rate) {
 	return p;
 }
 
-static void filters_rebuild(int rate) {
+static void filters_rebuild(int rate, const eq_settings_t *settings) {
 	bool rate_changed = rate != built_rate;
 	double max_boost = 0;
 	int active = 0;
@@ -1714,15 +1693,15 @@ static void filters_rebuild(int rate) {
 	// MSEB's gains stay out of max_boost: its level is settled by its own
 	// pre-gain, further down, on the algorithm the stock module uses.
 	for (int i = 0; i < MSEB_FILTERS; i++) {
-		double gain = mseb_enabled ? (double)mseb_value[MSEB_DEFS[i].slider] * MSEB_DEFS[i].db_per_step : 0.0;
+		double gain = settings->mseb_on ? (double)settings->mseb_value[MSEB_DEFS[i].slider] * MSEB_DEFS[i].db_per_step : 0.0;
 		slot_update(i, MSEB_DEFS[i].type, MSEB_DEFS[i].freq, gain, MSEB_DEFS[i].q, rate, rate_changed);
 		if (chain_active[i]) {
 			active++;
 		}
 	}
 	for (int i = 0; i < EQ_BANDS; i++) {
-		double gain = eq_enabled ? (double)band_tenths[i] / 10.0 : 0.0;
-		slot_update(MSEB_FILTERS + i, F_PEAK, eq_band_freq[i], gain, EQ_WIDTH_Q[eq_width], rate, rate_changed);
+		double gain = settings->eq_on ? (double)settings->eq_gain[i] : 0.0;
+		slot_update(MSEB_FILTERS + i, F_PEAK, eq_band_freq[i], gain, EQ_BAND_Q, rate, rate_changed);
 		if (chain_active[MSEB_FILTERS + i]) {
 			active++;
 			if (gain > max_boost) {
@@ -1731,23 +1710,14 @@ static void filters_rebuild(int rate) {
 		}
 	}
 
-	// Neighbouring bands overlap, the wider the more, and two boosted side by
-	// side rise above either: the curve's own peak is what has to fit.
-	if (eq_enabled) {
-		double peak = graphic_peak_db(rate);
-		if (peak > max_boost) {
-			max_boost = peak;
-		}
-	}
-
 	// The parametric. A band that is off still goes through slot_update with
 	// zero gain, so it keeps its place in the chain: turning it back on does
 	// not shift every other filter, which is what made the chain crackle when
 	// it changed shape under the fingers.
 	for (int i = 0; i < PEQ_BANDS; i++) {
-		const peq_band_t *b = &peq_bands[i];
+		const peq_band_t *b = &settings->peq_band[i];
 		int slot = PEQ_SLOT0 + i;
-		bool live = peq_enabled && b->on;
+		bool live = settings->peq_on && b->on;
 		int type = peq_filter_type(b->type);
 
 		// Low-pass and high-pass have no gain to zero, so they are switched off
@@ -1766,7 +1736,7 @@ static void filters_rebuild(int rate) {
 
 	// MSEB's own level, from its own bank. Its filters are the first thing the
 	// sample meets, and this is applied immediately in front of them.
-	mseb_pregain_db = mseb_auto_preamp_db(rate);
+	mseb_pregain_db = mseb_auto_preamp_db(rate, settings);
 	mseb_pregain_target = (float)pow(10.0, (double)mseb_pregain_db / 20.0);
 
 	// The anti-clip headroom (the stock's geq_pre_gain), for the graphic
@@ -1781,14 +1751,14 @@ static void filters_rebuild(int rate) {
 	// anywhere else. So the headroom only takes what a negative preamp has not
 	// already taken; a positive preamp, which guards nothing, is applied on top
 	// of the full headroom.
-	double manual = peq_enabled ? (double)peq_preamp_tenths / 10.0 : 0.0;
+	double manual = settings->peq_on ? (double)settings->preamp_tenths / 10.0 : 0.0;
 	pregain_target = (float)pow(10.0, headroom_db(max_boost, manual) / 20.0);
 	if (rate_changed) {
 		pregain = pregain_target;
 		mseb_pregain = mseb_pregain_target;
 	}
 
-	built_version = settings_version;
+	built_version = settings->version;
 	built_rate = rate;
 	fprintf(stderr, "eq: rebuilt (%d filters at %d Hz, mseb pregain %+.2f dB -> %.4f, geq/peq pregain -> %.3f)\n",
 			active, rate, (double)mseb_pregain_db, (double)mseb_pregain_target, (double)pregain_target);
@@ -1813,7 +1783,7 @@ int peq_response_tenths(int freq, int sample_rate) {
 		return 0;
 	}
 
-	double total_db = peq_enabled ? (double)peq_preamp_tenths / 10.0 : 0.0;
+	double total_db = peq_get_enabled() ? (double)peq_preamp_tenths / 10.0 : 0.0;
 	double w = 2.0 * M_PI * (double)freq / (double)sample_rate;
 
 	for (int i = 0; i < PEQ_BANDS; i++) {
@@ -1852,15 +1822,22 @@ int peq_response_tenths(int freq, int sample_rate) {
 #define EQ_HEADROOM_REFERENCE_RATE 44100
 
 int eq_auto_headroom_tenths(void) {
+	eq_settings_t settings = {0};
+	settings_capture_live(&settings);
 	double max_boost = 0;
-	double total = (double)mseb_auto_preamp_db(EQ_HEADROOM_REFERENCE_RATE);
+	double total = (double)mseb_auto_preamp_db(EQ_HEADROOM_REFERENCE_RATE, &settings);
 
-	if (eq_enabled) {
-		max_boost = graphic_peak_db(EQ_HEADROOM_REFERENCE_RATE);
+	if (settings.eq_on) {
+		for (int i = 0; i < EQ_BANDS; i++) {
+			double gain = (double)settings.eq_gain[i];
+			if (gain > max_boost) {
+				max_boost = gain;
+			}
+		}
 	}
-	if (peq_enabled) {
+	if (settings.peq_on) {
 		for (int i = 0; i < PEQ_BANDS; i++) {
-			const peq_band_t *b = &peq_bands[i];
+			const peq_band_t *b = &settings.peq_band[i];
 			if (!b->on || !filter_uses_gain(peq_filter_type(b->type))) {
 				continue;
 			}
@@ -1873,7 +1850,7 @@ int eq_auto_headroom_tenths(void) {
 
 	// Only the automatic part: the preamp has its own slider, and the page
 	// shows this beside it.
-	double manual = peq_enabled ? (double)peq_preamp_tenths / 10.0 : 0.0;
+	double manual = settings.peq_on ? (double)settings.preamp_tenths / 10.0 : 0.0;
 	total += headroom_db(max_boost, manual) - manual;
 
 	return (int)(total >= 0 ? total * 10.0 + 0.5 : total * 10.0 - 0.5);
@@ -2109,15 +2086,13 @@ static void chain_run_pass(int n, int channels, float step) {
 }
 
 static bool process_prepare(int frame_count, int channels, int sample_rate) {
-	if ((!eq_enabled && !mseb_enabled && !peq_enabled) || frame_count <= 0 || sample_rate <= 0) {
+	if (frame_count <= 0 || sample_rate <= 0 || channels > EQ_MAX_CHANNELS)
 		return false;
-	}
-	if (channels > EQ_MAX_CHANNELS) {
-		return false; // only mono/stereo hardware here
-	}
-	if (built_version != settings_version || built_rate != sample_rate) {
-		filters_rebuild(sample_rate);
-	}
+	settings_accept();
+	if (!audio_settings.eq_on && !audio_settings.mseb_on && !audio_settings.peq_on)
+		return false;
+	if (built_version != audio_settings.version || built_rate != sample_rate)
+		filters_rebuild(sample_rate, &audio_settings);
 	return true;
 }
 

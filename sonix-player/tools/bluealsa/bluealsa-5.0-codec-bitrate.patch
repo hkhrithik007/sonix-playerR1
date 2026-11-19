@@ -1,0 +1,125 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -401,7 +401,7 @@
+ 	test "x$prefix" = xNONE && AC_SUBST([localstatedir], [/var])
+ fi
+ 
+-AC_SUBST([localstoragedir], [$localstatedir/lib])
++AC_SUBST([localstoragedir], [/usr/data])
+ if test "$localstatedir" = "\${prefix}/var"; then
+ 	AC_SUBST([localstoragedir], [$prefix/var/lib])
+ fi
+--- a/src/ba-transport-pcm.h
++++ b/src/ba-transport-pcm.h
+@@ -117,6 +117,9 @@
+ 	unsigned int channels;
+ 	/* PCM sample rate */
+ 	unsigned int rate;
++
++	/* Encoded codec bitrate in bit/s, zero when unknown. Atomic access. */
++	int codec_bitrate;
+ 
+ 	/* Delay caused by the codec due to internal buffering. The delay is
+ 	 * expressed in 1/10 of millisecond. */
+@@ -237,6 +240,8 @@
+ 
+ bool ba_transport_pcm_is_active(const struct ba_transport_pcm *pcm);
+ 
++void ba_transport_pcm_codec_bitrate_set(struct ba_transport_pcm *pcm, unsigned int bitrate);
++
+ unsigned int ba_transport_pcm_volume_level_to_range(int value, int max);
+ int ba_transport_pcm_volume_range_to_level(int value, int max);
+ 
+--- a/src/ba-transport-pcm.c
++++ b/src/ba-transport-pcm.c
+@@ -75,6 +75,7 @@
+ 		bool master) {
+ 
+ 	pcm->t = t;
++	g_atomic_int_set(&pcm->codec_bitrate, 0);
+ 	pcm->mode = mode;
+ 	pcm->master = master;
+ 	pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+@@ -224,6 +225,9 @@
+ /**
+  * Transport IO thread cleanup function for pthread cleanup. */
+ void ba_transport_pcm_thread_cleanup(struct ba_transport_pcm *pcm) {
++
++	/* An ended encoder must not leave a stale measured bitrate. */
++	ba_transport_pcm_codec_bitrate_set(pcm, 0);
+ 
+ 	struct ba_transport *t = pcm->t;
+ 
+@@ -809,6 +813,15 @@
+ 
+ final:
+ 	return 0;
++}
++
++void ba_transport_pcm_codec_bitrate_set(struct ba_transport_pcm *pcm, unsigned int bitrate) {
++	if ((unsigned int)g_atomic_int_get(&pcm->codec_bitrate) == bitrate)
++		return;
++	g_atomic_int_set(&pcm->codec_bitrate, (int)bitrate);
++	/* No per-packet notification: publish only a changed encoded rate. */
++	if (pcm->ba_dbus_exported)
++		bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_CODEC_BITRATE);
+ }
+ 
+ const char *ba_transport_pcm_channel_to_string(
+--- a/src/bluealsa-dbus.h
++++ b/src/bluealsa-dbus.h
+@@ -29,6 +29,7 @@
+ #define BA_DBUS_PCM_UPDATE_SOFT_VOLUME      (1 << 8)
+ #define BA_DBUS_PCM_UPDATE_VOLUME           (1 << 9)
+ #define BA_DBUS_PCM_UPDATE_RUNNING          (1 << 10)
++#define BA_DBUS_PCM_UPDATE_CODEC_BITRATE    (1 << 11)
+ 
+ #define BA_DBUS_RFCOMM_UPDATE_FEATURES (1 << 0)
+ #define BA_DBUS_RFCOMM_UPDATE_BATTERY  (1 << 1)
+--- a/src/bluealsa-dbus.c
++++ b/src/bluealsa-dbus.c
+@@ -967,6 +967,8 @@
+ 		return ba_variant_new_pcm_channel_map(pcm);
+ 	if (strcmp(property, "Rate") == 0)
+ 		return ba_variant_new_pcm_rate(pcm);
++	if (strcmp(property, "CodecBitrate") == 0)
++		return g_variant_new_uint32((unsigned int)g_atomic_int_get(&pcm->codec_bitrate));
+ 	if (strcmp(property, "Codec") == 0) {
+ 		if ((value = ba_variant_new_pcm_codec(pcm)) == NULL)
+ 			goto unavailable;
+@@ -1134,6 +1136,9 @@
+ 		g_variant_builder_add(&props, "{sv}", "ChannelMap", ba_variant_new_pcm_channel_map(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_RATE)
+ 		g_variant_builder_add(&props, "{sv}", "Rate", ba_variant_new_pcm_rate(pcm));
++	if (mask & BA_DBUS_PCM_UPDATE_CODEC_BITRATE)
++		g_variant_builder_add(&props, "{sv}", "CodecBitrate",
++			g_variant_new_uint32((unsigned int)g_atomic_int_get(&pcm->codec_bitrate)));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CODEC)
+ 		g_variant_builder_add(&props, "{sv}", "Codec", ba_variant_new_pcm_codec(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CODEC_CONFIG)
+--- a/src/dbus/org.bluealsa.xml
++++ b/src/dbus/org.bluealsa.xml
+@@ -29,6 +29,8 @@
+ 		<property name="Channels" type="y" access="read" />
+ 		<property name="ChannelMap" type="as" access="read" />
+ 		<property name="Rate" type="u" access="read" />
++		<!-- Encoded codec bitrate in bit/s; zero means no measured rate. -->
++		<property name="CodecBitrate" type="u" access="read" />
+ 		<property name="Codec" type="s" access="read" />
+ 		<property name="CodecConfiguration" type="ay" access="read" />
+ 		<property name="Delay" type="q" access="read" />
+--- a/src/a2dp-ldac.c
++++ b/src/a2dp-ldac.c
+@@ -254,6 +254,12 @@
+ 					 * space in the BT socket. Set the queued_bytes to some
+ 					 * arbitrary big value. */
+ 					queued_bytes = 1024 * 16;
++
++				/* Read the frame just sent, before ABR chooses the next one.
++				 * Queue-pressure errno has already been consumed above. */
++				int bitrate = ldacBT_get_bitrate(handle);
++				ba_transport_pcm_codec_bitrate_set(t_pcm,
++					bitrate > 0 ? (unsigned int)bitrate * 1000U : 0);
+ 
+ 				if (config.ldac_abr)
+ 					ldac_ABR_Proc(handle, handle_abr, queued_bytes / t->mtu_write, 1);

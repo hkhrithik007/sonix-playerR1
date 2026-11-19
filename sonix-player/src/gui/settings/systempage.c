@@ -1,4 +1,5 @@
 #include "systempage.h"
+#include "src/gui/shell/sx_card.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,18 +7,21 @@
 
 #include "lvgl/lvgl.h"
 
-#include "src/gui/shell/confirm.h"
-#include "src/gui/shell/easteregg.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/settings/fwupdate.h"
+#include "src/gui/settings/recoverywizard.h"
 #include "src/gui/settings/settings.h"
+#include "src/gui/shell/confirm.h"
+#include "src/gui/shell/easteregg.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
-#include "src/system/core/config.h"
-#include "src/system/device/factoryreset.h"
 #include "src/system/audio/headset.h"
+#include "src/system/core/config.h"
 #include "src/system/core/lang.h"
+#include "src/system/device/factoryreset.h"
 #include "src/system/device/power.h"
 #include "src/system/device/sysinfo.h"
 #include "src/system/device/system.h"
@@ -64,6 +68,11 @@ static void firmware_clicked_cb(lv_event_t *e) {
 	fwupdate_show();
 }
 
+static void recovery_clicked_cb(lv_event_t *e) {
+	(void)e;
+	recoverywizard_open(NULL);
+}
+
 // ---------------------------------------------------------------------------
 // Factory reset
 //
@@ -81,8 +90,16 @@ static void factory_second_confirmed(void *user) {
 
 static void factory_first_confirmed(void *user) {
 	(void)user;
-	confirm_show("system_are_you_sure", "system_reset_confirm_note",
-				 "system_reset_2", factory_second_confirmed, NULL);
+	// The second sheet's button is the irreversible one: red (2.0, principle 6).
+	sx_sheet_t sheet = {
+		.title = tr("system_are_you_sure"),
+		.subtitle = tr("system_reset_confirm_note"),
+		.cancel_label = tr("cancel"),
+		.action_label = tr("system_reset_2"),
+		.action_destructive = true,
+		.on_action = factory_second_confirmed,
+	};
+	sx_sheet_open(&sheet);
 }
 
 static void factory_clicked_cb(lv_event_t *e) {
@@ -240,7 +257,7 @@ static void build_sysinfo_page(gui_config_t *cfg) {
 	lv_obj_set_width(sd_card, lv_pct(100));
 	lv_obj_set_height(sd_card, 116);
 	lv_obj_add_style(sd_card, &theme_style_card, 0);
-	lv_obj_set_style_radius(sd_card, 12, 0);
+	lv_obj_set_style_radius(sd_card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(sd_card, 0, 0);
 	lv_obj_set_style_shadow_width(sd_card, 0, 0);
 	lv_obj_set_style_pad_hor(sd_card, 20, 0);
@@ -297,10 +314,14 @@ void systempage_init(gui_config_t *cfg) {
 	build_sysinfo_page(cfg);
 
 	lv_obj_t *container = settingsrow_page(systempage_screen, cfg, "system");
+	container = sx_card_nav_group(container);
 
 	settingsrow_add(container, "system_about", NULL, switch_screen_cb, sysinfo_screen);
 	// Actions, not pages: settingsrow_action leaves off the chevron.
 	settingsrow_action(container, "system_update_firmware", firmware_clicked_cb, NULL);
+	if (strcmp(sysinfo_device_name(), "HiBy R1") == 0) {
+		settingsrow_action(container, "recovery_wizard_title", recovery_clicked_cb, NULL);
+	}
 	settingsrow_action(container, "system_factory_reset", factory_clicked_cb, NULL);
 
 	switcher_attach_back_gesture(systempage_screen);

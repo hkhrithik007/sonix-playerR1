@@ -294,6 +294,7 @@ extern int stb_vorbis_seek_start(stb_vorbis *f);
 // this function is equivalent to stb_vorbis_seek(f,0)
 
 extern unsigned int stb_vorbis_stream_length_in_samples(stb_vorbis *f);
+extern void stb_vorbis_set_file_length(stb_vorbis *f, unsigned int length);
 extern float stb_vorbis_stream_length_in_seconds(stb_vorbis *f);
 // these functions return the total length of the vorbis stream
 
@@ -5252,6 +5253,15 @@ unsigned int stb_vorbis_stream_length_in_samples(stb_vorbis *f) {
 		set_file_offset(f, restore_offset);
 	}
 	return f->total_samples == SAMPLE_unknown ? 0 : f->total_samples;
+}
+
+// Sonix: refresh the seek index after a growing file receives more pages.
+void stb_vorbis_set_file_length(stb_vorbis *f, unsigned int length) {
+	f->stream_len = length;
+	f->total_samples = 0;
+	f->eof = FALSE;
+	f->error = VORBIS__no_error;
+	memset(&f->p_last, 0, sizeof(f->p_last));
 }
 
 float stb_vorbis_stream_length_in_seconds(stb_vorbis *f) {

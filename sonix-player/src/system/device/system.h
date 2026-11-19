@@ -2,6 +2,8 @@
 #define SYSTEM_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
 	// Preferred block device, e.g. "/dev/mmcblk0p1". May be NULL: the player
@@ -60,8 +62,13 @@ void system_start_services(system_config_t *cfg, system_notification_cb_t notifi
 // The directory the card ended up mounted on, valid once
 // system_start_services() has returned. This is what the file browser should
 // read: hardcoding a path guesses wrong on firmwares that arrange the
-// /mnt -> /data/mnt -> /usr/data/mnt symlinks differently.
+// /mnt -> /data/mnt -> /usr/data/mnt symlinks differently. Returns NULL for a
+// missing managed mount or a card claimed by USB; host folders remain valid.
 const char *storage_sd_root(void);
+
+// Configured mount destination even when no filesystem is mounted there.
+// Only for mount/USB management; never use this as permission to write files.
+const char *storage_sd_mount_point(void);
 
 // Whether the card can be written to. False for a card mounted read-only -- an
 // NTFS one where ntfs-3g is not on the device, or an adapter with its
@@ -100,6 +107,43 @@ void storage_card_files_recheck(void);
 // under the export) and hardening each of them one at a time has not worked.
 void storage_recheck_card(void);
 
+// USB handoff, serialized with hotplug and the card supervisor. Release stops
+// local users and prevents remounts; false when shutdown already owns the card.
+// Resume may only run after the USB backing file is confirmed released. It
+// reopens local services only on a verified mount, never on its empty directory.
+bool storage_release_for_usb(void);
+void storage_resume_after_usb(void);
+
+// Pins the current card mount across a background save, including network
+// waits. The caller closes the returned directory fd on every exit. USB cannot
+// unmount it while held; admission is serialized with the USB claim.
+// Copies the stable root to out, or returns -1 without admitting the writer.
+int storage_pin_card(char *out, size_t size);
+
+// Process-lifetime managed ownership token. Zero is invalid. This is not an
+// fd lease or proof against external forced/lazy mount changes.
+typedef struct {
+	uint64_t epoch;
+} storage_card_token_t;
+
+// GUI-safe snapshot, no driver/filesystem I/O. Clears outputs on refusal.
+// Read-only ownership is admissible. Busy mutex is EAGAIN (unknown, not stale).
+bool storage_card_try_admit(storage_card_token_t *out, char *root, size_t size);
+
+// GUI-safe check: 0 if current; -1/EAGAIN if owner is busy; -1/ESTALE if
+// revoked/detached/claimed. Invalid zero tokens return -1/EINVAL.
+int storage_card_try_check(const storage_card_token_t *expected);
+
+// Worker-side exact-token conditional pin; close returned fd on every exit.
+// A stale token is never refreshed. No token requirement is added to legacy
+// storage_pin_card callers. The filesystem pin covers only the admitted mount.
+int storage_pin_card_if(const storage_card_token_t *expected);
+
+// Worker-only exact-token read pin. Locally owned read-only cards are allowed.
+// Close on every exit; no network waits or mutations may use this read pin.
+int storage_pin_card_read_if(const storage_card_token_t *expected);
+
+
 // Before the machine is powered off or rebooted: playback stops, everything
 // kept open on the card is closed, and the card is unmounted, or remounted
 // read-only when something still holds it. From then on nothing mounts it
@@ -107,6 +151,12 @@ void storage_recheck_card(void);
 // the card busy, which leaves FAT and exFAT with their volume-dirty flag set.
 // Call it last, after anything that still writes to the card.
 void storage_release_for_shutdown(void);
+
+// Firmware updates require a checked sync and ordinary unmount. On failure,
+// local services are restored and recovery must not be armed. Cancel releases
+// only this update's claim and restores the card after a later pre-reboot error.
+bool storage_prepare_for_update(void);
+void storage_cancel_update(void);
 
 // "Lock keys while the screen is off": with it on, volume down + power pressed
 // with the screen off locks the buttons on the case, and pressed again unlocks

@@ -28,7 +28,13 @@
 //     api_secret = ...
 //
 //     [listenbrainz]
-//     api_key = ... (the account's ListenBrainz user token)
+//     api_key = ... (ListenBrainz user token)
+//
+//     [yandex]
+//     client_id = ...
+//     client_secret = ...
+//     sign_key = ...
+//     client_header = X-Yandex-Music-Client: ...
 //
 // and shipped sealed, as /usr/resource/sonix/components/streaming-keys.bin, by
 // tools/seal_streamkeys.py. The key that opens it is not in the source: the
@@ -68,6 +74,15 @@ const char *streamkeys_tidal_client_secret(void);
 const char *streamkeys_podcast_key(void);
 const char *streamkeys_podcast_secret(void);
 const char *streamkeys_listenbrainz_key(void);
+
+// Yandex Music: the desktop application's OAuth client, the key that signs
+// get-file-info, and the X-Yandex-Music-Client header line it sends ("Name:
+// value", whole). Section [yandex]: client_id, client_secret, sign_key,
+// client_header.
+const char *streamkeys_yandex_client_id(void);
+const char *streamkeys_yandex_client_secret(void);
+const char *streamkeys_yandex_sign_key(void);
+const char *streamkeys_yandex_client_header(void);
 
 // Where they were read from, for the log and the information page. NULL when
 // none were found.

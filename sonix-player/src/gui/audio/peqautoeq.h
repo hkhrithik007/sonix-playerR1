@@ -12,6 +12,11 @@ lv_obj_t *peqautoeq_screen(void);
 void peqautoeq_open(void);
 void peqautoeq_set_reload_cb(void (*cb)(void));
 
+// GUI thread: drain retained terminal work from the existing main loop.
+void peqautoeq_service_completion(void);
+// GUI thread before process exit. Reject new work; no join or LVGL teardown.
+void peqautoeq_shutdown_completions(void);
+
 // Whether AutoEq can reach the network: Wi-Fi connected with an address.
 bool peqautoeq_network_ready(void);
 

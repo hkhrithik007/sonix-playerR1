@@ -13,7 +13,9 @@
 // whether it was streamed into the cache or kept in the Podcast folder: the
 // two are the same episode, and stopping one halfway must leave the other
 // halfway too. Any other file in the Podcast folder -- the ones copied there
-// by hand -- is identified by its path under the card.
+// by hand -- is identified by its path under the card. Imported Yandex/Zvuk
+// episodes instead use their service and episode ID from the sidecar; their
+// numeric IDs never collide with Podcast Index or with the other service.
 //
 // The row also holds the title, the podcast's name, its id and its artwork,
 // as they were when the episode last played: "Continue listening" draws from
@@ -21,8 +23,8 @@
 // is gone from the card by the next boot.
 
 typedef struct {
-	char path[512];						// absolute: its file in the Podcast folder when it has one,
-										// otherwise the file it last played from; "" if unknown
+	char path[512]; // absolute: its file in the Podcast folder when it has one,
+					// otherwise the file it last played from; "" if unknown
 	char title[PODCAST_TITLE_MAX];
 	char show[PODCAST_TITLE_MAX];		// the podcast's name
 	char image[PODCAST_URL_MAX];		// the podcast's artwork address, for an episode of the catalogue
@@ -76,10 +78,13 @@ void podcaststate_forget(const char *path);
 // An episode of the catalogue that has a file in the Podcast folder: its row,
 // when it has one, points there from now on. Called when a download completes
 // and for files saved before that was done.
-void podcaststate_downloaded(long long episode_id, const char *path);
+// Pass the epoch captured before the download started.
+unsigned podcaststate_card_epoch(void);
+void podcaststate_downloaded(long long episode_id, const char *path, unsigned epoch);
 
 // Every row whose file is inside `folder` (absolute), and every row of the
 // podcast `feed_id`. The callback runs once per row, on the caller's thread.
+// Callbacks run under the database lock and must not reenter podcaststate.
 // Return how many rows were delivered.
 typedef void (*podcaststate_cb_t)(const podcaststate_t *state, void *user);
 int podcaststate_in_folder(const char *folder, podcaststate_cb_t cb, void *user);

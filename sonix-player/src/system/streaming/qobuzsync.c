@@ -2,7 +2,12 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "src/system/streaming/qobuzcache.h"
+#include "src/system/streaming/provider.h"
 
 #include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
@@ -21,6 +26,17 @@ static bool favorites_loaded;
 static qobuz_playlist_t playlists[QOBUZSYNC_PLAYLISTS_MAX];
 static int playlists_count;
 static bool playlists_loaded;
+
+// When a failed load of the favourites may be retried (monotonic seconds; see
+// the worker). Under `lock`.
+static long load_retry_after;
+#define LOAD_RETRY_SECS 60
+
+static long monotonic_secs(void) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long)now.tv_sec;
+}
 
 // ---------------------------------------------------------------------------
 // the mirror
@@ -72,6 +88,7 @@ void qobuzsync_forget(void) {
 	pthread_mutex_lock(&lock);
 	favorites_count = 0;
 	favorites_loaded = false;
+	load_retry_after = 0; // another account: ask at once
 	playlists_count = 0;
 	playlists_loaded = false;
 	pthread_mutex_unlock(&lock);
@@ -80,10 +97,17 @@ void qobuzsync_forget(void) {
 // ---------------------------------------------------------------------------
 // the worker
 //
-// One thread, one queue slot. Submitting while a job is already waiting
-// replaces it: these are user taps, and the last one wins. A job already
-// running is always finished -- aborting a request that writes to the account
-// halfway through would leave its state unknown.
+// One thread and a short queue, as in subsonicsync.c and yandexsync.c. It used
+// to be a single slot where a newer job replaced one still waiting, on the
+// idea that these are taps and the last one wins -- but they are not all the
+// same tap. A star on one track replaced by a star on the next lost the first
+// write while its star stayed filled; a star replaced by the favourites load
+// (which the star asks for on every redraw) lost it the same way; and the load
+// that did run installed the account's list over the star just tapped, so it
+// emptied under the finger. Now jobs run in order, one load at a time is
+// queued, and the stars still waiting are put back over a list that has just
+// arrived. A job already running is always finished: aborting a request that
+// writes to the account halfway through would leave its state unknown.
 // ---------------------------------------------------------------------------
 
 typedef enum {
@@ -109,25 +133,46 @@ typedef struct {
 	void (*changed)(void);
 } job_t;
 
+#define QUEUE_MAX 8
+
 static pthread_mutex_t job_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t job_ready = PTHREAD_COND_INITIALIZER;
-static job_t pending;
-static bool have_pending;
+static job_t queue[QUEUE_MAX];
+static int queue_head;
+static int queue_len;
+static bool load_queued; // a favourites load is waiting or running: one is enough
 static bool worker_started;
 
 static void do_favorites_load(const job_t *job) {
 	long ids[FAVORITES_MAX];
 	int count = qobuz_favorite_track_ids(ids, FAVORITES_MAX);
 	if (count < 0) {
-		printf("qobuzsync: favorites not read: %s\n", qobuz_last_error());
+		printf("qobuzsync: favorites not read: %s; next try in %d s\n", qobuz_last_error(), LOAD_RETRY_SECS);
+		pthread_mutex_lock(&lock);
+		load_retry_after = monotonic_secs() + LOAD_RETRY_SECS;
+		pthread_mutex_unlock(&lock);
 		return;
 	}
 
+	// job_lock before lock, the one order both are ever held in.
+	pthread_mutex_lock(&job_lock);
 	pthread_mutex_lock(&lock);
 	memcpy(favorites, ids, sizeof(long) * (size_t)count);
 	favorites_count = count;
 	favorites_loaded = true;
+	// A star tapped while the list was on its way is still in the queue, not
+	// on the account: the list just installed does not have it, and showing
+	// that would flip the star back under the user's finger -- for good, since
+	// a write that succeeds does not touch the mirror. The taps win until they
+	// are sent.
+	for (int i = 0; i < queue_len; i++) {
+		const job_t *q = &queue[(queue_head + i) % QUEUE_MAX];
+		if (q->kind == JOB_FAVORITE_TOGGLE) {
+			mirror_set_locked(q->track_id, q->want);
+		}
+	}
 	pthread_mutex_unlock(&lock);
+	pthread_mutex_unlock(&job_lock);
 
 	printf("qobuzsync: %d favorite tracks\n", count);
 	if (job->changed) {
@@ -213,20 +258,31 @@ static void do_playlist_remove(const job_t *job) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
-	thread_be_background("qobuz sync");
+	// Nice ten, not SCHED_IDLE. A star is a tap waiting for its answer, and
+	// with Bluetooth encoding and a track decoding the core is 0 to 20 % idle:
+	// an idle-class thread then gets well under one percent of it, the request
+	// took minutes, and the star flipped back meanwhile. That is how Yandex's
+	// likes failed in 1.2.3 (see yandexsync.c).
+	thread_be_low_priority("qobuz sync");
 
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (!have_pending) {
+		while (queue_len == 0) {
 			pthread_cond_wait(&job_ready, &job_lock);
 		}
-		job_t job = pending;
-		have_pending = false;
+		job_t job = queue[queue_head];
+		queue_head = (queue_head + 1) % QUEUE_MAX;
+		queue_len--;
 		pthread_mutex_unlock(&job_lock);
 
 		switch (job.kind) {
 		case JOB_FAVORITES_LOAD:
 			do_favorites_load(&job);
+			// Only now: while a load runs, the redraws that ask for the
+			// mirror must not queue a second one behind it.
+			pthread_mutex_lock(&job_lock);
+			load_queued = false;
+			pthread_mutex_unlock(&job_lock);
 			break;
 		case JOB_FAVORITE_TOGGLE:
 			do_favorite_toggle(&job);
@@ -268,8 +324,34 @@ static void submit(const job_t *job) {
 			return;
 		}
 	}
-	pending = *job;
-	have_pending = true;
+	if (queue_len == QUEUE_MAX) {
+		// Full: the oldest waiting job goes. Eight writes waiting means the
+		// service has stopped answering, and the newest tap is the one that
+		// matters.
+		const job_t *dropped = &queue[queue_head];
+		if (dropped->kind == JOB_FAVORITES_LOAD) {
+			load_queued = false;
+		} else if (dropped->kind == JOB_FAVORITE_TOGGLE) {
+			// Never sent: the star goes back to what the account says --
+			// unless a later tap on the same track is still waiting, which
+			// will say it.
+			bool later = false;
+			for (int i = 1; i < queue_len && !later; i++) {
+				const job_t *q = &queue[(queue_head + i) % QUEUE_MAX];
+				later = q->kind == JOB_FAVORITE_TOGGLE && q->track_id == dropped->track_id;
+			}
+			if (!later) {
+				mirror_set(dropped->track_id, !dropped->want);
+			}
+		}
+		queue_head = (queue_head + 1) % QUEUE_MAX;
+		queue_len--;
+	}
+	if (job->kind == JOB_FAVORITES_LOAD) {
+		load_queued = true;
+	}
+	queue[(queue_head + queue_len) % QUEUE_MAX] = *job;
+	queue_len++;
 	pthread_cond_signal(&job_ready);
 	pthread_mutex_unlock(&job_lock);
 }
@@ -280,6 +362,17 @@ static void submit(const job_t *job) {
 
 void qobuzsync_favorites_refresh(void (*done)(void)) {
 	if (!qobuz_logged_in() || qobuzsync_favorites_known()) {
+		return;
+	}
+	// Asked on every redraw of the star: one load waiting is enough, and one
+	// that failed is not asked for again at once.
+	pthread_mutex_lock(&job_lock);
+	bool waiting = load_queued;
+	pthread_mutex_unlock(&job_lock);
+	pthread_mutex_lock(&lock);
+	bool resting = monotonic_secs() < load_retry_after;
+	pthread_mutex_unlock(&lock);
+	if (waiting || resting) {
 		return;
 	}
 	job_t job = {.kind = JOB_FAVORITES_LOAD, .changed = done};
@@ -356,3 +449,83 @@ int qobuzsync_playlists(qobuz_playlist_t *out, int max) {
 	pthread_mutex_unlock(&lock);
 	return count;
 }
+
+// ---------------------------------------------------------------------------
+// the service, as the rest of the program sees it (provider.h)
+//
+// Thin adapters: the provider speaks in paths and text ids, Qobuz in numeric
+// track ids and playlist numbers. The path -> id step is qobuzcache_track_id(),
+// pure string work, so doing it on every call costs nothing.
+// ---------------------------------------------------------------------------
+
+static bool provider_downloading(void) { return qobuzcache_downloading_id() > 0; }
+
+static bool provider_is_track(const char *path) { return qobuzcache_track_id(path) > 0; }
+
+static bool provider_fav_get(const char *path) { return qobuzsync_is_favorite(qobuzcache_track_id(path)); }
+
+static void provider_fav_toggle(const char *path, bool want, stream_provider_done_cb done, void *user) {
+	qobuzsync_favorite_toggle(qobuzcache_track_id(path), want, done, user);
+}
+
+static int provider_playlists(stream_provider_playlist_t *out, int max) {
+	if (!out || max <= 0) {
+		return 0;
+	}
+	if (max > QOBUZSYNC_PLAYLISTS_MAX) {
+		max = QOBUZSYNC_PLAYLISTS_MAX;
+	}
+	// Borrowed for the copy: the service's own records are large (cover URLs)
+	// and the picker only needs three fields of each.
+	qobuz_playlist_t *got = malloc(sizeof(*got) * (size_t)max);
+	if (!got) {
+		return 0;
+	}
+	int count = qobuzsync_playlists(got, max);
+	for (int i = 0; i < count; i++) {
+		snprintf(out[i].id, sizeof(out[i].id), "%ld", got[i].id);
+		snprintf(out[i].name, sizeof(out[i].name), "%s", got[i].name);
+		out[i].track_count = got[i].track_count;
+	}
+	free(got);
+	return count;
+}
+
+static void provider_playlist_add(const char *playlist_id, const char *path, stream_provider_done_cb done, void *user) {
+	long id = playlist_id ? strtol(playlist_id, NULL, 10) : 0;
+	if (id <= 0) {
+		return;
+	}
+	qobuzsync_playlist_add(id, qobuzcache_track_id(path), done, user);
+}
+
+static void provider_playlist_create_with(const char *name, const char *path, stream_provider_done_cb done,
+										  void *user) {
+	qobuzsync_playlist_create_with(name, qobuzcache_track_id(path), done, user);
+}
+
+static stream_provider_t provider = {
+	.id = "qobuz",
+	.set_root = qobuzcache_set_root,
+	.cache_dir = qobuzcache_dir,
+	.owns_path = qobuzcache_owns,
+	.downloading = provider_downloading,
+	.network_wanted = qobuzcache_network_wanted,
+	.clear_on_exit = qobuzcache_clear_on_exit,
+	.is_track = provider_is_track,
+	.fav_get = provider_fav_get,
+	.fav_refresh = qobuzsync_favorites_refresh,
+	.fav_toggle = provider_fav_toggle,
+	.fav_failed_key = "qobuz_favourites_failed",
+	.album_id = qobuzcache_album_id,
+	.album_failed_key = "trackmenu_qobuz_album_failed",
+	.playlists_known = qobuzsync_playlists_known,
+	.playlists_refresh = qobuzsync_playlists_refresh,
+	.playlists = provider_playlists,
+	.playlist_add = provider_playlist_add,
+	.playlist_create_with = provider_playlist_create_with,
+	.playlist_title_key = "playlist_qobuz_playlist",
+	.change_refused_key = "qobuz_change_refused",
+};
+
+void qobuzsync_register_provider(void) { stream_provider_register(&provider); }

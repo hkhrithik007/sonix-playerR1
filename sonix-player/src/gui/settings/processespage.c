@@ -6,6 +6,7 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 
@@ -111,7 +112,7 @@ static void add_proc_row(const char *name, long rss_kb) {
 	lv_obj_set_width(card, lv_pct(100));
 	lv_obj_set_height(card, LV_SIZE_CONTENT);
 	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 12, 0);
+	lv_obj_set_style_radius(card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_hor(card, 18, 0);
@@ -234,7 +235,7 @@ static void refresh_clicked_cb(lv_event_t *e) {
 	rebuild();
 }
 
-void processespage_init(gui_config_t *cfg) {
+static void build(gui_config_t *cfg) {
 	page_container = settingsrow_page(processespage_screen, cfg, "processes");
 
 	// The top-right icon, like the other page corner buttons.
@@ -260,7 +261,7 @@ void processespage_init(gui_config_t *cfg) {
 	lv_obj_set_width(ram_card, lv_pct(100));
 	lv_obj_set_height(ram_card, LV_SIZE_CONTENT);
 	lv_obj_add_style(ram_card, &theme_style_card, 0);
-	lv_obj_set_style_radius(ram_card, 12, 0);
+	lv_obj_set_style_radius(ram_card, SX_CARD_R, 0);
 	lv_obj_set_style_border_width(ram_card, 0, 0);
 	lv_obj_set_style_shadow_width(ram_card, 0, 0);
 	lv_obj_set_style_pad_all(ram_card, 18, 0);
@@ -291,3 +292,10 @@ void processespage_init(gui_config_t *cfg) {
 	rebuild();
 	lv_obj_add_event_cb(processespage_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 }
+
+// Built on the first visit rather than at boot (see gui_page_defer): the page is
+// two levels down in Developer options and most players never open it, yet its
+// rows and the process list it fills at once are close to two hundred objects.
+// Nothing outside reaches into it -- the devoptions row holds only the screen
+// pointer, which exists from gui_init() on -- so there is nothing to guard.
+void processespage_init(gui_config_t *cfg) { gui_page_defer(processespage_screen, build); }

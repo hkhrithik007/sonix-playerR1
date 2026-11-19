@@ -9,9 +9,9 @@ alac_file *create_alac(int samplesize, int numchannels);
  * alac.c. */
 void free_alac(alac_file *alac);
 void decode_frame(alac_file *alac,
-                  unsigned char *inbuffer,
+                  const unsigned char *inbuffer, int input_bytes,
                   void *outbuffer, int *outputsize);
-void alac_set_info(alac_file *alac, char *inputbuffer);
+int alac_set_info(alac_file *alac, char *inputbuffer);
 
 #endif /* __ALAC__DECOMP_H */
 

@@ -141,6 +141,13 @@ typedef struct {
 	// for a radio station, and almost never for a downloaded file.
 	long content_length;
 
+	// Where in the resource the body starts: the `from` of a ranged open the
+	// server honoured with a 206, 0 otherwise. And the whole resource's size
+	// when known -- from Content-Range on a 206, from Content-Length on a
+	// 200 -- or 0. For an ordinary open the two are 0 and content_length.
+	long range_start;
+	long total_length;
+
 	// Body bytes already read while parsing the headers. The first read has
 	// to hand these back before touching the socket again.
 	//
@@ -170,6 +177,29 @@ typedef struct {
 // fails, or the status is not 200.
 bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs);
 
+// The same, asking for the resource from byte `from` on (Range: bytes=from-),
+// for resuming a download. A 206 is accepted only when its Content-Range starts
+// at `from`; a 200 is accepted too -- a server need not do ranges -- and then
+// the body starts at 0, which range_start says. No ICY metadata is requested:
+// this is for files, not radios. `from` 0 is an ordinary open.
+bool http_stream_open_range(http_stream_t *st, const char *url, long from, int timeout_secs);
+
+// Reads and discards `count` bytes, advancing range_start by as many. For a
+// resume the server answered with the whole body (a 200 to a Range): the bytes
+// already on disk are read past rather than written again, because the file is
+// being decoded while it grows and rewriting its beginning under the decoder,
+// or truncating it, is exactly what must not happen. Interruptible by
+// http_stream_wake() like any read. False when the stream ends first.
+bool http_stream_skip(http_stream_t *st, long count);
+
+// Resumes a download that holds `have` bytes: a ranged open, and when the
+// server answers with the whole body instead, the first `have` bytes are read
+// and thrown away, so that either way the next read returns byte `have` and
+// range_start is `have`. That keeps a file being decoded while it grows
+// intact: nothing already written is touched. False when the open fails or the
+// stream ends before `have`; the stream is closed then.
+bool http_stream_resume(http_stream_t *st, const char *url, long have, int timeout_secs);
+
 // Reads up to `len` bytes of *audio* into buf: any ICY metadata blocks in the
 // way are consumed and parsed out, never handed to the caller. Returns the
 // number of bytes read, 0 at end of stream, -1 on error.
@@ -198,6 +228,67 @@ void http_stream_wake(http_stream_t *st);
 // Per thread on purpose: the radio's directory worker and its playback thread
 // both use this file and must not overwrite each other's answer.
 const char *http_last_error(void);
+
+// What became of the last request made by THIS thread (http_request and its
+// wrappers, or a stream open): whether it got an answer, with what status, and
+// where it failed when it did not. Unlike http_last_error() this is always
+// filled in, sentence or not -- it is what a caller classifies to tell the
+// user "no Wi-Fi" or "the server is not responding" instead of a number (see
+// streamerr.h), and what the log names the request by.
+typedef enum {
+	HTTP_FAIL_NONE = 0, // an answer came; `status` says which
+	HTTP_FAIL_ADDRESS,	// the URL could not be used
+	HTTP_FAIL_DNS,		// the name did not resolve
+	HTTP_FAIL_CONNECT,	// refused, unreachable, or no answer within the timeout
+	HTTP_FAIL_TLS,		// the handshake failed (http_last_error() says why)
+	HTTP_FAIL_TIMEOUT,	// connected, then silence past the timeout
+	HTTP_FAIL_BROKEN,	// the connection dropped, or the answer was cut short
+} http_fail_t;
+
+typedef struct {
+	http_fail_t fail;
+	int status;	   // the last status received, 0 when none was
+	char host[64]; // which server
+	char path[160]; // which request, WITHOUT the query: tokens travel there
+} http_outcome_t;
+
+void http_last_outcome(http_outcome_t *out);
+
+// Clears it, for a caller about to start something that may fail before any
+// request is made (no account, no keys): the facts of an older request must
+// not be read as this one's.
+void http_forget_outcome(void);
+
+// A ceiling on the timeout of every http_request() made by the calling thread
+// from now on (0 removes it). For a thread whose requests the interface waits
+// on -- a streaming page's worker, behind its spinner -- so that a server that
+// does not answer is reported in seconds, while the same API calls made by a
+// background sync thread keep their longer patience. Streams (downloads, radio)
+// are not affected.
+void http_set_thread_timeout_cap(int secs);
+
+// Optional response-body ceiling for this thread's API requests (0 disables).
+// Useful for concurrent small previews. Does not affect streaming downloads.
+void http_set_thread_body_cap(size_t bytes);
+
+// Changes the receive timeout of an open stream. A download opens with a
+// generous timeout -- a CDN can take a while to start sending a big file --
+// and then reads with a shorter one, so that a connection that has died
+// silently (Wi-Fi gone, a NAT that forgot it) is noticed and resumed in
+// seconds rather than sat out.
+void http_stream_set_read_timeout(http_stream_t *st, int secs);
+
+// The Content-Type of the last answer an http_request() on THIS thread got
+// (empty when it sent none): what a JSON API that may answer with an HTML page
+// instead -- an anti-bot filter's challenge -- is diagnosed by.
+const char *http_last_content_type(void);
+
+// Headers every stream opened by THIS thread from now on sends as well, lines
+// already terminated with "\r\n" (NULL: none). A User-Agent or an Accept among
+// them replaces the default one. The string is the caller's and must outlive
+// the streams. For a CDN that wants the same browser the API was talked to
+// with (zvukcache.c). The same rule applies to http_request()'s extra_headers.
+void http_set_thread_stream_headers(const char *headers);
 
 // Percent-encodes `in` into `out` for use inside a URL path segment or query
 // value. Returns out.

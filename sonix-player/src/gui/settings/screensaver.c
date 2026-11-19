@@ -1,4 +1,5 @@
 #include "screensaver.h"
+#include "src/gui/shell/artview.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +10,6 @@
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/clocklabel.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/scrolltext.h"
@@ -190,8 +190,8 @@ static void drop_next(void) {
 }
 
 static void drop_image(void) {
-	cover_free(&image_pic);
-	cover_free(&image_strip);
+	sx_artview_release_cover(&image_pic);
+	sx_artview_release_cover(&image_strip);
 	image_file[0] = '\0';
 }
 
@@ -212,7 +212,21 @@ void screensaver_set_enabled(bool on) {
 // what it shows
 // ---------------------------------------------------------------------------
 
-static void refresh_clock(void) { clocklabel_refresh(clock_label); }
+static void refresh_clock(void) {
+	if (!clock_label) {
+		return;
+	}
+	if (!clock_is_set()) {
+		lv_label_set_text(clock_label, "--:--");
+		return;
+	}
+	time_t now = time(NULL);
+	struct tm local;
+	localtime_r(&now, &local);
+	char text[16];
+	clock_format_hm(text, sizeof(text), local.tm_hour, local.tm_min);
+	lv_label_set_text(clock_label, text);
+}
 
 // What refresh_content() last drew, so the tick below can tell an idle moment
 // from a track that changed while the screensaver was up.
@@ -248,6 +262,7 @@ static void clock_timer_cb(lv_timer_t *timer) {
 		return;
 	}
 
+	sx_artview_refresh();
 	refresh_clock();
 }
 
@@ -259,10 +274,12 @@ static void promote_next(void) {
 	if (!next_ready) {
 		return;
 	}
+	sx_artview_detach(cover_img);
 	lv_image_set_src(cover_img, NULL);
+	sx_artview_detach(info_strip);
 	lv_obj_set_style_bg_image_src(info_strip, NULL, 0);
-	cover_free(&image_pic);
-	cover_free(&image_strip);
+	sx_artview_release_cover(&image_pic);
+	sx_artview_release_cover(&image_strip);
 	image_pic = next_pic;
 	image_strip = next_strip;
 	snprintf(image_file, sizeof(image_file), "%s", next_file);
@@ -278,25 +295,27 @@ static void draw_from_folder(void) {
 	set_strip_height(DEFAULT_STRIP_H);
 
 	if (image_pic.pixels) {
-		lv_image_set_src(cover_img, &image_pic.dsc);
+		lv_obj_set_hidden(cover_img, false);
+		sx_artview_bind(cover_img, &image_pic.dsc, image_pic.display_generation);
 		// Already built at screen size by cover_load_screensaver_images: no
 		// zoom to apply, and none to leave over from the album source.
 		lv_image_set_scale(cover_img, 256);
-		lv_obj_set_hidden(cover_img, false);
 		lv_obj_set_hidden(cover_placeholder, true);
 	} else {
 		// An empty folder, or a card that is not there. The note in the middle
 		// of a black screen, which is what the album source shows for a track
 		// with no artwork -- the same screen, missing the same thing.
+		sx_artview_detach(cover_img);
 		lv_image_set_src(cover_img, NULL);
 		lv_obj_set_hidden(cover_img, true);
 		lv_obj_set_hidden(cover_placeholder, false);
 	}
 
 	if (image_strip.pixels) {
-		lv_obj_set_style_bg_image_src(info_strip, &image_strip.dsc, 0);
+		sx_artview_bind_background(info_strip, &image_strip.dsc, image_strip.display_generation);
 		lv_obj_set_style_bg_opa(info_strip, LV_OPA_TRANSP, 0);
 	} else {
+		sx_artview_detach(info_strip);
 		lv_obj_set_style_bg_image_src(info_strip, NULL, 0);
 		lv_obj_set_style_bg_color(info_strip, lv_color_black(), 0);
 		lv_obj_set_style_bg_opa(info_strip, LV_OPA_60, 0);
@@ -363,7 +382,7 @@ static void refresh_content(void) {
 
 	const lv_image_dsc_t *cover = shown_cover;
 	if (cover) {
-		lv_image_set_src(cover_img, cover);
+		sx_artview_bind(cover_img, cover, player_cover_generation());
 		// Fill the whole area above the strip, cropping the overflow: a
 		// letterboxed cover with black bars would look like a bug, not a
 		// screensaver.
@@ -373,21 +392,24 @@ static void refresh_content(void) {
 		lv_obj_set_hidden(cover_img, false);
 		lv_obj_set_hidden(cover_placeholder, true);
 	} else {
+		sx_artview_detach(cover_img);
 		lv_image_set_src(cover_img, NULL);
 		lv_obj_set_hidden(cover_img, true);
 		lv_obj_set_hidden(cover_placeholder, false);
 	}
 
 	if (backdrop) {
-		lv_obj_set_style_bg_image_src(info_strip, backdrop, 0);
+		sx_artview_bind_background(info_strip, backdrop, player_backdrop_generation());
 		lv_obj_set_style_bg_opa(info_strip, LV_OPA_TRANSP, 0);
 	} else {
 		// No artwork at all: a plain dark strip carries the text instead.
+		sx_artview_detach(info_strip);
 		lv_obj_set_style_bg_image_src(info_strip, NULL, 0);
 		lv_obj_set_style_bg_color(info_strip, lv_color_black(), 0);
 		lv_obj_set_style_bg_opa(info_strip, LV_OPA_60, 0);
 	}
 
+	sx_artview_refresh();
 	refresh_clock();
 }
 
@@ -409,6 +431,7 @@ void screensaver_show(void) {
 	lv_obj_set_y(saver, 0);
 	lv_obj_set_hidden(saver, false);
 	lv_obj_move_foreground(saver);
+	sx_artview_opaque_overlay(saver);
 	lv_timer_resume(clock_timer);
 }
 
@@ -422,12 +445,15 @@ static void finish_hide(void) {
 	// and nothing here may still be pointing at them by then. The picture owned
 	// here goes too -- about a megabyte, and the device is in use again, which
 	// is exactly when that megabyte is worth having back.
+	sx_artview_detach(cover_img);
 	lv_image_set_src(cover_img, NULL);
+	sx_artview_detach(info_strip);
 	lv_obj_set_style_bg_image_src(info_strip, NULL, 0);
 	drop_image();
 	// The one being prepared goes too. It is another megabyte, the device is in
 	// use again, and the next screen-off asks for a fresh one anyway.
 	drop_next();
+	sx_artview_opaque_overlay(player_sheet_is_open() && lv_obj_get_y(player_screen) == 0 ? player_screen : NULL);
 	power_notify_activity(); // dismissing it counts as using the device
 }
 
@@ -445,6 +471,7 @@ static void slide_done_cb(lv_anim_t *a) {
 		finish_hide();
 	} else {
 		lv_obj_set_y(saver, 0); // exactly home, whatever the last frame did
+		sx_artview_opaque_overlay(saver);
 	}
 }
 
@@ -453,6 +480,8 @@ static void slide_done_cb(lv_anim_t *a) {
 static void slide_to(int y) {
 	lv_anim_delete(saver, anim_y_cb);
 	sliding_out = (y != 0);
+	if (sliding_out)
+		sx_artview_opaque_overlay(NULL);
 	lv_anim_t a;
 	lv_anim_init(&a);
 	lv_anim_set_var(&a, saver);
@@ -508,9 +537,11 @@ void screensaver_release_artwork(void) {
 	shown_file[0] = '\0';
 	// Whatever happens next, nothing here may still be pointing at the
 	// player's buffers when it frees them.
+	sx_artview_detach(cover_img);
 	lv_image_set_src(cover_img, NULL);
 	lv_obj_set_hidden(cover_img, true);
 	lv_obj_set_hidden(cover_placeholder, false);
+	sx_artview_detach(info_strip);
 	lv_obj_set_style_bg_image_src(info_strip, NULL, 0);
 	lv_obj_set_style_bg_color(info_strip, lv_color_black(), 0);
 	lv_obj_set_style_bg_opa(info_strip, LV_OPA_60, 0);
@@ -558,6 +589,7 @@ static void drag_cb(lv_event_t *e) {
 				return; // not (yet) an upward drag
 			}
 			engaged = true;
+			sx_artview_opaque_overlay(NULL);
 		}
 		// Only upward: dragging down does not pull it off the bottom.
 		lv_obj_set_y(saver, dy < 0 ? dy : 0);
@@ -665,7 +697,8 @@ void screensaver_init(gui_config_t *cfg) {
 	scrolltext_apply(artist_label);
 
 	// The time, in the largest figures the screen has.
-	clock_label = clocklabel_create(info_strip, &font_ui_72, 72, &font_ui_32, 32);
+	clock_label = lv_label_create(info_strip);
+	lv_obj_set_style_text_font(clock_label, &font_ui_72, 0);
 	lv_obj_set_style_text_color(clock_label, lv_color_white(), 0);
 	lv_obj_set_style_pad_top(clock_label, 6, 0);
 

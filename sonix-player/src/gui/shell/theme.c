@@ -1,6 +1,9 @@
 #include "theme.h"
 
-#include "src/system/device/bootlogo.h"
+#include "src/gui/shell/artview.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_styles.h"
 #include "src/system/core/config.h"
 
 #include <stdio.h>
@@ -18,64 +21,51 @@ lv_style_t theme_style_switch_checked; // switch indicator, on state
 lv_style_t theme_style_accent_bg;	   // anything that must follow the accent
 lv_style_t theme_style_slider_track;   // a slider's unfilled part
 
-// Spotify-inspired dark palette: near-black canvas, charcoal cards and the
-// familiar green playback accent.
-static theme_palette_t palette_dark = {
-	.screen_bg = LV_COLOR_MAKE(18, 18, 18),
-	.surface = LV_COLOR_MAKE(40, 40, 40),
-	.surface_pressed = LV_COLOR_MAKE(58, 58, 58),
-	.panel = LV_COLOR_MAKE(24, 24, 24),
-	.cover_bg = LV_COLOR_MAKE(24, 24, 24),
-	.text_primary = LV_COLOR_MAKE(255, 255, 255),
-	.text_secondary = LV_COLOR_MAKE(179, 179, 179),
-	.accent = LV_COLOR_MAKE(30, 215, 96),
-	.dark = true,
-};
+// The two palettes theme() hands out. Since 2.0 they are not presets any more
+// but views of sx_palette.c's colours (see rebuild_active): the fields keep
+// their names and meanings, so the hundred-odd places that read theme()->accent
+// or theme()->surface carry on, now in the cover's colours.
+static theme_palette_t palette_dark = {.dark = true};
+static theme_palette_t palette_light = {.dark = false};
 
-// Light mode stays neutral while sharing the Spotify green accent.
-static theme_palette_t palette_light = {
-	// The window is pushed further from white than stock Adwaita's #fafafa:
-	// on this panel white cards on a #fafafa window are indistinguishable, so
-	// the window is a light grey and the pressed state a step deeper.
-	.screen_bg = LV_COLOR_MAKE(236, 237, 240),
-	.surface = LV_COLOR_MAKE(255, 255, 255),
-	.surface_pressed = LV_COLOR_MAKE(221, 223, 228),
-	.panel = LV_COLOR_MAKE(255, 255, 255),
-	.cover_bg = LV_COLOR_MAKE(224, 226, 230),
-	.text_primary = LV_COLOR_MAKE(50, 50, 50),
-	.text_secondary = LV_COLOR_MAKE(115, 115, 115),
-	.accent = LV_COLOR_MAKE(30, 215, 96),
-	.dark = false,
-};
-
-// Whether the dark preset is the chosen one, kept apart from `active` because
-// with the dynamic tint on `active` points at a derived copy rather than at
-// either preset.
+// Whether the dark theme is the chosen one.
 static bool dark_selected = true;
 
-// The dynamic tint: the neutral colours -- backgrounds, cards, the status bar
-// -- borrow the accent's hue, the way Material You colours a system from one
-// seed. Off by default, remembered in the config.
+// "Tint from cover" (Appearance; was "Dynamic tint" before 2.0): the
+// backgrounds, cards and the status bar take the cover's hue when enabled.
+// Existing choices are retained; Graphite starts with neutral surfaces.
 static bool dynamic_tint;
-
-// The tinted copy of whichever preset is chosen. Rebuilt on every theme,
-// accent or tint change; `active` points here while the tint is on.
-static theme_palette_t tinted;
+static int palette_family, lcd_lamp;
+static bool force_color_placeholders;
+static bool monochrome_covers;
 
 static theme_palette_t *active = &palette_dark;
 
-// Spotify green is the default; the remaining accents stay available in settings.
+// Existing preset indices remain stable; neutral gray is appended last.
+// Graphite and cover-derived colours use their own persisted identifiers.
 static const lv_color_t ACCENT_COLORS[THEME_ACCENT_COUNT] = {
-	LV_COLOR_MAKE(53, 132, 228), // blue (#3584e4)
-	LV_COLOR_MAKE(255, 120, 0),  // orange (#ff7800)
-	LV_COLOR_MAKE(229, 165, 10), // yellow (#e5a50a)
-	LV_COLOR_MAKE(30, 215, 96),  // green (#1ed760, default)
-	LV_COLOR_MAKE(145, 65, 172), // purple (#9141ac)
-	LV_COLOR_MAKE(213, 97, 153), // pink (#d56199)
+	LV_COLOR_MAKE(53, 132, 228),  // blue (#3584e4)
+	LV_COLOR_MAKE(255, 120, 0),	  // orange (#ff7800)
+	LV_COLOR_MAKE(229, 165, 10),  // yellow (#e5a50a)
+	LV_COLOR_MAKE(46, 194, 126),  // green (#2ec27e)
+	LV_COLOR_MAKE(145, 65, 172),  // purple (#9141ac)
+	LV_COLOR_MAKE(213, 97, 153),  // pink (#d56199)
+	LV_COLOR_MAKE(184, 184, 184), // gray; its light-theme counterpart is below
 };
-static int accent_index;
+static int accent_index = THEME_ACCENT_GRAPHITE;
 
 lv_color_t theme_accent_preset(int index) {
+	if (index == THEME_ACCENT_GRAY) {
+		return sx_hex(dark_selected ? 0xB8B8B8 : 0x626262);
+	}
+	if (index == THEME_ACCENT_GRAPHITE) {
+		return sx_hex(dark_selected ? SX_D_ACCENT : SX_L_ACCENT);
+	}
+	if (index == THEME_ACCENT_PALETTE)
+		return sx_palette_recommended_accent();
+	if (index == THEME_ACCENT_COVER) {
+		return sx_pal()->accent;
+	}
 	if (index < 0 || index >= THEME_ACCENT_COUNT) {
 		index = 0;
 	}
@@ -93,73 +83,37 @@ static theme_refresh_cb_t *refresh_cbs;
 static int refresh_cb_count;
 static int refresh_cb_capacity;
 
-// How much of the accent's own saturation a neutral borrows. Dark surfaces
-// take more before the hue stops reading as a shade and starts reading as a
-// colour; the light ones are nearly white, where the same amount would turn
-// the page pastel.
-#define TINT_STRENGTH_DARK 0.30f
-#define TINT_STRENGTH_LIGHT 0.15f
-
-// Gives a neutral the accent's hue while keeping exactly how light it is: the
-// brightest channel of the result is the brightest channel of the input. The
-// colour is never pulled towards the accent's own brightness, which is what
-// would turn a dark background light under a pale accent; the two channels
-// below the brightest do come down, so a tinted surface is fractionally darker
-// than the plain one, and that is what the two strengths above are set from.
-static lv_color_t tint_with(lv_color_t c, lv_color_t accent, float strength) {
-	uint8_t amax = accent.red > accent.green ? accent.red : accent.green;
-	if (accent.blue > amax) {
-		amax = accent.blue;
+// Fills `active` from sx_palette.c's colours. With `configure`, hands the
+// Appearance choices over first, which recomputes them; without, takes the
+// palette as it stands -- after a change of hue, which sx_palette.c has
+// already worked out.
+static void rebuild_active(bool configure) {
+	if (configure) {
+		lv_color_t preset = theme_accent_preset(accent_index);
+		sx_palette_options(palette_family, lcd_lamp, force_color_placeholders, monochrome_covers);
+		int effective_accent = !palette_family && accent_index == THEME_ACCENT_PALETTE ? THEME_ACCENT_GRAPHITE : accent_index;
+		if (effective_accent == THEME_ACCENT_GRAPHITE)
+			preset = theme_accent_preset(effective_accent);
+		sx_palette_configure(dark_selected, effective_accent, preset, dynamic_tint);
 	}
-	uint8_t amin = accent.red < accent.green ? accent.red : accent.green;
-	if (accent.blue < amin) {
-		amin = accent.blue;
-	}
-	uint8_t cmax = c.red > c.green ? c.red : c.green;
-	if (c.blue > cmax) {
-		cmax = c.blue;
-	}
-	if (amax == amin || cmax == 0) {
-		return c; // a grey accent has no hue to lend, and black takes none
-	}
+	const sx_palette_t *p = sx_pal();
 
-	// The accent's shape: 1 on its brightest channel, 0 on its darkest. Applied
-	// to the neutral's own brightness it reproduces that hue at the neutral's
-	// level, at a fraction of the accent's saturation.
-	float span = (float)(amax - amin);
-	float sat = span / (float)amax * strength;
-	float shape[3] = {
-		((float)accent.red - (float)amin) / span,
-		((float)accent.green - (float)amin) / span,
-		((float)accent.blue - (float)amin) / span,
-	};
-
-	uint8_t out[3];
-	for (int i = 0; i < 3; i++) {
-		out[i] = (uint8_t)((float)cmax * (1.0f - sat * (1.0f - shape[i])) + 0.5f);
-	}
-	return lv_color_make(out[0], out[1], out[2]);
-}
-
-// Points `active` at the chosen preset, or at a tinted copy of it.
-static void rebuild_active(void) {
-	theme_palette_t *base = dark_selected ? &palette_dark : &palette_light;
-
-	if (!dynamic_tint) {
-		active = base;
-		return;
-	}
-
-	float strength = base->dark ? TINT_STRENGTH_DARK : TINT_STRENGTH_LIGHT;
-	tinted = *base;
-	tinted.screen_bg = tint_with(base->screen_bg, base->accent, strength);
-	tinted.surface = tint_with(base->surface, base->accent, strength);
-	tinted.surface_pressed = tint_with(base->surface_pressed, base->accent, strength);
-	tinted.panel = tint_with(base->panel, base->accent, strength);
-	tinted.cover_bg = tint_with(base->cover_bg, base->accent, strength);
-	// Text keeps the plain colours: the monochrome icons are recoloured with
-	// text_primary, and they are meant to come through the tint untouched.
-	active = &tinted;
+	theme_palette_t *t = dark_selected ? &palette_dark : &palette_light;
+	t->screen_bg = p->bg;
+	t->surface = p->surface;
+	t->surface_pressed = p->press;
+	// 2.0 draws the status bar in the page's own colour: one surface from the
+	// top edge down, the bar telling itself apart only by what it carries.
+	t->panel = p->bg;
+	// Behind a missing artwork: a step below the page, as before 2.0.
+	t->cover_bg = dark_selected ? sx_mix(lv_color_black(), p->bg, 20) : p->press;
+	t->text_primary = p->text;
+	t->text_secondary = p->text2;
+	t->accent = p->accent;
+	t->accent_text = p->accent_text;
+	t->on_accent = p->on_accent;
+	t->dark = dark_selected;
+	active = t;
 }
 
 // Pushes the active palette into the shared styles.
@@ -183,9 +137,27 @@ static void apply_palette(void) {
 
 	lv_style_set_bg_color(&theme_style_accent_bg, active->accent);
 	lv_style_set_bg_color(&theme_style_slider_track, active->text_secondary);
+
+	// The 2.0 components' own shared styles (sx_*.c) follow the same palette.
+	sx_styles_apply();
+}
+
+static void refresh_light(void);
+
+// The hue moved under an unchanged theme: the playing album changed, or an
+// album page put up its own colours. Only colours change, and a colour is read
+// out of the shared styles at draw time, so invalidating what is on screen is
+// the whole repaint (refresh_light) -- no walk of every object's styles, which
+// is what a theme switch pays for.
+static void hue_changed(void) {
+	rebuild_active(false);
+	apply_palette();
+	refresh_light();
 }
 
 void theme_init(void) {
+	sx_styles_init();
+
 	lv_style_init(&theme_style_screen);
 	lv_style_set_bg_opa(&theme_style_screen, LV_OPA_COVER);
 
@@ -194,9 +166,6 @@ void theme_init(void) {
 
 	lv_style_init(&theme_style_card);
 	lv_style_set_bg_opa(&theme_style_card, LV_OPA_COVER);
-	// Keep cards, rows and fields visually related across the player; callers
-	// can still override the radius for compact or pill-shaped controls.
-	lv_style_set_radius(&theme_style_card, 12);
 
 	lv_style_init(&theme_style_card_pressed);
 	lv_style_set_bg_opa(&theme_style_card_pressed, LV_OPA_COVER);
@@ -225,21 +194,29 @@ void theme_init(void) {
 	// Whatever was chosen last time. Dark is the default for a first boot.
 	dark_selected = config_get_bool("ui", "dark_theme", true);
 
-	// The accent as it was left; both palettes carry the same one.
-	accent_index = (int)config_get_int("ui", "accent", 3);
-	if (accent_index < 0 || accent_index >= THEME_ACCENT_COUNT) {
-		accent_index = 3;
+	// A missing preference selects Graphite. Keep every explicitly saved accent.
+	accent_index = (int)config_get_int("ui", "accent", THEME_ACCENT_GRAPHITE);
+	if (accent_index != THEME_ACCENT_PALETTE && accent_index != THEME_ACCENT_COVER && accent_index != THEME_ACCENT_GRAPHITE && (accent_index < 0 || accent_index >= THEME_ACCENT_COUNT)) {
+		accent_index = THEME_ACCENT_GRAPHITE;
 	}
-	palette_dark.accent = ACCENT_COLORS[accent_index];
-	palette_light.accent = ACCENT_COLORS[accent_index];
 
+	// Only change the default; preserve saved tint preferences.
 	dynamic_tint = config_get_bool("ui", "dynamic_tint", false);
+	palette_family = (int)config_get_int("ui", "palette", 0);
+	if (palette_family < 0 || palette_family >= THEME_PALETTE_COUNT)
+		palette_family = 0;
+	lcd_lamp = (int)config_get_int("ui", "lcd_backlight", 0);
+	if (lcd_lamp < 0 || lcd_lamp >= THEME_LCD_LAMP_COUNT)
+		lcd_lamp = 0;
+	force_color_placeholders = config_get_bool("ui", "force_color_placeholders", false);
+	monochrome_covers = config_get_bool("ui", "monochrome_covers", false);
+	sx_artview_mode(monochrome_covers);
 
-	rebuild_active();
+	rebuild_active(true);
 	apply_palette();
 
-	// The marker on the flash may be missing or older than these settings.
-	bootlogo_follow(active->dark, accent_index);
+	// A new album, or an album page with its own colours: repaint in place.
+	sx_palette_set_change_hook(hue_changed);
 }
 
 void theme_apply_slider_knob(lv_obj_t *slider) {
@@ -349,6 +326,8 @@ static void refresh_tree(lv_obj_t *obj) {
 }
 
 void theme_notify_screen_shown(lv_obj_t *screen) {
+	sx_row_refresh_content(screen);
+	sx_artview_screen_will_show(screen);
 	if (screen && screen_is_stale(screen)) {
 		refresh_tree(screen);
 	}
@@ -360,6 +339,8 @@ void theme_notify_screen_shown(lv_obj_t *screen) {
 // at runtime, the blurred artwork behind the controls. Those run for every
 // page, on screen or not, and cost about as much as one frame in total.
 static void refresh_all(void) {
+	sx_row_refresh_content(NULL);
+	sx_artview_mode(monochrome_covers);
 	palette_generation++;
 
 	lv_obj_t *screen = lv_screen_active();
@@ -374,34 +355,74 @@ static void refresh_all(void) {
 	}
 }
 
+// The cheap repaint, for a change of hue: everything visible is redrawn from
+// the styles as they now stand, and the callbacks recolour what was set by
+// hand. Pages off screen need nothing from the styles -- they read them when
+// drawn.
+//
+// The callbacks are not run in one go. Together they cost a few milliseconds
+// on the emulator (the keyboards, which repaint every key, are most of it)
+// and several frames' worth on the device, and a change of hue comes with a
+// track change, when the player is busiest; so they are spread over a few
+// ticks of a timer, a handful at a time. The page in front of the user is
+// repainted from the shared styles at once either way. A theme switch still
+// runs them all at once (refresh_all): there the whole interface changes.
+#define LIGHT_CBS_PER_TICK 6
+#define LIGHT_TICK_MS 15
+
+static lv_timer_t *light_timer;
+static int light_next; // the next callback the spread repaint runs
+
+static void light_tick_cb(lv_timer_t *t) {
+	int end = light_next + LIGHT_CBS_PER_TICK;
+	for (; light_next < end && light_next < refresh_cb_count; light_next++) {
+		refresh_cbs[light_next]();
+	}
+	if (light_next >= refresh_cb_count) {
+		lv_timer_pause(t);
+	}
+}
+
+static void refresh_light(void) {
+	sx_row_refresh_content(NULL);
+	sx_artview_mode(monochrome_covers);
+	lv_obj_invalidate(lv_screen_active());
+	lv_obj_invalidate(lv_layer_top());
+	lv_obj_invalidate(lv_layer_sys());
+	lv_obj_invalidate(lv_layer_bottom());
+
+	if (!light_timer) {
+		light_timer = lv_timer_create(light_tick_cb, LIGHT_TICK_MS, NULL);
+	}
+	// A second change of hue before the first is through starts again from
+	// the top: every callback reads the palette as it is when it runs.
+	light_next = 0;
+	lv_timer_reset(light_timer);
+	lv_timer_resume(light_timer);
+	lv_timer_ready(light_timer);
+}
+
 void theme_toggle(void) {
 	dark_selected = !dark_selected;
-	rebuild_active();
+	rebuild_active(true);
 	apply_palette();
 
 	config_set_bool("ui", "dark_theme", active->dark);
 	config_save();
 
-	// The boot logo follows the theme and the accent; see bootlogo.h.
-	bootlogo_follow(active->dark, accent_index);
-
 	refresh_all();
 }
 
 void theme_set_accent(int index) {
-	if (index < 0 || index >= THEME_ACCENT_COUNT) {
-		index = 0;
+	if (index != THEME_ACCENT_PALETTE && index != THEME_ACCENT_COVER && index != THEME_ACCENT_GRAPHITE && (index < 0 || index >= THEME_ACCENT_COUNT)) {
+		index = THEME_ACCENT_GRAPHITE;
 	}
 	accent_index = index;
-	palette_dark.accent = ACCENT_COLORS[index];
-	palette_light.accent = ACCENT_COLORS[index];
-	rebuild_active(); // the tint is drawn from the accent, so it moves with it
+	rebuild_active(true);
 	apply_palette();
 
 	config_set_int("ui", "accent", index);
 	config_save();
-
-	bootlogo_follow(active->dark, accent_index);
 
 	refresh_all();
 }
@@ -413,11 +434,58 @@ void theme_set_dynamic_tint(bool on) {
 		return;
 	}
 	dynamic_tint = on;
-	rebuild_active();
+	rebuild_active(true);
 	apply_palette();
 
 	config_set_bool("ui", "dynamic_tint", on);
 	config_save();
 
 	refresh_all();
+}
+
+int theme_get_palette(void) { return palette_family; }
+int theme_get_lcd_lamp(void) { return lcd_lamp; }
+bool theme_force_color_placeholders(void) { return force_color_placeholders; }
+static void appearance_option_saved(const char *key, int value) {
+	rebuild_active(true);
+	apply_palette();
+	config_set_int("ui", key, value);
+	config_save();
+	refresh_all();
+}
+void theme_set_palette(int family) {
+	if (family < 0 || family >= THEME_PALETTE_COUNT)
+		family = 0;
+	if (palette_family == family)
+		return;
+	palette_family = family;
+	appearance_option_saved("palette", family);
+}
+void theme_set_lcd_lamp(int lamp) {
+	if (lamp < 0 || lamp >= THEME_LCD_LAMP_COUNT)
+		lamp = 0;
+	if (lcd_lamp == lamp)
+		return;
+	lcd_lamp = lamp;
+	appearance_option_saved("lcd_backlight", lamp);
+}
+void theme_set_force_color_placeholders(bool on) {
+	if (force_color_placeholders == on)
+		return;
+	force_color_placeholders = on;
+	appearance_option_saved("force_color_placeholders", on);
+}
+
+bool theme_monochrome_covers(void) { return monochrome_covers; }
+bool theme_set_monochrome_covers(bool on) {
+	if (monochrome_covers == on)
+		return sx_artview_refresh();
+	monochrome_covers = on;
+	rebuild_active(true);
+	apply_palette();
+	bool ok = sx_artview_mode(on);
+	config_set_bool("ui", "monochrome_covers", on);
+	config_save();
+	refresh_all();
+	return ok;
 }

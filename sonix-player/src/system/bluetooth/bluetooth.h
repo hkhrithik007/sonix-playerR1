@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "src/system/bluetooth/btrate.h"
+
 // The Bluetooth radio, driven by the player itself.
 //
 // Nothing here goes through the firmware's scripts or the bluez-tools.
@@ -178,16 +180,29 @@ bool bluetooth_a2dp_streams(char *out, int size, int *age_ms);
 // The codecs the connected sink offers and the one in use. The list is read
 // on the worker; this only copies what it last found.
 //
-// The player picks the best of them by itself at every connection and there is
-// no setting in front of that. bluetooth_set_codec() moves the link that is up
-// onto something else and is not remembered: the next connection starts from the
-// top again.
+// The player picks the best of them by itself at every connection.
+// bluetooth_set_codec() moves the link that is up onto something else and,
+// once the headphones accept it, remembers it for that device: the next
+// connection of the same headphones asks for it first and falls back to the
+// automatic choice only if it is refused. bluetooth_set_codec_auto() forgets
+// it and makes the automatic choice again now. bluetooth_codec_chosen() says
+// what is remembered for the connected device ("" and false for nothing).
 //
 // Only the headphone direction. As a receiver the phone is the source and the
 // choice is the phone's; nothing here can move it.
 int bluetooth_get_codecs(char out[][BT_CODEC_MAX], int max, char *selected, int selected_size);
 void bluetooth_refresh_codecs(void);
 void bluetooth_set_codec(const char *codec);
+void bluetooth_set_codec_auto(void);
+bool bluetooth_codec_chosen(char *out, int size);
+
+// What the headphones' link is carrying, for a person to read: the codec, with
+// LDAC's bit rate from the setting the daemon was started with, and the rate
+// the link runs at -- "LDAC 990 · 48 kHz", "AAC · 44.1 kHz". False and "" with
+// no headphones, or when `mac` (NULL for whichever is connected) is not the
+// device the sound is going to. Cache reads plus one config read, so for the
+// GUI thread.
+bool bluetooth_codec_summary(const char *mac, char *out, int size);
 
 // What THIS player can encode and decode, which is a property of the bluealsa
 // binary the firmware ships and is known as soon as the stack comes up --
@@ -219,6 +234,14 @@ void bluetooth_set_discoverable(bool on);
 // Changing it restarts bluealsa when the radio is on, because that is the only
 // moment the option is read. The link comes back by itself; the audio stops for
 // as long as that takes.
+//
+// Kept per pair of headphones ([wireless] bt_ldac_<address>), with
+// bt_ldac_quality as the default for a pair that has none: the getter answers
+// for the pair connected, or the last one with nothing connected, and the
+// setter writes for the pair connected and the default both. A pair that
+// connects with a rate of its own other than the daemon's gets it by a
+// restart made only while nothing plays (see daemon_options_check()).
+// Any thread; takes the module's lock, so not to be called under it.
 const char *bluetooth_ldac_quality(void);
 
 // Moves on each time the headphones' stream came back under a bluealsa this
@@ -227,6 +250,72 @@ const char *bluetooth_ldac_quality(void);
 // a daemon that is gone: whoever plays has to open it again.
 unsigned bluetooth_output_generation(void);
 void bluetooth_set_ldac_quality(const char *mode);
+
+// AAC's bit-rate mode, a daemon option like LDAC's quality and restarted for
+// the same way. True (the default) asks bluealsa for VBR, which it uses only
+// with headphones that declare VBR support; false is CBR at BT_AAC_CBR_BPS.
+// Kept in [wireless] bt_aac_mode = vbr | cbr.
+#define BT_AAC_CBR_BPS 220000
+bool bluetooth_aac_vbr(void);
+void bluetooth_set_aac_vbr(bool on);
+
+// Wi-Fi coexistence for LDAC 990 (see bluetooth.c). The UI says whether the
+// Wi-Fi transfer server is on; with LDAC set to 990, the next connection then
+// gets 660 -- bluealsa is restarted only when no music is playing, never under it.
+// UI thread; cheap when nothing changed, so it can be called on every tick.
+void bluetooth_set_wifi_busy(bool transfer_server_on);
+// True while that is in force: LDAC set to 990 and the transfer server on.
+bool bluetooth_ldac_held_back(void);
+
+// The rate the link is asked to run at, the "Sample rate" choice of the
+// Bluetooth audio page (btrate.h has what each one means). Kept in
+// [wireless] bt_sample_rate = auto | 44100 | follow | 96000; follow when the
+// key is missing.
+//
+// 44.1 kHz is a start-up option of bluealsa (--a2dp-force-audio-cd), so a
+// change to it or away from it restarts the daemon, like the two above. The
+// others move the link with SelectCodec at a rate: at a connection, at a
+// track start (bluetooth_link_rate_wanted()), and at once when the setting
+// changes with nothing playing.
+bt_rate_mode_t bluetooth_rate_mode(void);
+void bluetooth_set_rate_mode(bt_rate_mode_t mode);
+// The same for the 44.1 kHz choice alone: on is BT_RATE_44K, off BT_RATE_AUTO.
+bool bluetooth_force_44k(void);
+void bluetooth_set_force_44k(bool on);
+
+// For the playback thread, at the start of a track and before the stream is
+// opened: the rate the link should move to for a track at `track_rate` (`dsd`
+// when it is DSD sent as PCM), or 0 when it stays as it is. Cheap: settings
+// and numbers the worker keeps, no call on the bus. Also remembers the track,
+// for "Follow the music" at the next connection.
+#define BT_LINK_RATE_DEFAULT 1u // back to bluealsa's own choice
+unsigned bluetooth_link_rate_wanted(unsigned track_rate, bool dsd);
+
+// Then makes the change, on the worker, and waits for it -- the codec
+// renegotiated at that rate and the new stream up -- for up to fifteen
+// seconds. True when the link is now at `target`. Whatever was open on the
+// stream must have been closed first: the transport is built again under it.
+// bluetooth_sink_rate() gives the rate afterwards either way.
+bool bluetooth_link_rate_set(unsigned target);
+
+// The headphones' own battery level, for any headset rather than only AirPods.
+// Off by default, and an opt-in for a reason: it means starting bluealsa as a
+// hands-free audio gateway too (-p hfp-ag), because the level travels on the
+// hands-free control channel: AT+IPHONEACCEV, which most headsets send after
+// their AT+XAPL is answered, whatever phone they think they are talking to,
+// or the HFP battery indicator. The player never
+// opens or routes the SCO voice channel that profile also brings; it only
+// reads the number. Kept in [wireless] bt_headset_battery = 0 | 1. Changing it
+// restarts bluealsa like the options above, but never under music that is
+// playing: then it waits until the headphones disconnect or the player has
+// been idle a while.
+bool bluetooth_headset_battery_enabled(void);
+void bluetooth_set_headset_battery_enabled(bool on);
+
+// The connected headphones' level, 0..100, or -1 with the setting off, nothing
+// connected, or nothing said yet. A cache read: any thread. `serial_out`, when
+// given, moves whenever any headset's level changes.
+int bluetooth_headset_battery(unsigned *serial_out);
 
 // ---------------------------------------------------------------------------
 // The other direction: a device streaming to this one

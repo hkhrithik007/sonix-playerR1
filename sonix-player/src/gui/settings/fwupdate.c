@@ -8,6 +8,7 @@
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/firmware.h"
 #include "src/system/device/ota.h"
@@ -48,7 +49,7 @@ static bool holding_screen;
 
 static enum { PHASE_NONE, PHASE_CHECK, PHASE_DOWNLOAD } phase;
 
-static char notes_line[4096];
+static char notes_line[1024];
 
 // ---------------------------------------------------------------------------
 // the card
@@ -154,7 +155,7 @@ static void build(void) {
 		lv_obj_t *btn = lv_btn_create(column);
 		lv_obj_set_width(btn, lv_pct(100));
 		lv_obj_set_height(btn, BUTTON_H);
-		lv_obj_set_style_radius(btn, 12, 0);
+		lv_obj_set_style_radius(btn, SX_CARD_R, 0);
 		lv_obj_set_style_border_width(btn, 0, 0);
 		lv_obj_set_style_shadow_width(btn, 0, 0);
 		lv_obj_add_event_cb(btn, button_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -182,7 +183,7 @@ static void set_button(int i, const char *key, bool accent, action_fn action) {
 	}
 
 	lv_label_set_text(button_labels[i], tr(key));
-	lv_obj_set_style_text_color(button_labels[i], accent ? lv_color_white() : theme()->text_primary, 0);
+	lv_obj_set_style_text_color(button_labels[i], accent ? theme()->on_accent : theme()->text_primary, 0);
 	button_actions[i] = action;
 	lv_obj_set_hidden(btn, false);
 }
@@ -541,11 +542,19 @@ static void show_release(void) {
 	hide_buttons(2);
 }
 
+static const char *update_failure_key(firmware_update_result_t result) {
+	if (result == FIRMWARE_UPDATE_BOOTMODE_UNCERTAIN)
+		return "system_update_bootmode_failed";
+	return "system_update_prepare_failed";
+}
+
 static void install_cb(lv_timer_t *timer) {
 	(void)timer;
-	firmware_update_start();
-	// Returns only on the host build.
-	close_card();
+	firmware_update_result_t result = firmware_update_start();
+	if (result == FIRMWARE_UPDATE_SIMULATED)
+		close_card();
+	else
+		show_notice(tr(update_failure_key(result)));
 }
 
 static void show_installing(void) {
@@ -645,7 +654,9 @@ static void sd_run(void *unused) {
 		return;
 	}
 	printf("firmware: update file %s\n", path);
-	firmware_update_start();
+	firmware_update_result_t result = firmware_update_start();
+	if (result != FIRMWARE_UPDATE_SIMULATED)
+		gui_notify_popup(update_failure_key(result));
 }
 
 static void sd_clicked(void) {

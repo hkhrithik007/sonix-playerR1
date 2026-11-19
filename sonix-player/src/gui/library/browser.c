@@ -1,12 +1,16 @@
 #include "browser.h"
+#include "src/gui/library/music.h"
+#include "src/gui/library/rowart.h"
+#include "src/gui/shell/artview.h"
+#include "src/gui/shell/playbackplace.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <malloc.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -15,24 +19,32 @@
 
 #include <pthread.h>
 
+#include "src/gui/fonts/fonts.h"
+#include "src/gui/library/listacts.h"
+#include "src/gui/library/playlistpage.h"
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/nowplaying/coverloader.h"
-#include "src/gui/fonts/fonts.h"
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/trackmenu.h"
+#include "src/gui/settings/musicsettings.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons.h"
-#include "src/gui/settings/musicsettings.h"
-#include "src/gui/library/playlistpage.h"
-#include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_palette.h"
+#include "src/gui/shell/sx_row.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/shell/sx_tokens.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/toast.h"
+#include "src/gui/shell/touch.h"
+#include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 #include "src/system/library/cue.h"
 #include "src/system/library/folderorder.h"
 #include "src/system/playback/device_state.h"
-#include "src/gui/shell/toast.h"
 #include "src/system/playback/playlist.h"
-#include "src/system/core/lang.h"
-#include "src/system/core/utils.h"
 
 // ---------------------------------------------------------------------------
 // A windowed list.
@@ -49,22 +61,16 @@
 // change.
 // ---------------------------------------------------------------------------
 
-// Side of the album art thumbnail shown in front of each row.
-#define THUMB_SIZE 72
+// Row geometry: the 2.0 row (sx_row.h), 80 px or 100 with "Large rows". The
+// pitch is what the windowing maths is built on, so it has to be exact: the
+// row height plus the gap underneath it. The height is the one "Large rows"
+// decides, taken each time a folder's listing is put on screen, so one listing
+// is one shape however long it stays up.
+static int row_height = TOUCH_ROW_HEIGHT;
+#define ROW_PITCH (row_height + SX_ROW_GAP)
 
-// Row geometry. The pitch is what the windowing maths is built on, so it has
-// to be exact: the row height plus the gap underneath it.
-#define ROW_HEIGHT 100
-#define LIST_ROW_GAP 8
-#define ROW_PITCH (ROW_HEIGHT + LIST_ROW_GAP)
-#define LIST_ROW_RADIUS 12 // Adwaita boxed-list corner radius
-#define LIST_ROW_PAD 14
-
-// The now-playing mark, the same one the library lists carry: a rounded
-// accent bar in the row's own left padding, so nothing on the row moves.
-#define PLAYMARK_WIDTH 6
-#define PLAYMARK_HEIGHT 52
-#define PLAYMARK_INSET 4
+// The cover a file's row shows, decoded at the size the row's lead has.
+static int thumb_px(void) { return touch_large_rows() ? SX_ROW_THUMB_BIG : SX_ROW_THUMB; }
 
 // How many row widgets exist. A 720 px panel shows six or seven; the spares
 // cover the partly visible rows at each end and give the recycling somewhere
@@ -94,7 +100,6 @@ static lv_obj_t *file_list; // the scrolling viewport
 static lv_obj_t *list_body; // as tall as the whole list; the rows live in here
 static lv_timer_t *thumb_timer;
 
-static lv_style_t style_list_btn;
 static lv_style_t style_list_error;
 
 // Root of the browsable area (the SD card mount point). Navigation is not
@@ -257,11 +262,9 @@ static int entry_cmp(const void *a, const void *b) {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-	lv_obj_t *button;
-	lv_obj_t *icon;
-	lv_obj_t *label;
-	lv_obj_t *check;	// the tick on a chosen row in selection mode
-	lv_obj_t *playmark; // the accent bar on the row of the playing file
+	lv_obj_t *row; // the 2.0 row (sx_row.h)
+	lv_color_t art_tone;
+	float art_hue;
 
 	// Which entry this row is currently showing, or -1 when parked.
 	int index;
@@ -292,19 +295,27 @@ static bool reader_busy(void);
 static void row_update_selection(row_t *row);
 static bool list_directory(const char *path, listing_t *out, cue_sheet_t *sheets, char (*claims)[512]);
 
+// A folder's plaque is in a colour of its own (from its name), a file's in the
+// neutral cover tone until its picture comes.
 static void row_show_glyph(row_t *row, bool is_dir) {
+	const char *name = row->index >= 0 && (size_t)row->index < shown.count ? entry_name((size_t)row->index) : "";
 	// Audio files get the note, not a generic sheet of paper -- everything a
 	// browser row can show besides a folder is playable anyway.
-	lv_image_set_src(row->icon, is_dir ? &icon_folder : &icon_music2);
-	lv_obj_add_style(row->icon, &theme_style_icon, 0);
-	lv_obj_set_style_image_recolor_opa(row->icon, LV_OPA_COVER, 0);
+	char path[768], album[512] = "", title[256] = "";
+	const char *file = row->index >= 0 && (size_t)row->index < shown.count ? entry_file((size_t)row->index) : "";
+	snprintf(path, sizeof(path), "%s/%s", current_path, file);
+	if (!is_dir && rowart_album_of_track(path, album, sizeof(album))) {
+		library_album_title(album, title, sizeof(title));
+	}
+	row->art_hue = is_dir ? sx_palette_hue_of_name(name) : sx_placeholder_file_hue(path, title);
+	row->art_tone = is_dir ? sx_placeholder_name(name) : sx_placeholder_file(path, title);
+	sx_row_set_glyph(row->row, is_dir ? &icon_folder : &icon_music2, row->art_tone);
+	sx_row_set_content(row->row, row->art_hue, false, false, 0);
 }
 
-// Album art must not be tinted, so the recolour the glyphs rely on is switched
-// off for as long as a picture is on the row.
 static void row_show_cover(row_t *row, const lv_image_dsc_t *dsc) {
-	lv_image_set_src(row->icon, dsc);
-	lv_obj_set_style_image_recolor_opa(row->icon, LV_OPA_TRANSP, 0);
+	sx_row_set_thumb(row->row, dsc, sx_placeholder_tone(row->art_hue));
+	sx_row_set_content(row->row, row->art_hue, false, dsc != NULL, row->thumb.display_generation);
 }
 
 static int row_slot(const row_t *row) { return (int)(row - rows); }
@@ -317,7 +328,7 @@ static void row_drop_thumb(row_t *row) {
 		// The widget has to stop pointing at the pixels before they go.
 		bool is_dir = row->index >= 0 && (size_t)row->index < shown.count && shown.entries[row->index].is_dir;
 		row_show_glyph(row, is_dir);
-		cover_free(&row->thumb);
+		sx_artview_release_cover(&row->thumb);
 		row->has_thumb = false;
 	}
 
@@ -330,10 +341,6 @@ static void row_drop_thumb(row_t *row) {
 static char np_path[512];
 
 static void row_update_playmark(row_t *row) {
-	if (!row->playmark) {
-		return;
-	}
-
 	bool playing = false;
 	if (row->index >= 0 && (size_t)row->index < shown.count && np_path[0]) {
 		char full[sizeof(current_path) + 256 + 1];
@@ -349,16 +356,11 @@ static void row_update_playmark(row_t *row) {
 			playing = strcmp(full, np_path) == 0;
 		}
 	}
-
-	if (playing) {
-		lv_obj_set_hidden(row->playmark, false);
-	} else {
-		lv_obj_set_hidden(row->playmark, true);
-	}
+	sx_row_set_playing(row->row, playing);
 }
 
 void browser_notify_now_playing(void) {
-	if (!rows[0].button) {
+	if (!rows[0].row) {
 		return; // called during the boot restore, before the page exists
 	}
 
@@ -383,21 +385,21 @@ static void row_bind(row_t *row, int index) {
 	row->generation = listing_generation;
 
 	if (index < 0 || (size_t)index >= shown.count) {
-		lv_obj_set_hidden(row->button, true);
-		lv_obj_set_hidden(row->check, true);
-		// The mark goes with the entry, or it outlives it: the row is hidden
-		// here, but set_message() shows the first one again for "reading" and
-		// "no audio files" without rebinding it, and a row that comes back for
-		// a folder with fewer entries than there are widgets is never rebound
-		// at all.
-		lv_obj_set_hidden(row->playmark, true);
+		lv_obj_set_hidden(row->row, true);
 		return;
 	}
 
-	lv_obj_set_hidden(row->button, false);
-	lv_obj_set_y(row->button, index * ROW_PITCH);
-	lv_label_set_text(row->label, entry_name((size_t)index));
-	row_show_glyph(row, shown.entries[index].is_dir != 0);
+	lv_obj_set_hidden(row->row, false);
+	lv_obj_set_y(row->row, index * ROW_PITCH);
+	if (lv_obj_get_style_height(row->row, LV_PART_MAIN) != row_height) {
+		sx_row_set_compact(row->row, false); // "Large rows" changed since it was last bound
+	}
+	bool is_dir = shown.entries[index].is_dir != 0;
+	sx_row_set_title(row->row, entry_name((size_t)index));
+	sx_row_set_subtitle(row->row, "", NULL, NULL);
+	// A folder takes the queue's swipes for everything under it, a file for
+	// itself; neither while rows are being chosen (row_update_selection).
+	row_show_glyph(row, is_dir);
 	row_update_playmark(row);
 	row_update_selection(row);
 }
@@ -493,7 +495,7 @@ static void thumbs_update(void) {
 			char entry_path[sizeof(current_path) + 256 + 1];
 			snprintf(entry_path, sizeof(entry_path), "%s/%s", current_path, entry_file((size_t)row->index));
 
-			coverloader_request(row_slot(row), entry_path, THUMB_SIZE);
+			coverloader_request(row_slot(row), entry_path, thumb_px());
 			row->thumb_requested = true;
 			busy = true;
 			continue;
@@ -537,9 +539,7 @@ static bool is_playable_file(const char *name) {
 	// -- opening every container to find out would be one extra read per row
 	// of every folder. An audio-only .mp4 is still found by the library scan,
 	// which opens the container anyway (see is_video_file in library.c).
-	static const char *const playable_exts[] = {".wav",  ".mp3",  ".flac", ".ogg", ".m4b", ".m4a",
-												 ".alac", ".aac",  ".dsf",  ".dff", ".aif", ".aiff",
-												 ".aifc", ".caf",  ".opus", ".wv",   ".ape"};
+	static const char *const playable_exts[] = {".wav", ".mp3", ".flac", ".ogg", ".m4b", ".m4a", ".alac", ".aac", ".dsf", ".dff", ".aif", ".aiff", ".aifc", ".caf", ".opus", ".wv", ".ape"};
 
 	if (playlist_is_junk_name(name)) {
 		return false; // a macOS resource fork with a .flac on the end is not a track
@@ -561,16 +561,16 @@ static void browser_open_dir(const char *path);
 static int scroll_stack[SCROLL_STACK_DEPTH];
 static int scroll_stack_len;
 static int pending_scroll = -1; // applied by adopt_listing() when >= 0
+static char playback_reveal[512];
 
-// Which row the pointer is over, or -1. The pool of row objects is reused as
-// the list scrolls, so a row's index has to be looked up rather than carried.
-static row_t *row_of_button(lv_obj_t *button) {
-	for (int i = 0; i < ROW_POOL; i++) {
-		if (rows[i].button == button) {
-			return &rows[i];
-		}
-	}
-	return NULL;
+static void note_folder_playback(const char *path) {
+	playbackplace_t place = {.kind = -1};
+	if (strlen(current_path) >= sizeof(place.a))
+		return;
+	snprintf(place.a, sizeof(place.a), "%s", current_path);
+	const char *name = strrchr(current_path, '/');
+	snprintf(place.title, sizeof(place.title), "%s", name && name[1] ? name + 1 : tr("music_browse"));
+	playbackplace_arm("music", &place, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -599,14 +599,27 @@ static lv_obj_t *sel_close_btn;
 
 static void update_corner_buttons(void);
 
+// The trailing slot: a folder's chevron, a file's star -- or, while rows are
+// being chosen, the tick (and the tick's empty place on the others).
 static void row_update_selection(row_t *row) {
-	bool on = selecting && chosen && row->index >= 0 && (size_t)row->index < shown.count && chosen[row->index];
-	if (on) {
-		lv_obj_set_style_image_recolor(row->check, theme()->accent, 0);
-		lv_obj_set_hidden(row->check, false);
-	} else {
-		lv_obj_set_hidden(row->check, true);
+	if (row->index < 0 || (size_t)row->index >= shown.count) {
+		return;
 	}
+	if (selecting) {
+		bool on = chosen && chosen[row->index];
+		sx_row_set_trail(row->row, on ? SX_ROW_TRAIL_CHECK : SX_ROW_TRAIL_BLANK);
+		sx_row_set_swipes(row->row, false, false);
+		return;
+	}
+	sx_row_set_swipes(row->row, true, true);
+	if (shown.entries[row->index].is_dir) {
+		sx_row_set_trail(row->row, SX_ROW_TRAIL_CHEVRON);
+		return;
+	}
+	char full[sizeof(current_path) + 256 + 1];
+	snprintf(full, sizeof(full), "%s/%s", current_path, entry_file((size_t)row->index));
+	sx_row_set_starred(row->row, library_fav_contains(full));
+	sx_row_set_trail(row->row, SX_ROW_TRAIL_STAR);
 }
 
 static void rows_update_selection(void) {
@@ -661,39 +674,17 @@ static void selection_toggle(row_t *row) {
 	row_update_selection(row);
 }
 
-static void entry_long_pressed_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active() || gathering) {
-		return;
-	}
-	row_t *row = row_of_button(lv_event_get_current_target(e));
-	if (!row || row->index < 0 || (size_t)row->index >= shown.count) {
-		return;
-	}
-
-	// The lift that ends this press would otherwise arrive as a click and
-	// take the row straight back out of the selection.
-	lv_indev_t *indev = lv_indev_active();
-	if (indev) {
-		lv_indev_wait_release(indev);
-	}
-
-	if (!selection_start()) {
-		return;
-	}
-	if (!chosen[row->index]) {
-		selection_toggle(row);
-	}
-}
-
 // What the chosen rows turn into, and where it goes.
 typedef enum {
-	SEND_QUEUE,
+	SEND_QUEUE,		// "Play next"
+	SEND_QUEUE_END, // "Add to end of queue"
 	SEND_FAVOURITES,
 	SEND_PLAYLIST,
 } send_t;
 
 typedef struct {
 	send_t to;
+	char label[256]; // what went in, for the toast; empty: a count
 
 	char **roots; // the chosen rows, in list order
 	uint8_t *root_is_dir;
@@ -777,22 +768,13 @@ static void gather_done_cb(void *arg) {
 	}
 
 	switch (g->to) {
-	case SEND_QUEUE: {
-		int queued = 0;
-		for (int i = 0; i < g->count; i++) {
-			queued += playlist_enqueue(g->paths[i]) ? 1 : 0;
-		}
-		if (queued > 0) {
-			// Written down now: the mirror on disk is otherwise refreshed only
-			// when a track is loaded, and a power-off before that loses the
-			// addition.
-			device_state_queue_changed();
-			toast_success(queued == 1 ? "added_to_the_queue" : "queue_tracks_added");
-		} else {
-			toast_error("playlist_cannot_add_the_tracks");
-		}
+	case SEND_QUEUE:
+	case SEND_QUEUE_END:
+		// Written down at once, inside: the mirror on disk is otherwise
+		// refreshed only when a track is loaded, and a power-off before that
+		// loses the addition.
+		listacts_queue((const char *const *)g->paths, g->count, g->to == SEND_QUEUE ? PLAYLIST_QUEUE_NEXT : PLAYLIST_QUEUE_END, g->label[0] ? g->label : NULL);
 		break;
-	}
 	case SEND_FAVOURITES:
 		playlistpage_add_favourites((const char *const *)g->paths, g->count);
 		break;
@@ -810,7 +792,8 @@ static void *gather_worker(void *arg) {
 	for (int i = 0; i < g->root_count && more; i++) {
 		more = g->root_is_dir[i] ? gather_walk(g, g->roots[i], 0) : gather_add(g, g->roots[i]);
 	}
-	gui_post(gather_done_cb, g);
+	if (!gui_post(gather_done_cb, g))
+		gather_free(g);
 	return NULL;
 }
 
@@ -858,9 +841,58 @@ static void selection_send(send_t to) {
 	pthread_detach(thread);
 }
 
+// One row's tracks -- a file, or everything under a folder -- the same way,
+// for the row's swipes and its sheet.
+static void row_send(int index, send_t to) {
+	if (gathering || index < 0 || (size_t)index >= shown.count) {
+		return;
+	}
+	char path[PATH_BUF];
+	snprintf(path, sizeof(path), "%s/%s", current_path, entry_file((size_t)index));
+	if (!shown.entries[index].is_dir && (to == SEND_QUEUE || to == SEND_QUEUE_END)) {
+		// A file goes in at once: there is nothing to walk.
+		const char *one = path;
+		listacts_queue(&one, 1, to == SEND_QUEUE ? PLAYLIST_QUEUE_NEXT : PLAYLIST_QUEUE_END, entry_name((size_t)index));
+		return;
+	}
+	gather_t *g = calloc(1, sizeof(*g));
+	if (!g) {
+		return;
+	}
+	g->to = to;
+	snprintf(g->label, sizeof(g->label), "%s", entry_name((size_t)index));
+	g->roots = calloc(1, sizeof(*g->roots));
+	g->root_is_dir = calloc(1, 1);
+	g->sheets = malloc(sizeof(*g->sheets)); // NULL only leaves cue sheets unsplit
+	if (!g->roots || !g->root_is_dir || !(g->roots[0] = strdup(path))) {
+		gather_free(g);
+		return;
+	}
+	g->root_is_dir[0] = shown.entries[index].is_dir;
+	g->root_count = 1;
+
+	gathering = true;
+	toast_busy("browser_gathering_tracks");
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, gather_worker, g) != 0) {
+		gather_done_cb(g);
+		return;
+	}
+	pthread_detach(thread);
+}
+
+static void sel_queue_chosen(playlist_queue_where_t where, void *user) {
+	(void)user;
+	selection_send(where == PLAYLIST_QUEUE_NEXT ? SEND_QUEUE : SEND_QUEUE_END);
+}
+
+// Which of the two first: one button stands for the queue, and both answers
+// are common enough to be a tap away.
 static void sel_queue_cb(lv_event_t *e) {
-	(void)e;
-	selection_send(SEND_QUEUE);
+	if (!selecting || chosen_count == 0 || gathering) {
+		return;
+	}
+	trackmenu_queue_choose(lv_event_get_current_target(e), sel_queue_chosen, NULL);
 }
 
 static void sel_fav_cb(lv_event_t *e) {
@@ -883,13 +915,17 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	selection_stop();
 }
 
-static void entry_clicked_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return; // a swipe across the row, not a tap on it
-	}
+static row_t *row_live(void *user) {
+	row_t *row = user;
+	return row && row->index >= 0 && (size_t)row->index < shown.count ? row : NULL;
+}
 
-	row_t *row = row_of_button(lv_event_get_target(e));
-	if (!row || row->index < 0 || (size_t)row->index >= shown.count) {
+// A tap: a folder opens, a file plays -- and the page stays, the mini player
+// coming up with it (it used to switch to the player).
+static void row_tap_cb(lv_obj_t *obj, void *user) {
+	(void)obj;
+	row_t *row = row_live(user);
+	if (!row) {
 		return;
 	}
 	int index = row->index;
@@ -911,8 +947,94 @@ static void entry_clicked_cb(lv_event_t *e) {
 		browser_open_dir(full_path);
 	} else {
 		player_play_file(full_path);
-		switch_screen(player_screen);
+		note_folder_playback(full_path);
 	}
+}
+
+static void row_next_cb(lv_obj_t *obj, void *user) {
+	(void)obj;
+	row_t *row = row_live(user);
+	if (row && !selecting) {
+		row_send(row->index, SEND_QUEUE);
+	}
+}
+
+static void row_end_cb(lv_obj_t *obj, void *user) {
+	(void)obj;
+	row_t *row = row_live(user);
+	if (row && !selecting) {
+		row_send(row->index, SEND_QUEUE_END);
+	}
+}
+
+static void row_star_cb(lv_obj_t *obj, void *user) {
+	row_t *row = row_live(user);
+	if (!row || shown.entries[row->index].is_dir) {
+		return;
+	}
+	char full_path[sizeof(current_path) + 256 + 1];
+	snprintf(full_path, sizeof(full_path), "%s/%s", current_path, entry_file((size_t)row->index));
+	sx_row_set_starred(obj, listacts_star(full_path, entry_name((size_t)row->index), ""));
+}
+
+// The sheets. What they act on is copied: the listing can change under an
+// open sheet (a folder read again).
+static char sheet_path[PATH_BUF];
+static char sheet_name[256];
+static uint32_t sheet_generation;
+static int sheet_index;
+
+static void sheet_select_cb(void *user) {
+	(void)user;
+	if (sheet_generation != listing_generation || !selection_start()) {
+		return;
+	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		if (rows[i].index == sheet_index) {
+			if (!chosen[sheet_index]) {
+				selection_toggle(&rows[i]);
+			}
+			return;
+		}
+	}
+}
+
+static void sheet_send_cb(void *user) {
+	if (sheet_generation == listing_generation) {
+		row_send(sheet_index, (send_t)(intptr_t)user);
+	}
+}
+
+// Held: the row's sheet -- a file's is the library's track sheet (favourite,
+// the queue's two ends, a playlist, the album and artist when the index knows
+// them, details), a folder's sends everything under it; both end in "Select",
+// which is how selection mode starts now. Held in selection mode, the row is
+// chosen, as before.
+static void row_hold_cb(lv_obj_t *obj, void *user) {
+	(void)obj;
+	row_t *row = row_live(user);
+	if (!row || gathering) {
+		return;
+	}
+	if (selecting) {
+		if (!chosen[row->index]) {
+			selection_toggle(row);
+		}
+		return;
+	}
+	sheet_index = row->index;
+	sheet_generation = listing_generation;
+	snprintf(sheet_path, sizeof(sheet_path), "%s/%s", current_path, entry_file((size_t)row->index));
+	snprintf(sheet_name, sizeof(sheet_name), "%s", entry_name((size_t)row->index));
+	sx_sheet_item_t select = {tr("lists_select"), &icon_check, false, false, sheet_select_cb, NULL};
+	if (!shown.entries[row->index].is_dir) {
+		listacts_track_sheet(sheet_path, sheet_name, "", NULL, NULL, NULL, &select, 1);
+		return;
+	}
+	sx_sheet_item_t items[] = {
+		{tr("queue_play_next"), &icon_list_start, false, false, sheet_send_cb, (void *)(intptr_t)SEND_QUEUE}, {tr("queue_add_to_end"), &icon_list_plus_small, false, false, sheet_send_cb, (void *)(intptr_t)SEND_QUEUE_END}, {tr("add_to_playlist"), &icon_list_music, false, false, sheet_send_cb, (void *)(intptr_t)SEND_PLAYLIST}, {tr("medialist_add_to_favourites"), &icon_star, false, false, sheet_send_cb, (void *)(intptr_t)SEND_FAVOURITES}, select,
+	};
+	sx_sheet_menu(sheet_name, NULL, items, (int)(sizeof(items) / sizeof(items[0])));
 }
 
 // True when the folder on screen has at least one track in it. The listing is
@@ -1001,11 +1123,24 @@ static void shuffle_button_cb(lv_event_t *e) {
 
 	char full_path[1024];
 	snprintf(full_path, sizeof(full_path), "%s/%s", current_path, name);
-	player_play_file(full_path);
-	switch_screen(player_screen);
+	player_play_file(full_path); // the page stays: the mini player comes up
+	note_folder_playback(full_path);
 }
 
 void browser_open_dir_public(const char *path) { browser_open_dir(path); }
+
+bool browser_open_playback_place(void) {
+	playbackplace_t place;
+	if (!playbackplace_get("music", &place) || place.kind != -1 || access(place.a, R_OK))
+		return false;
+	device_state_t state;
+	device_state_get(&state);
+	const char *file = state.current_file[0] && !strncmp(state.current_file, place.a, strlen(place.a)) && state.current_file[strlen(place.a)] == '/' ? state.current_file : place.path;
+	snprintf(playback_reveal, sizeof(playback_reveal), "%s", file);
+	browser_open_dir(place.a);
+	switch_screen(browser_screen);
+	return true;
+}
 
 void browser_refresh(void) {
 	if (current_path[0]) {
@@ -1045,23 +1180,21 @@ bool browser_go_up(void) {
 	return true;
 }
 
-// The first row doubles as the place messages are shown: there is no reason to
-// build a widget just to say a folder is empty.
+// What the list says instead of rows: "reading", "no audio files", an error.
+static lv_obj_t *message_label;
+
 static void set_message(const char *text) {
-	lv_obj_set_hidden(rows[0].button, false);
-	lv_obj_set_y(rows[0].button, 0);
-	lv_obj_set_hidden(rows[0].icon, true);
-	// A sentence is not a track: whatever this row was showing before, it is
-	// not playing now.
-	lv_obj_set_hidden(rows[0].playmark, true);
-	lv_label_set_text(rows[0].label, tr(text));
-	lv_obj_add_style(rows[0].label, &style_list_error, 0);
+	lv_label_set_text(message_label, tr(text));
+	bool error = strcmp(text, "reading") != 0;
+	if (error) {
+		lv_obj_add_style(message_label, &style_list_error, 0);
+	} else {
+		lv_obj_remove_style(message_label, &style_list_error, 0);
+	}
+	lv_obj_set_hidden(message_label, false);
 }
 
-static void clear_message(void) {
-	lv_obj_set_hidden(rows[0].icon, false);
-	lv_obj_remove_style(rows[0].label, &style_list_error, 0);
-}
+static void clear_message(void) { lv_obj_set_hidden(message_label, true); }
 
 // ---------------------------------------------------------------------------
 // the reader thread
@@ -1263,8 +1396,7 @@ static bool list_directory(const char *path, listing_t *out, cue_sheet_t *sheets
 	// Telling them apart matters: a truncated listing otherwise just looks like
 	// a folder with fewer files in it.
 	if (errno != 0) {
-		fprintf(stderr, "browser: readdir stopped after %zu entries in '%s': %s\n", out->count, path,
-				strerror(errno));
+		fprintf(stderr, "browser: readdir stopped after %zu entries in '%s': %s\n", out->count, path, strerror(errno));
 	}
 
 	closedir(dir);
@@ -1471,11 +1603,22 @@ static void adopt_listing(void) {
 
 	// The body is as tall as the whole list would be: that is what the scroll
 	// position and the scrollbar come from, while only ROW_POOL widgets exist.
+	row_height = touch_row_height();
 	lv_obj_set_height(list_body, shown.count ? (int)(shown.count * ROW_PITCH) : ROW_PITCH);
 
 	// Fresh folders start at the top; a walk back up resumes where the level
 	// was left (clamped: the folder may have shrunk meanwhile).
 	int target_scroll = pending_scroll >= 0 ? pending_scroll : 0;
+	if (playback_reveal[0]) {
+		const char *file = strrchr(playback_reveal, '/');
+		for (size_t i = 0; file && i < shown.count; i++) {
+			if (!strcmp(entry_file(i), file + 1)) {
+				target_scroll = (int)i * ROW_PITCH;
+				break;
+			}
+		}
+		playback_reveal[0] = '\0';
+	}
 	pending_scroll = -1;
 	int max_scroll = (int)(shown.count * ROW_PITCH) - lv_obj_get_height(file_list);
 	if (target_scroll > max_scroll) {
@@ -1493,90 +1636,45 @@ static void adopt_listing(void) {
 
 	update_corner_buttons();
 
-	fprintf(stderr, "browser: '%s': %zu entries, %d row widgets, %zu KB of names\n", current_path, shown.count,
-			ROW_POOL, shown.pool_used / 1024);
+	fprintf(stderr, "browser: '%s': %zu entries, %d row widgets, %zu KB of names\n", current_path, shown.count, ROW_POOL, shown.pool_used / 1024);
 }
 
 // ---------------------------------------------------------------------------
 
 static void init_list_styles(void) {
 	lv_style_init(&style_list_error);
-	lv_style_set_text_color(&style_list_error, lv_color_make(212, 94, 76));
-
-	// Row geometry. The colours live in the shared theme styles, so switching
-	// palette repaints the list without touching a single row.
-	lv_style_init(&style_list_btn);
-	lv_style_set_border_width(&style_list_btn, 0);
-	lv_style_set_radius(&style_list_btn, LIST_ROW_RADIUS);
-	lv_style_set_shadow_width(&style_list_btn, 0);
-	lv_style_set_pad_all(&style_list_btn, LIST_ROW_PAD);
-	lv_style_set_pad_column(&style_list_btn, 14);
+	lv_style_set_text_color(&style_list_error, lv_color_hex(SX_DANGER_TEXT));
 }
 
 // Builds the fixed pool of rows. This runs once, at startup: from here on the
 // browser never creates or destroys a widget, whatever the user opens.
 static void build_rows(int width) {
+	static const sx_row_handlers_t HANDLERS = {
+		.on_tap = row_tap_cb,
+		.on_long_press = row_hold_cb,
+		.on_swipe_next = row_next_cb,
+		.on_swipe_end = row_end_cb,
+		.on_star = row_star_cb,
+	};
 	for (int i = 0; i < ROW_POOL; i++) {
 		row_t *row = &rows[i];
-
-		row->button = lv_btn_create(list_body);
-		lv_obj_set_size(row->button, width, ROW_HEIGHT);
-		lv_obj_set_x(row->button, 0);
-		lv_obj_add_style(row->button, &theme_style_card, 0);
-		lv_obj_add_style(row->button, &style_list_btn, 0);
-		lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
-		lv_obj_set_hidden(row->button, true);
-		lv_obj_set_event_bubble(row->button, true); // so a swipe can start on a row
-		lv_obj_add_event_cb(row->button, entry_clicked_cb, LV_EVENT_CLICKED, NULL);
-		lv_obj_add_event_cb(row->button, entry_long_pressed_cb, LV_EVENT_LONG_PRESSED, NULL);
-
-		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
-		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-		row->icon = lv_image_create(row->button);
-		lv_obj_set_size(row->icon, THUMB_SIZE, THUMB_SIZE);
-		lv_image_set_inner_align(row->icon, LV_IMAGE_ALIGN_CENTER);
-
-		row->label = lv_label_create(row->button);
-		lv_label_set_long_mode(row->label, LV_LABEL_LONG_DOT);
-		lv_obj_set_flex_grow(row->label, 1);
-		lv_obj_add_style(row->label, &theme_style_text, 0);
-		lv_obj_set_style_text_font(row->label, &font_ui_24, 0);
-		// Two lines at most: the cap on the height is what makes LV_LABEL_LONG_DOT
-		// cut the name there, with the ellipsis, instead of wrapping on past the
-		// row. A cap and not a height, so a one-line name stays centred.
-		lv_obj_set_style_max_height(row->label,
-									2 * lv_font_get_line_height(&font_ui_24) +
-										lv_obj_get_style_text_line_space(row->label, LV_PART_MAIN),
-									0);
-
-		row->check = lv_image_create(row->button);
-		lv_image_set_src(row->check, &icon_check);
-		lv_obj_add_style(row->check, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(row->check, LV_OPA_COVER, 0);
-		lv_obj_set_clickable(row->check, false);
-		lv_obj_set_hidden(row->check, true);
-
-		// Outside the flex layout, in the row's own left padding: it marks the
-		// row without moving anything on it.
-		row->playmark = lv_obj_create(row->button);
-		lv_obj_set_ignore_layout(row->playmark, true);
-		lv_obj_set_size(row->playmark, PLAYMARK_WIDTH, PLAYMARK_HEIGHT);
-		lv_obj_align(row->playmark, LV_ALIGN_LEFT_MID, PLAYMARK_INSET - LIST_ROW_PAD, 0);
-		lv_obj_add_style(row->playmark, &theme_style_accent_bg, 0);
-		lv_obj_set_style_radius(row->playmark, LV_RADIUS_CIRCLE, 0);
-		lv_obj_set_style_border_width(row->playmark, 0, 0);
-		lv_obj_set_style_shadow_width(row->playmark, 0, 0);
-		lv_obj_set_style_pad_all(row->playmark, 0, 0);
-		lv_obj_set_scrollable(row->playmark, false);
-		lv_obj_set_clickable(row->playmark, false);
-		lv_obj_set_hidden(row->playmark, true);
-
+		row->row = sx_row_create(list_body, &HANDLERS, false);
+		lv_obj_set_width(row->row, width);
+		sx_row_set_user(row->row, row);
+		lv_obj_set_hidden(row->row, true);
 		row->index = -1;
 		row->has_thumb = false;
 		row->thumb_requested = false;
 		row->thumb_settled = false;
 	}
+
+	message_label = lv_label_create(list_body);
+	lv_obj_set_width(message_label, width);
+	lv_obj_set_style_pad_all(message_label, SX_ROW_PAD_L, 0);
+	lv_label_set_long_mode(message_label, LV_LABEL_LONG_WRAP);
+	lv_obj_add_style(message_label, &sx_style_text2, 0);
+	lv_obj_set_style_text_font(message_label, &font_ui_24, 0);
+	lv_obj_set_hidden(message_label, true);
 }
 
 // A button in the title row's corner, `slot` places from the right edge.
@@ -1600,6 +1698,7 @@ static lv_obj_t *corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t
 }
 
 void browser_init(gui_config_t *cfg) {
+	switcher_browse_bind("music", browser_screen, music_screen);
 	init_list_styles();
 
 	// Once, and kept: a folder with a sheet in it is read on the reader thread,
