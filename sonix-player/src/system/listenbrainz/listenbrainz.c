@@ -18,7 +18,9 @@
 
 #define LB_URL "https://api.listenbrainz.org/1/submit-listens"
 #define LB_VALIDATE_URL "https://api.listenbrainz.org/1/validate-token"
-#define LB_QUEUE_MAX 40
+// Keep a few weeks of offline listens while keeping the fixed RAM queue small
+// (roughly 200 KiB for 256 entries); the same queue is persisted beside config.
+#define LB_QUEUE_MAX 256
 #define LB_FIELD_MAX 256
 #define LB_BODY_MAX 2048
 #define LB_RETRY_MAX 600
