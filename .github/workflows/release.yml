@@ -4,11 +4,7 @@ on:
   push:
     branches:
       - main
-<<<<<<< Updated upstream
-=======
-      - spotui
-      - beta-releases
->>>>>>> Stashed changes
+      - Rage-os
 
   workflow_dispatch:
 
@@ -36,7 +32,6 @@ env:
   RBDEV_DOWNLOAD: ${{ github.workspace }}/sonix-player/.cache/rbdev-dl
   RBDEV_BUILD: ${{ github.workspace }}/sonix-player/.cache/rbdev-build
 
-<<<<<<< Updated upstream
   MAKEFLAGS: -j2
 
   # ================================================================
@@ -44,13 +39,6 @@ env:
   # ================================================================
   RELEASE_TAG: latest
   RELEASE_NAME: Latest Sonix Player R1 Firmware
-=======
-  # Canonical working SpotUI source.
-  SPOTUI_REPOSITORY: https://github.com/noisetta/spotui-hiby-r3proii.git
-  SPOTUI_REF: main
-  R1_UI_PATCH_VERSION: v5-robust-no-wlan0-startup
-  R1_PLAYBACK_PATCH_VERSION: symphonia-codec-vorbis-0.5.5-integer-root-v1
->>>>>>> Stashed changes
 
 
 jobs:
@@ -779,6 +767,7 @@ jobs:
       # ============================================================
 
       - name: Publish Latest R1 Firmware
+        if: github.ref_name == 'main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -864,7 +853,6 @@ jobs:
       # FAILURE DIAGNOSTICS
       # ============================================================
 
-<<<<<<< Updated upstream
       - name: Upload diagnostics on failure
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -878,54 +866,3 @@ jobs:
             sonix-packer/r1.upt
             sonix-packer/hiby-v1.6-download/**
           retention-days: 14
-=======
-          BUILD_TIME_IST=$(
-            TZ=Asia/Kolkata \
-            date '+%d-%m-%Y %I:%M:%S %p IST'
-          )
-
-          {
-            echo "## SpotUI HiBy R1"
-            echo
-            echo "### Build successful"
-            echo
-            echo "- Branch: \`${GITHUB_REF_NAME}\`"
-            echo "- Commit: \`${GITHUB_SHA}\`"
-            echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
-            echo "- Build time: \`${BUILD_TIME_IST}\`"
-            echo "- Target: \`${RUST_TARGET}\`"
-            echo "- librespot: \`${LIBRESPOT_VERSION}\`"
-            echo
-            echo "### Fixes"
-            echo
-            echo "- MIPS toolchain downloaded from GitHub instead of stalled musl.cc endpoint"
-            echo "- SpotUI source auto-resolved"
-            echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
-            echo "- Spotify daemon autorun included"
-            echo "- Symphonia OGG/Vorbis integer-root fix applied for MIPS32 soft-float"
-            echo "- GCC resolves the MIPS sysroot, CRT objects, and musl loader directly"
-            echo "- GCC is used to resolve CRT, loader, and runtime-library paths; no recursive toolchain scanning"
-            echo "- R1 musl loader bundled and invoked explicitly"
-            echo
-            echo "### Artifacts"
-            echo
-            echo "- \`spotui_daemon\`"
-            echo "- \`spotui-ui-poc\`"
-            echo "- \`S91_spotui_daemon\`"
-            echo "- \`spotui_daemon_autostart.sh\`"
-            echo "- \`SHA256SUMS\`"
-            echo "- \`build-info.txt\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "SpotUI HiBy R1 build completed successfully."
-
-  firmware:
-    name: Build the R1 firmware image
-    needs: build
-    if: github.ref_name == 'spotui'
-    uses: ./.github/workflows/spotui-r1-upt.yml
-    permissions:
-      actions: read
-      contents: write
-    secrets: inherit
->>>>>>> Stashed changes

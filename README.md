@@ -208,6 +208,13 @@ The first run takes a while and does four things by itself:
 
 Steps 1 to 3 happen once. Later builds go straight to step 4.
 
+### Build with GitHub Actions
+
+Pushing to `Rage-os` or starting **Build HiBy R1 Firmware** from the Actions tab
+builds and packages the R1 firmware. Download the `r1-firmware-<commit>` artifact
+from the completed run; it contains `r1.upt` and `SHA256SUMS`. The `Rage-os`
+build does not publish a GitHub release.
+
 Everything the device does not already carry is linked statically, so the
 result is one file to copy across with nothing to install beside it. The same
 file goes into both images.
