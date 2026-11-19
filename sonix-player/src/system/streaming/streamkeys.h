@@ -27,6 +27,9 @@
 //     api_key = ...
 //     api_secret = ...
 //
+//     [listenbrainz]
+//     api_key = ... (the account's ListenBrainz user token)
+//
 // and shipped sealed, as /usr/resource/sonix/components/streaming-keys.bin, by
 // tools/seal_streamkeys.py. The key that opens it is not in the source: the
 // tool keeps it in streaming-keys.key, outside git, and the Makefile compiles
@@ -64,6 +67,7 @@ const char *streamkeys_tidal_client_secret(void);
 // out of the source, in a file whoever assembles the firmware fills in.
 const char *streamkeys_podcast_key(void);
 const char *streamkeys_podcast_secret(void);
+const char *streamkeys_listenbrainz_key(void);
 
 // Where they were read from, for the log and the information page. NULL when
 // none were found.

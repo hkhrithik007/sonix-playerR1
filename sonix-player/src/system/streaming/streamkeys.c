@@ -23,6 +23,7 @@ static char tidal_client_id[64];
 static char tidal_client_secret[128];
 static char podcast_key[64];
 static char podcast_secret[128];
+static char listenbrainz_key[256];
 static char source_path[256];
 static bool loaded_any;
 
@@ -102,6 +103,11 @@ static void parse_line(char *line, char section[32]) {
 		} else if (strcmp(key, "api_secret") == 0) {
 			dest = podcast_secret;
 			dest_size = sizeof(podcast_secret);
+		}
+	} else if (strcmp(section, "listenbrainz") == 0) {
+		if (strcmp(key, "api_key") == 0) {
+			dest = listenbrainz_key;
+			dest_size = sizeof(listenbrainz_key);
 		}
 	} else if (strcmp(section, "tidal") == 0) {
 		if (strcmp(key, "client_id") == 0) {
@@ -260,10 +266,11 @@ void streamkeys_init(void) {
 	// The log records that the keys are present, never their values: the log
 	// lands on the card and from there goes to whoever asks for it about any
 	// problem at all.
-	printf("streamkeys: from %s -- Qobuz %s, Tidal %s, Podcast %s\n", path,
+	printf("streamkeys: from %s -- Qobuz %s, Tidal %s, Podcast %s, ListenBrainz %s\n", path,
 		   qobuz_app_id[0] && qobuz_app_secret[0] ? "yes" : "no",
 		   tidal_client_id[0] && tidal_client_secret[0] ? "yes" : "no",
-		   podcast_key[0] && podcast_secret[0] ? "yes" : "no");
+		   podcast_key[0] && podcast_secret[0] ? "yes" : "no",
+		   listenbrainz_key[0] ? "yes" : "no");
 }
 
 static const char *or_null(const char *s) { return s[0] ? s : NULL; }
@@ -275,5 +282,6 @@ const char *streamkeys_tidal_client_secret(void) { return or_null(tidal_client_s
 
 const char *streamkeys_podcast_key(void) { return or_null(podcast_key); }
 const char *streamkeys_podcast_secret(void) { return or_null(podcast_secret); }
+const char *streamkeys_listenbrainz_key(void) { return or_null(listenbrainz_key); }
 
 const char *streamkeys_source(void) { return loaded_any ? source_path : NULL; }

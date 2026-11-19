@@ -330,116 +330,71 @@ jobs:
       # ============================================================
       # CREATE / SEAL STREAMING KEYS
       # ============================================================
-      - name: Create and seal Last.fm streaming keys
+      - name: Create and seal ListenBrainz streaming key
         working-directory: sonix-player
         shell: bash
         env:
-          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
-          LASTFM_API_SECRET: ${{ secrets.LASTFM_API_SECRET }}
+          LISTENBRAINZ_API_KEY: ${{ secrets.LISTENBRAINZ_API_KEY }}
         run: |
           set -euo pipefail
 
           echo "============================================"
-          echo "PREPARING LAST.FM STREAMING KEYS"
+          echo "PREPARING LISTENBRAINZ STREAMING KEY"
           echo "============================================"
 
           test -f streaming-keys.ini.example
           test -f tools/seal_streamkeys.py
+          test -n "${LISTENBRAINZ_API_KEY:-}" || {
+            echo "ERROR: LISTENBRAINZ_API_KEY GitHub Secret is empty."
+            exit 1
+          }
 
           cp -f streaming-keys.ini.example streaming-keys.ini
-
-          python3 - <<'PY'
+          python3 - <<'PYKEY'
           import os
           import re
           from pathlib import Path
 
           path = Path("streaming-keys.ini")
           text = path.read_text(encoding="utf-8")
-
-          api_key = os.environ["LASTFM_API_KEY"].strip()
-          api_secret = os.environ["LASTFM_API_SECRET"].strip()
+          api_key = os.environ["LISTENBRAINZ_API_KEY"].strip()
 
           if not api_key:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_KEY GitHub Secret is empty."
-              )
-
-          if not api_secret:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_SECRET GitHub Secret is empty."
-              )
-
+              raise SystemExit("ERROR: LISTENBRAINZ_API_KEY GitHub Secret is empty.")
           if "\n" in api_key or "\r" in api_key:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_KEY must be a single line."
-              )
-
-          if "\n" in api_secret or "\r" in api_secret:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_SECRET must be a single line."
-              )
+              raise SystemExit("ERROR: LISTENBRAINZ_API_KEY must be a single line.")
+          if not 10 <= len(api_key) <= 200 or not re.fullmatch(r"[A-Za-z0-9._~-]+", api_key):
+              raise SystemExit("ERROR: LISTENBRAINZ_API_KEY is not a valid ListenBrainz user token.")
 
           match = re.search(
-              r"(?ms)^\[lastfm\][ \t]*\r?$.*?(?=^\[[^]]+\][ \t]*\r?$|\Z)",
+              r"(?ms)^\[listenbrainz\][ \t]*\r?$.*?(?=^\[[^]]+\][ \t]*\r?$|\Z)",
               text,
           )
-
           if not match:
               raise SystemExit(
-                  "ERROR: [lastfm] section was not found "
+                  "ERROR: [listenbrainz] section was not found "
                   "in streaming-keys.ini.example."
               )
 
           section = match.group(0)
-
-          if not re.search(
-              r"(?m)^[ \t]*api_key[ \t]*=",
-              section,
-          ):
+          if not re.search(r"(?m)^[ \t]*api_key[ \t]*=", section):
               raise SystemExit(
-                  "ERROR: api_key entry was not found "
-                  "in the [lastfm] section."
-              )
-
-          if not re.search(
-              r"(?m)^[ \t]*api_secret[ \t]*=",
-              section,
-          ):
-              raise SystemExit(
-                  "ERROR: api_secret entry was not found "
-                  "in the [lastfm] section."
+                  "ERROR: api_key entry was not found in the [listenbrainz] section."
               )
 
           section = re.sub(
               r"(?m)^([ \t]*api_key[ \t]*=[ \t]*)[^\r\n]*$",
-              lambda m: m.group(1) + api_key,
+              lambda found: found.group(1) + api_key,
               section,
               count=1,
           )
-
-          section = re.sub(
-              r"(?m)^([ \t]*api_secret[ \t]*=[ \t]*)[^\r\n]*$",
-              lambda m: m.group(1) + api_secret,
-              section,
-              count=1,
-          )
-
-          path.write_text(
-              text[:match.start()] +
-              section +
-              text[match.end():],
-              encoding="utf-8",
-          )
-          PY
+          path.write_text(text[:match.start()] + section + text[match.end():], encoding="utf-8")
+          PYKEY
 
           chmod 600 streaming-keys.ini
-
-          echo "Last.fm credentials inserted into streaming-keys.ini."
-
+          echo "ListenBrainz user token inserted into streaming-keys.ini."
           echo "Sealing streaming keys..."
-
           python3 tools/seal_streamkeys.py seal
-
           test -s streaming-keys.key
 
           for PACKED_KEYS in \
@@ -453,8 +408,7 @@ jobs:
             }
           done
 
-          echo "Streaming keys sealed successfully."
-          echo "The credential values themselves are not printed."
+          echo "ListenBrainz key sealed for both firmware targets."
 
       # ============================================================
       # BUILD SONIX PLAYER
@@ -713,9 +667,9 @@ jobs:
             }
 
           # ----------------------------------------------------------
-          # Verify Last.fm sealed key payload exists.
+          # Verify ListenBrainz sealed key payload exists.
           # ----------------------------------------------------------
-          echo "Checking Last.fm sealed key payload..."
+          echo "Checking ListenBrainz sealed key payload..."
 
           KEYS_SIZE=$(
             unsquashfs -cat "$ROOTFS_IMAGE" \
@@ -904,7 +858,7 @@ jobs:
             echo "- R1 bootloader compatibility marker present"
             echo "- Rootfs chunks present"
             echo "- Sonix Player binary present"
-            echo "- Last.fm sealed key payload present"
+            echo "- ListenBrainz sealed key payload present"
             echo
             echo "### Result"
             echo

@@ -14,6 +14,7 @@
 #include "src/system/core/md5.h"
 #include "src/system/net/http.h"
 #include "src/system/net/wifi.h"
+#include "src/system/streaming/streamkeys.h"
 
 #define LB_URL "https://api.listenbrainz.org/1/submit-listens"
 #define LB_VALIDATE_URL "https://api.listenbrainz.org/1/validate-token"
@@ -192,13 +193,20 @@ static bool token_shape_ok(const char *value) {
 
 static void token_load(void) {
 	FILE *f = fopen(token_path, "r");
-	if (!f) return;
-	if (fgets(token, sizeof(token), f)) {
-		token[strcspn(token, "\r\n")] = 0;
-		if (!token_shape_ok(token)) token[0] = 0;
+	if (f) {
+		if (fgets(token, sizeof(token), f)) {
+			token[strcspn(token, "\r\n")] = 0;
+			if (!token_shape_ok(token)) token[0] = 0;
+		}
+		fclose(f);
+		chmod(token_path, 0600);
 	}
-	fclose(f);
-	chmod(token_path, 0600);
+	if (!token[0] && !config_get_bool("listenbrainz", "ignore_bundled_token", false)) {
+		const char *bundled = streamkeys_listenbrainz_key();
+		if (token_shape_ok(bundled)) {
+			snprintf(token, sizeof(token), "%s", bundled);
+		}
+	}
 }
 
 static bool validate_token(const char *value, char *user_out, size_t user_cap) {
@@ -440,6 +448,8 @@ void listenbrainz_set_enabled(bool on) {
 
 void listenbrainz_set_token(const char *value) {
 	if (!token_shape_ok(value)) return;
+	config_set_bool("listenbrainz", "ignore_bundled_token", false);
+	config_save();
 	pthread_mutex_lock(&lock);
 	snprintf(new_token, sizeof(new_token), "%s", value);
 	token_valid = false;
@@ -450,6 +460,8 @@ void listenbrainz_set_token(const char *value) {
 }
 
 void listenbrainz_logout(void) {
+	config_set_bool("listenbrainz", "ignore_bundled_token", true);
+	config_save();
 	pthread_mutex_lock(&lock); logout_requested = true; pthread_cond_signal(&wake); pthread_mutex_unlock(&lock);
 }
 
