@@ -67,6 +67,8 @@ void player_layout_set(player_layout_t layout);
 // their accent, as Waveform always does. Off by default; saved in the config.
 bool player_cover_accent(void);
 void player_cover_accent_set(bool on);
+// Accent currently used by the player chrome; follows cover art when enabled.
+lv_color_t player_cover_accent_color(void);
 
 // The output the music was going to has just been unplugged -- a jack pulled
 // out, a USB-C DAC removed, headphones that walked out of range. Pauses, so

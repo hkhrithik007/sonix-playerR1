@@ -68,7 +68,10 @@ There are two builds from one tree:
 
 The `Rage-os` branch uses a Spotify-inspired dark palette, green playback
 controls, a shortcut-based home screen, and a compact player with album art.
-The accent remains adjustable in Appearance settings.
+The accent remains adjustable in Appearance settings. When cover accents are
+enabled, album art also tints a subtle home-screen gradient and the mini-player
+outline and progress bar. Cards use softer corners, and the mini-player fades
+and lifts into view when playback starts.
 
 | Gesture | Action |
 |---|---|
@@ -231,10 +234,10 @@ Steps 1 to 3 happen once. Later builds go straight to step 4.
 
 ### Build with GitHub Actions
 
-Pushing to `Rage-os` or starting **Build HiBy R1 Firmware** from the Actions tab
-builds and packages the R1 firmware. Download the `r1-firmware-<commit>` artifact
-from the completed run; it contains `r1.upt` and `SHA256SUMS`. The `Rage-os`
-build does not publish a GitHub release.
+Pushing to `Rage-os` or manually starting **Build Rage-os Release Firmware**
+from the Actions tab builds and packages the R1 firmware. Each successful run
+updates the **Rage-os Release** GitHub release and uploads a run artifact named
+`rage-os-r1-<run number>` containing `r1.upt` and build information.
 
 Everything the device does not already carry is linked statically, so the
 result is one file to copy across with nothing to install beside it. The same

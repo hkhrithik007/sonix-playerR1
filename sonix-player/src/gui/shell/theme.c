@@ -194,6 +194,9 @@ void theme_init(void) {
 
 	lv_style_init(&theme_style_card);
 	lv_style_set_bg_opa(&theme_style_card, LV_OPA_COVER);
+	// Keep cards, rows and fields visually related across the player; callers
+	// can still override the radius for compact or pill-shaped controls.
+	lv_style_set_radius(&theme_style_card, 12);
 
 	lv_style_init(&theme_style_card_pressed);
 	lv_style_set_bg_opa(&theme_style_card_pressed, LV_OPA_COVER);

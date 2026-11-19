@@ -4612,6 +4612,8 @@ player_layout_t player_layout_get(void) { return layout_choice; }
 
 bool player_cover_accent(void) { return cover_accent; }
 
+lv_color_t player_cover_accent_color(void) { return chrome_accent(); }
+
 void player_cover_accent_set(bool on) {
 	if (on == cover_accent) {
 		return;
