@@ -60,7 +60,8 @@ static bool online(void) {
 
 static void paths_init(void) {
 	char dir[400] = "/tmp";
-	const char *cfg = config_path();
+	char config_file[512];
+	const char *cfg = config_path_copy(config_file, sizeof(config_file));
 	if (cfg && cfg[0]) {
 		const char *slash = strrchr(cfg, '/');
 		if (slash == cfg) snprintf(dir, sizeof(dir), "/");
