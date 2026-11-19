@@ -1,5 +1,7 @@
 ﻿# Sonix Player
 
+ (THIS IS THE SUCCESSOR TO M4ttia's SONIX REPO)
+
 A replacement player for the **HiBy R3 Pro II** and the **HiBy R1**, written on
 LVGL.
 
