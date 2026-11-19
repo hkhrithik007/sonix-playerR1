@@ -4,7 +4,6 @@
 #include <string.h>
 #include <time.h>
 
-#include "src/system/lastfm/lastfm.h"
 #include "src/system/library/library.h"
 
 // A longer step between two calls than this is the device having been asleep,
@@ -12,7 +11,7 @@
 #define STEP_MAX_SECS 5.0
 
 // Back at the start of the same file, after being this far into it: played
-// again. The same test Last.fm's counting makes.
+// again, after ten seconds back near the start.
 #define AGAIN_NEAR_START_SECS 5.0
 #define AGAIN_BACK_SECS 10.0
 
@@ -31,6 +30,12 @@ static double now_seconds(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static bool listened_enough(double length, double listened) {
+	double threshold = length / 2.0;
+	if (threshold > 240.0) threshold = 240.0;
+	return listened >= threshold;
 }
 
 void playcount_note_playback(const playcount_playback_t *now) {
@@ -64,7 +69,8 @@ void playcount_note_playback(const playcount_playback_t *now) {
 	play.last_tick = t;
 	play.last_position = now->position;
 
-	if (!play.counted && !play.skip && lastfm_play_counts(now->duration, play.listened)) {
+	if (!play.counted && !play.skip && now->duration >= 30.0 &&
+		listened_enough(now->duration, play.listened)) {
 		play.counted = true;
 		library_note_play(play.file);
 	}

@@ -89,7 +89,7 @@ static const char *const SCHEMA[] = {
 	"CREATE TABLE IF NOT EXISTS FAVOURITES(path TEXT PRIMARY KEY, name TEXT, artist TEXT, added_at INT)",
 
 	// Also local: how many times each track has been played through, by the
-	// rule Last.fm counts a play by, and when last. Keyed by path and kept apart
+	// rule used for counting a play, and when last. Keyed by path and kept apart
 	// from MEDIA_TABLE like the favourites, so a rescan does not forget it.
 	"CREATE TABLE IF NOT EXISTS PLAY_COUNTS(path TEXT PRIMARY KEY, plays INT NOT NULL, last_played INT)",
 

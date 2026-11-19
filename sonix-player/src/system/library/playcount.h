@@ -6,12 +6,11 @@
 // ---------------------------------------------------------------------------
 // How many times each track has been played, for the Most played list.
 //
-// A play counts by Last.fm's rule (lastfm_play_counts): a track of at least 30
-// seconds, played for half its length or for four minutes. Only time actually
-// playing counts -- not a pause, not the device asleep -- and a track started
-// again, by repeat-one or by hand, is a new play. Counted whether Last.fm is in
-// use or not, and written to the library (library_note_play), which keeps it
-// only for tracks it has indexed.
+// A play counts when a track is at least 30 seconds and has been played for
+// half its length or four minutes. Only time actually playing counts -- not a
+// pause, not the device asleep -- and a track started again, by repeat-one or
+// by hand, is a new play. It is written to the library (library_note_play),
+// which keeps it only for tracks it has indexed.
 // ---------------------------------------------------------------------------
 
 typedef struct {
