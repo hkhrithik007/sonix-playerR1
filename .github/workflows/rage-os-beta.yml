@@ -1,4 +1,4 @@
-name: Build Rage-os Beta Firmware
+name: Build Rage-os Release Firmware
 
 on:
   push:
@@ -11,12 +11,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: rage-os-r1-beta-${{ github.ref }}
+  group: rage-os-release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  # Official HiBy R1 Firmware V1.6 Google Drive folder
-  HIBY_R1_V16_FOLDER: https://drive.google.com/drive/folders/1A2RIMdvuZRzGCNMY9F81vtGAAs2FJ46W?usp=sharing
+  # Latest HiBy R1 firmware Google Drive folder
+  HIBY_R1_LATEST_FOLDER: https://drive.google.com/drive/folders/1SbpnO8DanVWB54M4UeIM6XEzTCwzBbfB
 
   # Rockbox/R1 build environment
   RBDEV_HOST_PREFIX: ${{ github.workspace }}/sonix-player/rockbox-toolchain
@@ -24,12 +24,12 @@ env:
   RBDEV_BUILD: ${{ github.workspace }}/sonix-player/.cache/rbdev-build
   MAKEFLAGS: -j2
 
-  # Rolling beta release
-  LATEST_BETA_RELEASE_TAG: beta-latest
+  # Rolling Rage-os release
+  RAGE_OS_RELEASE_TAG: rage-os-release
 
 jobs:
   build:
-    name: Build Rage-os Beta Firmware
+    name: Build Rage-os Firmware
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
@@ -158,19 +158,19 @@ jobs:
           key: hiby-r1-libs-v1-${{ runner.os }}-${{ hashFiles('sonix-player/Makefile') }}
 
       # ============================================================
-      # DOWNLOAD OFFICIAL HIBY R1 V1.6
+      # DOWNLOAD LATEST OFFICIAL HIBY R1 FIRMWARE
       # ============================================================
-      - name: Download official HiBy R1 v1.6
+      - name: Download latest official HiBy R1 firmware
         shell: bash
         run: |
           set -euo pipefail
 
           echo "============================================"
-          echo "DOWNLOADING OFFICIAL HIBY R1 V1.6"
+          echo "DOWNLOADING LATEST OFFICIAL HIBY R1 FIRMWARE"
           echo "============================================"
 
-          rm -rf sonix-packer/hiby-v1.6-download
-          mkdir -p sonix-packer/hiby-v1.6-download
+          rm -rf sonix-packer/hiby-latest-download
+          mkdir -p sonix-packer/hiby-latest-download
 
           python3 -m venv "$RUNNER_TEMP/gdown-env"
 
@@ -184,32 +184,32 @@ jobs:
           "$RUNNER_TEMP/gdown-env/bin/gdown" --version
 
           "$RUNNER_TEMP/gdown-env/bin/gdown" \
-            "$HIBY_R1_V16_FOLDER" \
-            --output sonix-packer/hiby-v1.6-download \
+            "$HIBY_R1_LATEST_FOLDER" \
+            --output sonix-packer/hiby-latest-download \
             --folder
 
           echo "Downloaded files:"
 
-          find sonix-packer/hiby-v1.6-download \
+          find sonix-packer/hiby-latest-download \
             -type f \
             -printf '%p\n' \
             | sort
 
       # ============================================================
-      # EXTRACT / FIND r1.upt FROM V1.6
+      # EXTRACT / FIND LATEST r1.upt
       # ============================================================
-      - name: Prepare official R1 v1.6 r1.upt
+      - name: Prepare latest official R1 r1.upt
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_DIR="sonix-packer/hiby-v1.6-download"
+          BASE_DIR="sonix-packer/hiby-latest-download"
           OUTPUT="sonix-packer/r1_original.upt"
 
           rm -f "$OUTPUT"
 
           echo "============================================"
-          echo "LOCATING OFFICIAL R1 V1.6 r1.upt"
+          echo "LOCATING LATEST OFFICIAL R1 r1.upt"
           echo "============================================"
 
           DIRECT_UPT=$(find "$BASE_DIR" \
@@ -273,7 +273,7 @@ jobs:
           fi
 
           if [ ! -s "$OUTPUT" ]; then
-            echo "ERROR: Official HiBy R1 v1.6 r1.upt was not found."
+            echo "ERROR: latest official HiBy R1 firmware r1.upt was not found."
 
             find "$BASE_DIR" \
               -type f \
@@ -284,7 +284,7 @@ jobs:
           fi
 
           echo "============================================"
-          echo "OFFICIAL HIBY R1 V1.6 FOUND"
+          echo "LATEST OFFICIAL HIBY R1 FIRMWARE FOUND"
           echo "============================================"
 
           ls -lh "$OUTPUT"
@@ -303,7 +303,7 @@ jobs:
 
           7z l "$OUTPUT" | grep -q 'ota_v0'
 
-          echo "Official HiBy R1 v1.6 firmware is ready."
+          echo "Latest official HiBy R1 firmware is ready."
 
       # ============================================================
       # CREATE / SEAL STREAMING KEYS
@@ -588,7 +588,7 @@ jobs:
           set -euo pipefail
 
           echo "============================================"
-          echo "PACKING SONIX PLAYER INTO HIBY R1 V1.6"
+          echo "PACKING SONIX PLAYER INTO HIBY R1 LATEST FIRMWARE"
           echo "============================================"
 
           ./sonix_firmware_packer.sh
@@ -641,6 +641,10 @@ jobs:
 
           test -d "$OTA_DIR"
           test -f "$OTA_DIR/ota_update.in"
+          test -f "$OTA_DIR/ota_compatibility.in"
+          grep -Fxq 'compatibility=hiby_r1_x1600_auto_rf_auto' \
+            "$OTA_DIR/ota_compatibility.in"
+          echo "R1 bootloader compatibility marker verified."
 
           echo "============================================"
           echo "ota_update.in"
@@ -722,7 +726,7 @@ jobs:
       # ============================================================
       # CREATE BUILD INFORMATION
       # ============================================================
-      - name: Create beta build information
+      - name: Create Rage-os build information
         shell: bash
         run: |
           set -euo pipefail
@@ -733,55 +737,54 @@ jobs:
           )
 
           {
-            echo "HiBy R1 Sonix Player Beta Firmware"
+            echo "Rage-os Release Firmware"
             echo
             echo "Branch: ${GITHUB_REF_NAME}"
             echo "Commit: ${GITHUB_SHA}"
             echo "Run number: ${GITHUB_RUN_NUMBER}"
             echo "Build time: ${BUILD_TIME_IST}"
             echo
-            echo "Base firmware: Official HiBy R1 v1.6"
+            echo "Base firmware: latest official HiBy R1 firmware"
             echo
-            echo "This is a beta build."
-          } > sonix-packer/beta-build-info.txt
+            echo "This is a Rage-os build."
+          } > sonix-packer/rage-os-build-info.txt
 
-          cat sonix-packer/beta-build-info.txt
+          cat sonix-packer/rage-os-build-info.txt
 
       # ============================================================
       # UPLOAD ARTIFACT
       # ============================================================
-      - name: Upload beta firmware artifact
+      - name: Upload Rage-os firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hiby-r1-beta-${{ github.run_number }}
+          name: rage-os-r1-${{ github.run_number }}
           path: |
             sonix-packer/r1.upt
-            sonix-packer/beta-build-info.txt
+            sonix-packer/rage-os-build-info.txt
           if-no-files-found: error
           retention-days: 30
 
       # ============================================================
-      # PREPARE ROLLING BETA RELEASE
+      # PREPARE RAGE-OS RELEASE
       # ============================================================
-      - name: Prepare rolling beta release
+      - name: Prepare rolling Rage-os release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          TAG="${LATEST_BETA_RELEASE_TAG}"
-
+          TAG="${RAGE_OS_RELEASE_TAG}"
           BUILD_TIME_IST=$(
             TZ=Asia/Kolkata \
             date '+%d-%m-%Y %I:%M:%S %p IST'
           )
 
-          RELEASE_TITLE="HiBy R1 Beta - ${BUILD_TIME_IST}"
+          RELEASE_TITLE="Rage-os Release"
 
           RELEASE_NOTES=$(
             cat <<EOF
-          ## HiBy R1 Beta
+          ## Rage-os Release
 
           **Build time:** ${BUILD_TIME_IST}
 
@@ -789,9 +792,9 @@ jobs:
 
           **Run:** #${GITHUB_RUN_NUMBER}
 
-          **Base firmware:** Official HiBy R1 v1.6
+          **Base firmware:** latest official HiBy R1 firmware
 
-          This is a rolling beta release. The assets are replaced by the newest successful beta build.
+          This Rage-os release is updated with each successful build from the Rage-os branch.
           EOF
           )
 
@@ -799,44 +802,43 @@ jobs:
           echo "Release title: $RELEASE_TITLE"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Existing beta release found."
+            echo "Existing Rage-os release found."
 
             gh release edit "$TAG" \
               --title "$RELEASE_TITLE" \
-              --notes "$RELEASE_NOTES" \
-              --prerelease
+              --notes "$RELEASE_NOTES"
 
           else
-            echo "Creating rolling beta release."
+            echo "Creating rolling Rage-os release."
 
             gh release create "$TAG" \
               --title "$RELEASE_TITLE" \
               --notes "$RELEASE_NOTES" \
-              --prerelease
+              --target "$GITHUB_SHA"
           fi
 
       # ============================================================
-      # UPLOAD ROLLING BETA FIRMWARE
+      # UPLOAD RAGE-OS FIRMWARE
       # ============================================================
-      - name: Upload rolling beta firmware
+      - name: Upload Rage-os release firmware
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          TAG="${LATEST_BETA_RELEASE_TAG}"
+          TAG="${RAGE_OS_RELEASE_TAG}"
 
           test -s sonix-packer/r1.upt
-          test -s sonix-packer/beta-build-info.txt
+          test -s sonix-packer/rage-os-build-info.txt
 
           gh release upload "$TAG" \
             sonix-packer/r1.upt \
-            sonix-packer/beta-build-info.txt \
+            sonix-packer/rage-os-build-info.txt \
             --clobber
 
           echo "============================================"
-          echo "BETA RELEASE UPDATED"
+          echo "RAGE-OS RELEASE UPDATED"
           echo "============================================"
 
           gh release view "$TAG"
@@ -857,7 +859,7 @@ jobs:
           )
 
           {
-            echo "## HiBy R1 Beta Firmware"
+            echo "## Rage-os Release Firmware"
             echo
             echo "### Build successful"
             echo
@@ -865,8 +867,8 @@ jobs:
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
             echo "- Build time: \`${BUILD_TIME_IST}\`"
-            echo "- Base firmware: HiBy R1 v1.6"
-            echo "- Release tag: \`${LATEST_BETA_RELEASE_TAG}\`"
+            echo "- Base firmware: latest official HiBy R1 firmware"
+            echo "- Release tag: \`${RAGE_OS_RELEASE_TAG}\`"
             echo
             echo "### Firmware"
             echo
@@ -877,13 +879,14 @@ jobs:
             echo "- UPT archive valid"
             echo "- ota_v0 present"
             echo "- ota_update.in present"
+            echo "- R1 bootloader compatibility marker present"
             echo "- Rootfs chunks present"
             echo "- Sonix Player binary present"
             echo "- Last.fm sealed key payload present"
             echo
             echo "### Result"
             echo
-            echo "Rolling beta release updated successfully."
+            echo "Rolling Rage-os release updated successfully."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Build completed successfully."

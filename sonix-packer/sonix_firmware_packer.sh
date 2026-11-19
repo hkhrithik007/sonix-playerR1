@@ -318,6 +318,13 @@ build_one() {
 
 	[ -d "$OTA_DIR" ] || die "there is no ota_v0 folder inside the .upt: not a firmware of this kind."
 
+	# R1 units shipped with HiBy firmware 2.0 use a newer recovery bootloader
+	# that refuses OTA packages without this board compatibility marker.
+	# Always emit it for R1, including when the supplied base predates 2.0.
+	if [ "$MODEL_DIR" = "R1" ]; then
+		printf '%s\n' 'compatibility=hiby_r1_x1600_auto_rf_auto' > "$OTA_DIR/ota_compatibility.in"
+	fi
+
 	say "    Joining the rootfs chunks..."
 	( cd "$OTA_DIR" && cat rootfs.squashfs.* ) > "$MERGED_SQUASHFS"
 
