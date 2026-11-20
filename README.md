@@ -608,3 +608,10 @@ sonix-player/
 [@hkhrithik007](https://github.com/hkhrithik007)
 
 and all the members of this fantastic community!!
+
+Rage-os also brings together UI and interaction ideas from
+[sonix-player-rekkod-mod](https://github.com/Rekkod-Tree/sonix-player-rekkod-mod)
+and visual-player features from
+[sonix-visualiser](https://github.com/josephmalam/sonix-visualiser). Thank you
+to RekkoD-Tree and josephmalam for sharing your work with the Sonix community;
+these projects helped shape Rage-os.
