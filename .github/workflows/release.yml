@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - main
-<<<<<<< Updated upstream
-=======
-      - spotui
-      - beta-releases
->>>>>>> Stashed changes
 
   workflow_dispatch:
 
@@ -22,12 +17,13 @@ concurrency:
 
 env:
   # ================================================================
-  # HiBy R1 OFFICIAL V1.6 BASE FIRMWARE
+  # Latest official HiBy R1 firmware (v2.0).
   #
   # This is the Google Drive folder linked by HiBy's official
-  # R1 Firmware V1.6 download page.
+  # Linked from HiBy's official R1 Firmware V2.0 download page.
   # ================================================================
-  HIBY_R1_V16_FOLDER: https://drive.google.com/drive/folders/1A2RIMdvuZRzGCNMY9F81vtGAAs2FJ46W?usp=sharing
+  HIBY_R1_FIRMWARE_VERSION: "2.0"
+  HIBY_R1_V20_FOLDER: https://drive.google.com/drive/folders/1SbpnO8DanVWB54M4UeIM6XEzTCwzBbfB?usp=sharing
 
   # ================================================================
   # ROCKBOX / R1 BUILD ENVIRONMENT
@@ -36,7 +32,6 @@ env:
   RBDEV_DOWNLOAD: ${{ github.workspace }}/sonix-player/.cache/rbdev-dl
   RBDEV_BUILD: ${{ github.workspace }}/sonix-player/.cache/rbdev-build
 
-<<<<<<< Updated upstream
   MAKEFLAGS: -j2
 
   # ================================================================
@@ -44,13 +39,6 @@ env:
   # ================================================================
   RELEASE_TAG: latest
   RELEASE_NAME: Latest Sonix Player R1 Firmware
-=======
-  # Canonical working SpotUI source.
-  SPOTUI_REPOSITORY: https://github.com/noisetta/spotui-hiby-r3proii.git
-  SPOTUI_REF: main
-  R1_UI_PATCH_VERSION: v5-robust-no-wlan0-startup
-  R1_PLAYBACK_PATCH_VERSION: symphonia-codec-vorbis-0.5.5-integer-root-v1
->>>>>>> Stashed changes
 
 
 jobs:
@@ -212,21 +200,21 @@ jobs:
 
 
       # ============================================================
-      # DOWNLOAD OFFICIAL HIBY R1 V1.6
+      # DOWNLOAD OFFICIAL HIBY R1 V2.0
       # ============================================================
 
-      - name: Download official HiBy R1 v1.6
+      - name: Download official HiBy R1 v2.0
         shell: bash
         run: |
           set -euo pipefail
 
           echo
           echo "============================================"
-          echo "DOWNLOADING OFFICIAL HIBY R1 V1.6"
+          echo "DOWNLOADING OFFICIAL HIBY R1 V${HIBY_R1_FIRMWARE_VERSION}"
           echo "============================================"
 
-          rm -rf sonix-packer/hiby-v1.6-download
-          mkdir -p sonix-packer/hiby-v1.6-download
+          rm -rf sonix-packer/hiby-v2.0-download
+          mkdir -p sonix-packer/hiby-v2.0-download
 
           python3 -m venv "$RUNNER_TEMP/gdown-env"
 
@@ -241,36 +229,36 @@ jobs:
           "$RUNNER_TEMP/gdown-env/bin/gdown" --version
 
           echo
-          echo "Downloading HiBy R1 v1.6 folder..."
+          echo "Downloading HiBy R1 v${HIBY_R1_FIRMWARE_VERSION} folder..."
 
           "$RUNNER_TEMP/gdown-env/bin/gdown" \
-            "$HIBY_R1_V16_FOLDER" \
-            --output sonix-packer/hiby-v1.6-download \
+            "$HIBY_R1_V20_FOLDER" \
+            --output sonix-packer/hiby-v2.0-download \
             --folder
 
           echo
           echo "Downloaded files:"
-          find sonix-packer/hiby-v1.6-download \
+          find sonix-packer/hiby-v2.0-download \
             -type f \
             -printf '%p\n' \
             | sort
       # ============================================================
-      # EXTRACT / FIND r1.upt FROM V1.6
+      # EXTRACT / FIND r1.upt FROM V2.0
       # ============================================================
 
-      - name: Prepare official R1 v1.6 r1.upt
+      - name: Prepare official R1 v2.0 r1.upt
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_DIR="sonix-packer/hiby-v1.6-download"
+          BASE_DIR="sonix-packer/hiby-v2.0-download"
           OUTPUT="sonix-packer/r1_original.upt"
 
           rm -f "$OUTPUT"
 
           echo
           echo "============================================"
-          echo "LOCATING OFFICIAL R1 V1.6 r1.upt"
+          echo "LOCATING OFFICIAL R1 V${HIBY_R1_FIRMWARE_VERSION} r1.upt"
           echo "============================================"
 
           # ----------------------------------------------------------
@@ -307,14 +295,14 @@ jobs:
               echo "Found firmware ZIP:"
               echo "$ZIP_FILE"
 
-              rm -rf "$RUNNER_TEMP/hiby-r1-v16-extracted"
-              mkdir -p "$RUNNER_TEMP/hiby-r1-v16-extracted"
+              rm -rf "$RUNNER_TEMP/hiby-r1-v2.0-extracted"
+              mkdir -p "$RUNNER_TEMP/hiby-r1-v2.0-extracted"
 
               unzip -o "$ZIP_FILE" \
-                -d "$RUNNER_TEMP/hiby-r1-v16-extracted"
+                -d "$RUNNER_TEMP/hiby-r1-v2.0-extracted"
 
               EXTRACTED_UPT=$(find \
-                "$RUNNER_TEMP/hiby-r1-v16-extracted" \
+                "$RUNNER_TEMP/hiby-r1-v2.0-extracted" \
                 -type f \
                 \( -iname 'r1.upt' -o -iname 'R1.upt' \) \
                 -print \
@@ -363,7 +351,7 @@ jobs:
           if [ ! -s "$OUTPUT" ]; then
 
             echo
-            echo "ERROR: Official HiBy R1 v1.6 r1.upt was not found."
+            echo "ERROR: Official HiBy R1 v${HIBY_R1_FIRMWARE_VERSION} r1.upt was not found."
             echo
             echo "Downloaded files:"
             find "$BASE_DIR" -type f -printf '%p\n' | sort
@@ -378,7 +366,7 @@ jobs:
 
           echo
           echo "============================================"
-          echo "OFFICIAL HIBY R1 V1.6 FOUND"
+          echo "OFFICIAL HIBY R1 V${HIBY_R1_FIRMWARE_VERSION} FOUND"
           echo "============================================"
 
           ls -lh "$OUTPUT"
@@ -406,7 +394,7 @@ jobs:
           7z l "$OUTPUT" | grep -q 'ota_v0'
 
           echo
-          echo "Official HiBy R1 v1.6 firmware is ready."
+          echo "Official HiBy R1 v${HIBY_R1_FIRMWARE_VERSION} firmware is ready."
 
 
       # ============================================================
@@ -601,7 +589,7 @@ jobs:
 
           echo
           echo "============================================"
-          echo "PACKING SONIX PLAYER INTO HIBY R1 V1.6"
+          echo "PACKING SONIX PLAYER INTO HIBY R1 V${HIBY_R1_FIRMWARE_VERSION}"
           echo "============================================"
 
           ./sonix_firmware_packer.sh
@@ -672,6 +660,10 @@ jobs:
           OTA_DIR="$RUNNER_TEMP/r1-verify/ota_v0"
 
           test -d "$OTA_DIR"
+          test -f "$OTA_DIR/ota_compatibility.in"
+          grep -Fxq 'compatibility=hiby_r1_x1600_auto_rf_auto' \
+            "$OTA_DIR/ota_compatibility.in"
+          echo "HiBy R1 v2.0 compatibility marker verified."
 
           echo
           echo "OTA files:"
@@ -797,7 +789,7 @@ jobs:
 
           ## Base firmware
 
-          Official HiBy R1 Firmware V1.6.
+          Official HiBy R1 Firmware V${HIBY_R1_FIRMWARE_VERSION}.
 
           ## Files
 
@@ -864,7 +856,6 @@ jobs:
       # FAILURE DIAGNOSTICS
       # ============================================================
 
-<<<<<<< Updated upstream
       - name: Upload diagnostics on failure
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -876,56 +867,5 @@ jobs:
             sonix-player/.cache/rbdev-build/*.log
             sonix-packer/r1_original.upt
             sonix-packer/r1.upt
-            sonix-packer/hiby-v1.6-download/**
+            sonix-packer/hiby-v2.0-download/**
           retention-days: 14
-=======
-          BUILD_TIME_IST=$(
-            TZ=Asia/Kolkata \
-            date '+%d-%m-%Y %I:%M:%S %p IST'
-          )
-
-          {
-            echo "## SpotUI HiBy R1"
-            echo
-            echo "### Build successful"
-            echo
-            echo "- Branch: \`${GITHUB_REF_NAME}\`"
-            echo "- Commit: \`${GITHUB_SHA}\`"
-            echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
-            echo "- Build time: \`${BUILD_TIME_IST}\`"
-            echo "- Target: \`${RUST_TARGET}\`"
-            echo "- librespot: \`${LIBRESPOT_VERSION}\`"
-            echo
-            echo "### Fixes"
-            echo
-            echo "- MIPS toolchain downloaded from GitHub instead of stalled musl.cc endpoint"
-            echo "- SpotUI source auto-resolved"
-            echo "- serde_json dependency explicitly added to librespot for spotui_daemon"
-            echo "- Spotify daemon autorun included"
-            echo "- Symphonia OGG/Vorbis integer-root fix applied for MIPS32 soft-float"
-            echo "- GCC resolves the MIPS sysroot, CRT objects, and musl loader directly"
-            echo "- GCC is used to resolve CRT, loader, and runtime-library paths; no recursive toolchain scanning"
-            echo "- R1 musl loader bundled and invoked explicitly"
-            echo
-            echo "### Artifacts"
-            echo
-            echo "- \`spotui_daemon\`"
-            echo "- \`spotui-ui-poc\`"
-            echo "- \`S91_spotui_daemon\`"
-            echo "- \`spotui_daemon_autostart.sh\`"
-            echo "- \`SHA256SUMS\`"
-            echo "- \`build-info.txt\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "SpotUI HiBy R1 build completed successfully."
-
-  firmware:
-    name: Build the R1 firmware image
-    needs: build
-    if: github.ref_name == 'spotui'
-    uses: ./.github/workflows/spotui-r1-upt.yml
-    permissions:
-      actions: read
-      contents: write
-    secrets: inherit
->>>>>>> Stashed changes
