@@ -15,8 +15,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Official HiBy R1 Firmware V1.6 Google Drive folder
-  HIBY_R1_V16_FOLDER: https://drive.google.com/drive/folders/1A2RIMdvuZRzGCNMY9F81vtGAAs2FJ46W?usp=sharing
+  # Official HiBy R1 Firmware V2.0 Google Drive folder
+  HIBY_R1_FIRMWARE_VERSION: "2.0"
+  HIBY_R1_V20_FOLDER: https://drive.google.com/drive/folders/1SbpnO8DanVWB54M4UeIM6XEzTCwzBbfB?usp=sharing
 
   # Rockbox/R1 build environment
   RBDEV_HOST_PREFIX: ${{ github.workspace }}/sonix-player/rockbox-toolchain
@@ -158,19 +159,19 @@ jobs:
           key: hiby-r1-libs-v1-${{ runner.os }}-${{ hashFiles('sonix-player/Makefile') }}
 
       # ============================================================
-      # DOWNLOAD OFFICIAL HIBY R1 V1.6
+      # DOWNLOAD OFFICIAL HIBY R1 V2.0
       # ============================================================
-      - name: Download official HiBy R1 v1.6
+      - name: Download official HiBy R1 v2.0
         shell: bash
         run: |
           set -euo pipefail
 
           echo "============================================"
-          echo "DOWNLOADING OFFICIAL HIBY R1 V1.6"
+          echo "DOWNLOADING OFFICIAL HIBY R1 V2.0"
           echo "============================================"
 
-          rm -rf sonix-packer/hiby-v1.6-download
-          mkdir -p sonix-packer/hiby-v1.6-download
+          rm -rf sonix-packer/hiby-v2.0-download
+          mkdir -p sonix-packer/hiby-v2.0-download
 
           python3 -m venv "$RUNNER_TEMP/gdown-env"
 
@@ -184,32 +185,32 @@ jobs:
           "$RUNNER_TEMP/gdown-env/bin/gdown" --version
 
           "$RUNNER_TEMP/gdown-env/bin/gdown" \
-            "$HIBY_R1_V16_FOLDER" \
-            --output sonix-packer/hiby-v1.6-download \
+            "$HIBY_R1_V20_FOLDER" \
+            --output sonix-packer/hiby-v2.0-download \
             --folder
 
           echo "Downloaded files:"
 
-          find sonix-packer/hiby-v1.6-download \
+          find sonix-packer/hiby-v2.0-download \
             -type f \
             -printf '%p\n' \
             | sort
 
       # ============================================================
-      # EXTRACT / FIND r1.upt FROM V1.6
+      # EXTRACT / FIND r1.upt FROM V2.0
       # ============================================================
-      - name: Prepare official R1 v1.6 r1.upt
+      - name: Prepare official R1 v2.0 r1.upt
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_DIR="sonix-packer/hiby-v1.6-download"
+          BASE_DIR="sonix-packer/hiby-v2.0-download"
           OUTPUT="sonix-packer/r1_original.upt"
 
           rm -f "$OUTPUT"
 
           echo "============================================"
-          echo "LOCATING OFFICIAL R1 V1.6 r1.upt"
+          echo "LOCATING OFFICIAL R1 V2.0 r1.upt"
           echo "============================================"
 
           DIRECT_UPT=$(find "$BASE_DIR" \
@@ -235,14 +236,14 @@ jobs:
               echo "Found firmware ZIP:"
               echo "$ZIP_FILE"
 
-              rm -rf "$RUNNER_TEMP/hiby-r1-v16-extracted"
-              mkdir -p "$RUNNER_TEMP/hiby-r1-v16-extracted"
+              rm -rf "$RUNNER_TEMP/hiby-r1-v20-extracted"
+              mkdir -p "$RUNNER_TEMP/hiby-r1-v20-extracted"
 
               unzip -o "$ZIP_FILE" \
-                -d "$RUNNER_TEMP/hiby-r1-v16-extracted"
+                -d "$RUNNER_TEMP/hiby-r1-v20-extracted"
 
               EXTRACTED_UPT=$(find \
-                "$RUNNER_TEMP/hiby-r1-v16-extracted" \
+                "$RUNNER_TEMP/hiby-r1-v20-extracted" \
                 -type f \
                 \( -iname 'r1.upt' -o -iname 'R1.upt' \) \
                 -print \
@@ -273,7 +274,7 @@ jobs:
           fi
 
           if [ ! -s "$OUTPUT" ]; then
-            echo "ERROR: Official HiBy R1 v1.6 r1.upt was not found."
+            echo "ERROR: Official HiBy R1 v2.0 r1.upt was not found."
 
             find "$BASE_DIR" \
               -type f \
@@ -284,7 +285,7 @@ jobs:
           fi
 
           echo "============================================"
-          echo "OFFICIAL HIBY R1 V1.6 FOUND"
+          echo "OFFICIAL HIBY R1 V2.0 FOUND"
           echo "============================================"
 
           ls -lh "$OUTPUT"
@@ -303,136 +304,11 @@ jobs:
 
           7z l "$OUTPUT" | grep -q 'ota_v0'
 
-          echo "Official HiBy R1 v1.6 firmware is ready."
+          echo "Official HiBy R1 v2.0 firmware is ready."
 
-      # ============================================================
-      # CREATE / SEAL STREAMING KEYS
-      # ============================================================
-      - name: Create and seal Last.fm streaming keys
-        working-directory: sonix-player
-        shell: bash
-        env:
-          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
-          LASTFM_API_SECRET: ${{ secrets.LASTFM_API_SECRET }}
-        run: |
-          set -euo pipefail
-
-          echo "============================================"
-          echo "PREPARING LAST.FM STREAMING KEYS"
-          echo "============================================"
-
-          test -f streaming-keys.ini.example
-          test -f tools/seal_streamkeys.py
-
-          cp -f streaming-keys.ini.example streaming-keys.ini
-
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          path = Path("streaming-keys.ini")
-          text = path.read_text(encoding="utf-8")
-
-          api_key = os.environ["LASTFM_API_KEY"].strip()
-          api_secret = os.environ["LASTFM_API_SECRET"].strip()
-
-          if not api_key:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_KEY GitHub Secret is empty."
-              )
-
-          if not api_secret:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_SECRET GitHub Secret is empty."
-              )
-
-          if "\n" in api_key or "\r" in api_key:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_KEY must be a single line."
-              )
-
-          if "\n" in api_secret or "\r" in api_secret:
-              raise SystemExit(
-                  "ERROR: LASTFM_API_SECRET must be a single line."
-              )
-
-          match = re.search(
-              r"(?ms)^\[lastfm\][ \t]*\r?$.*?(?=^\[[^]]+\][ \t]*\r?$|\Z)",
-              text,
-          )
-
-          if not match:
-              raise SystemExit(
-                  "ERROR: [lastfm] section was not found "
-                  "in streaming-keys.ini.example."
-              )
-
-          section = match.group(0)
-
-          if not re.search(
-              r"(?m)^[ \t]*api_key[ \t]*=",
-              section,
-          ):
-              raise SystemExit(
-                  "ERROR: api_key entry was not found "
-                  "in the [lastfm] section."
-              )
-
-          if not re.search(
-              r"(?m)^[ \t]*api_secret[ \t]*=",
-              section,
-          ):
-              raise SystemExit(
-                  "ERROR: api_secret entry was not found "
-                  "in the [lastfm] section."
-              )
-
-          section = re.sub(
-              r"(?m)^([ \t]*api_key[ \t]*=[ \t]*)[^\r\n]*$",
-              lambda m: m.group(1) + api_key,
-              section,
-              count=1,
-          )
-
-          section = re.sub(
-              r"(?m)^([ \t]*api_secret[ \t]*=[ \t]*)[^\r\n]*$",
-              lambda m: m.group(1) + api_secret,
-              section,
-              count=1,
-          )
-
-          path.write_text(
-              text[:match.start()] +
-              section +
-              text[match.end():],
-              encoding="utf-8",
-          )
-          PY
-
-          chmod 600 streaming-keys.ini
-
-          echo "Last.fm credentials inserted into streaming-keys.ini."
-
-          echo "Sealing streaming keys..."
-
-          python3 tools/seal_streamkeys.py seal
-
-          test -s streaming-keys.key
-
-          for PACKED_KEYS in \
-            ../sonix-packer/assets/R1/usr/resource/sonix/components/streaming-keys.bin \
-            ../sonix-packer/assets/R3PII/usr/resource/sonix/components/streaming-keys.bin
-          do
-            test -s "$PACKED_KEYS" || {
-              echo "ERROR: Sealed streaming keys were not found:"
-              echo "$PACKED_KEYS"
-              exit 1
-            }
-          done
-
-          echo "Streaming keys sealed successfully."
-          echo "The credential values themselves are not printed."
+      # ListenBrainz uses a personal user token entered on-device and stored
+      # beside the player configuration. Do not bake that private token into
+      # a downloadable firmware image.
 
       # ============================================================
       # BUILD SONIX PLAYER
@@ -588,7 +464,7 @@ jobs:
           set -euo pipefail
 
           echo "============================================"
-          echo "PACKING SONIX PLAYER INTO HIBY R1 V1.6"
+          echo "PACKING SONIX PLAYER INTO HIBY R1 V2.0"
           echo "============================================"
 
           ./sonix_firmware_packer.sh
@@ -686,23 +562,8 @@ jobs:
               exit 1
             }
 
-          # ----------------------------------------------------------
-          # Verify Last.fm sealed key payload exists.
-          # ----------------------------------------------------------
-          echo "Checking Last.fm sealed key payload..."
-
-          KEYS_SIZE=$(
-            unsquashfs -cat "$ROOTFS_IMAGE" \
-              usr/resource/sonix/components/streaming-keys.bin \
-              | wc -c
-          )
-
-          echo "streaming-keys.bin size: $KEYS_SIZE bytes"
-
-          if [ "$KEYS_SIZE" -le 0 ]; then
-            echo "ERROR: streaming-keys.bin is empty or missing."
-            exit 1
-          fi
+          # ListenBrainz credentials are configured by each user on-device.
+          echo "ListenBrainz token remains user-configured on the device."
 
           # ----------------------------------------------------------
           # Verify firmware contains the expected main filesystem.
@@ -740,7 +601,7 @@ jobs:
             echo "Run number: ${GITHUB_RUN_NUMBER}"
             echo "Build time: ${BUILD_TIME_IST}"
             echo
-            echo "Base firmware: Official HiBy R1 v1.6"
+            echo "Base firmware: Official HiBy R1 v${HIBY_R1_FIRMWARE_VERSION}"
             echo
             echo "This is a beta build."
           } > sonix-packer/beta-build-info.txt
@@ -789,7 +650,7 @@ jobs:
 
           **Run:** #${GITHUB_RUN_NUMBER}
 
-          **Base firmware:** Official HiBy R1 v1.6
+          **Base firmware:** Official HiBy R1 v${HIBY_R1_FIRMWARE_VERSION}
 
           This is a rolling beta release. The assets are replaced by the newest successful beta build.
           EOF
@@ -865,7 +726,7 @@ jobs:
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
             echo "- Build time: \`${BUILD_TIME_IST}\`"
-            echo "- Base firmware: HiBy R1 v1.6"
+            echo "- Base firmware: HiBy R1 v${HIBY_R1_FIRMWARE_VERSION}"
             echo "- Release tag: \`${LATEST_BETA_RELEASE_TAG}\`"
             echo
             echo "### Firmware"
@@ -879,7 +740,7 @@ jobs:
             echo "- ota_update.in present"
             echo "- Rootfs chunks present"
             echo "- Sonix Player binary present"
-            echo "- Last.fm sealed key payload present"
+            echo "- ListenBrainz user-token flow retained"
             echo
             echo "### Result"
             echo
