@@ -18,6 +18,7 @@
 #include "src/gui/nowplaying/coverflow.h"
 #include "src/gui/settings/artistexceptions.h"
 #include "src/gui/settings/lastfmsettings.h"
+#include "src/gui/settings/listenbrainzsettings.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
@@ -1898,8 +1899,13 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_nowplaying_page(cfg);
 	settingsrow_add(container, "musicsettings_now_playing", NULL, switch_screen_cb, nowplaying_screen);
 
-	lastfmsettings_init(cfg);
-	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());
+	// NOTE: last.fm settings won't be available by default because the default Sonix player does not come with the API keys for it.
+	// TODO: once a plugin system is implemented, remove last.fm from the stock player, and package it as a plugin instead.
+	// lastfmsettings_init(cfg);
+	// settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());
+
+	listenbrainzsettings_init(cfg);
+	settingsrow_add(container, "listenbrainz", NULL, switch_screen_cb, listenbrainzsettings_screen());
 
 	settingsrow_heading(container, "musicsettings_section_playback");
 	build_playback_page(cfg);
