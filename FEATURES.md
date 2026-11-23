@@ -102,7 +102,14 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Qobuz** - sign in with your account. MP3 320, FLAC 16/44.1, 24/96 and 24/192. Search, albums, artists, playlists, favourites and new releases. You can add and remove favourites and manage your playlists from the player.
 - **Radio** - thousands of stations by country, language or genre, plus search, favourites and recently played. MP3, AAC and FLAC stations.
   > **My stations** - write your own list in a `radio.txt` file in the root of the card, one station per line: `name, address`.
-- **Last.fm** - scrobbles what you listen to. Without Wi-Fi the plays are kept and sent the next time the player connects.
+- **ListenBrainz** - scrobbles what you listen to to ListenBrainz with a user token. Without Wi-Fi the plays are kept and sent the next time the player connects.
+
+> [!NOTE]
+> **last.fm**
+>
+> The code fully supports last.fm, but the standard Sonix OS release does not have this feature enabled due to issues with sourcing the API keys for it.
+> 
+> To re-enable it (if you are forking Sonix) just edit `musicsettings.c`, uncommenting the lines for initializing last.fm and for adding the last.fm settings to the page. Also edit `main.c` to uncomment the `lastfm_init()` call.
 
 ## Podcasts
 
