@@ -1,6 +1,9 @@
 ﻿# Sonix Player
 
- (THIS IS THE SUCCESSOR TO M4ttia's SONIX REPO)
+> [!Note]
+> THIS IS THE SUCCESSOR TO M4ttia's SONIX REPO
+> 
+> Huge thanks for Jepl4r/M4ttia for being the one to start this project!
 
 A replacement player for the **HiBy R3 Pro II** and the **HiBy R1**, written on
 LVGL.
@@ -10,7 +13,7 @@ Everything it can do is in **[FEATURES.md](FEATURES.md)**.
 ## Install
 
 1. Download the firmware for your player from the
-   **[latest release](https://github.com/Jepl4r/sonix-player/releases/latest)**:
+   **[latest release](https://github.com/Tartarus6/sonix-player/releases/latest)**:
    `r3proii.upt` for the R3 Pro II, `r1.upt` for the R1. **Never the other
    one**: the update does not check which player it is given.
 2. Charge the player **above 30%**.
@@ -47,7 +50,7 @@ into each image.
 | DAC controls | digital filters, DRE, NOS | digital filters, NOS |
 | touch | Goodix gt9xx, open-source driver, five fingers | Hynitron CST8xx, open-source driver, two fingers |
 | charger | MP2731 | the AXP2101 PMIC |
-| kernel | custom 4.4.94, see [hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel) | the same |
+| kernel | custom 4.4.94, see [hiby-custom-kernel](https://github.com/Tartarus6/hiby-custom-kernel) | the same |
 | double tap to wake | yes | no |
 | buttons | volume on the left flank, playback on the right | all on the right flank, one skip key |
 | firmware image | `r3proii.upt` | `r1.upt` |
@@ -362,7 +365,7 @@ the stock one: it may not be bigger than the stock kernel, and its size and md5
 go into `ota_update.in`. Without it the stock kernel is carried across
 untouched, size and md5 copied from the original rather than recomputed. The
 kernels in `kernel/` are built from
-[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), and the
+[hiby-custom-kernel](https://github.com/Tartarus6/hiby-custom-kernel), and the
 modules in `assets/<model>/module_driver/` are built against them.
 
 Most of those modules are open-source replacements for HiBy's closed ones,

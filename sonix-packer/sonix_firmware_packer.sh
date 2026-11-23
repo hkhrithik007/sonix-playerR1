@@ -68,6 +68,10 @@ LAUNCH_BIN="$SCRIPT_DIR/sonix_launch"
 # Not under assets/, which is copied into the rootfs.
 KERNEL_DIR="$SCRIPT_DIR/kernel"
 
+# The size of the partitions the two images are written to
+KERNEL_MAX=$((0x500000))
+ROOTFS_MAX=$((0x2d00000))
+
 # The models, one line each: the assets folder, the stock firmware to start
 # from, the image to write, and the device-name the player will read out of
 # system-info.json. The last one is not decoration -- it is checked against the
@@ -660,20 +664,19 @@ build_one() {
 
 	ORIGINAL_SUM="$(get_md5 "$ROOTFS_NEW")"
 	SIZE="$(get_size "$ROOTFS_NEW")"
-	say "    rootfs.squashfs: $SIZE bytes, md5 $ORIGINAL_SUM"
+	say "    rootfs.squashfs: $SIZE bytes, md5 $ORIGINAL_SUM (max $ROOTFS_MAX)"
+	[ "$SIZE" -le "$ROOTFS_MAX" ] ||
+		die "rootfs.squashfs is $SIZE bytes, $((SIZE - ROOTFS_MAX)) more than the $ROOTFS_MAX-byte rootfs partition."
 
 	step "[$MODEL_NAME] updating ota_update.in"
 	if [ -f "$KERNEL_NEW" ]; then
 		# A kernel of our own: it replaces the stock one, chunks and md5 chain
-		# alike. It may not be bigger than the stock one -- that is all the
-		# room the kernel partition is known to have.
-		STOCK_X_SIZE="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_size' | cut -d= -f2 | tr -d '\r ')"
+		# alike. It has to fit in the kernel partition.
 		X_SIZE="$(get_size "$KERNEL_NEW")"
 		X_MD5="$(get_md5 "$KERNEL_NEW")"
-		[ -n "$STOCK_X_SIZE" ] || die "cannot read the kernel entry from ota_update.in."
-		[ "$X_SIZE" -le "$STOCK_X_SIZE" ] ||
-			die "kernel/xImage-$MODEL_DIR is $X_SIZE bytes, the stock kernel $STOCK_X_SIZE: it may not fit."
-		say "    xImage: kernel/xImage-$MODEL_DIR, $X_SIZE bytes, md5 $X_MD5 (stock: $STOCK_X_SIZE bytes)"
+		[ "$X_SIZE" -le "$KERNEL_MAX" ] ||
+			die "kernel/xImage-$MODEL_DIR is $X_SIZE bytes, $((X_SIZE - KERNEL_MAX)) more than the $KERNEL_MAX-byte kernel partition."
+		say "    xImage: kernel/xImage-$MODEL_DIR, $X_SIZE bytes, md5 $X_MD5 (max: $KERNEL_MAX bytes)"
 	else
 		# The stock kernel stays, so its two lines are carried over exactly as
 		# they were: recomputing them from a file this script never writes
