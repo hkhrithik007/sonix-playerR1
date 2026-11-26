@@ -1230,10 +1230,10 @@ static void host_card_root(char *out, size_t size) {
 	if (access(out, F_OK) == 0) {
 		return;
 	}
-	char italian[1024];
-	snprintf(italian, sizeof(italian), "%s/Documenti", home);
-	if (access(italian, F_OK) == 0) {
-		snprintf(out, size, "%s", italian);
+	char documents_italian[1024];
+	snprintf(documents_italian, sizeof(documents_italian), "%s/Documenti", home);
+	if (access(documents_italian, F_OK) == 0) {
+		snprintf(out, size, "%s", documents_italian);
 	}
 }
 

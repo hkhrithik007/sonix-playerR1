@@ -31,6 +31,7 @@ typedef struct {
 #define T9_LATIN_LOWER ".,?!\'", "abc", "def", "ghi", "jkl", "mno", "pqrs", "tuv", "wxyz"
 #define T9_LATIN_UPPER ".,?!\'", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"
 
+// TODO: (probably) move keyboard layout definitions into the language .ini files, so that everything is in one place and it's easier to keep it updated/organized
 static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 	[KB_LAYOUT_ENGLISH] = {"English",
 						   {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
@@ -95,6 +96,35 @@ static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 							"\xd0\xa0\xd0\xa1\xd0\xa2\xd0\xa3", "\xd0\xa4\xd0\xa5\xd0\xa6\xd0\xa7",
 							"\xd0\xa8\xd0\xa9\xd0\xaa\xd0\xab", "\xd0\xac\xd0\xad\xd0\xae\xd0\xaf"},
 						   "Russian"},
+	// The ЙЦУКЕН rows again, with і, є and ї where Russian has ы, э and ъ. A
+	// Ukrainian keyboard puts ґ beside the backslash, off these rows, so here
+	// it comes from holding г, as on a phone.
+	[KB_LAYOUT_UKRAINIAN] = {"\xd0\xa3\xd0\xba\xd1\x80\xd0\xb0\xd1\x97\xd0\xbd\xd1\x81\xd1\x8c\xd0\xba\xd0\xb0",
+							 {"\xd0\xb9\xd1\x86\xd1\x83\xd0\xba\xd0\xb5\xd0\xbd\xd0\xb3\xd1\x88\xd1\x89\xd0\xb7"
+							  "\xd1\x85\xd1\x97",
+							  "\xd1\x84\xd1\x96\xd0\xb2\xd0\xb0\xd0\xbf\xd1\x80\xd0\xbe\xd0\xbb\xd0\xb4\xd0\xb6"
+							  "\xd1\x94",
+							  "\xd1\x8f\xd1\x87\xd1\x81\xd0\xbc\xd0\xb8\xd1\x82\xd1\x8c\xd0\xb1\xd1\x8e"},
+							 {"\xd0\x99\xd0\xa6\xd0\xa3\xd0\x9a\xd0\x95\xd0\x9d\xd0\x93\xd0\xa8\xd0\xa9\xd0\x97"
+							  "\xd0\xa5\xd0\x87",
+							  "\xd0\xa4\xd0\x86\xd0\x92\xd0\x90\xd0\x9f\xd0\xa0\xd0\x9e\xd0\x9b\xd0\x94\xd0\x96"
+							  "\xd0\x84",
+							  "\xd0\xaf\xd0\xa7\xd0\xa1\xd0\x9c\xd0\x98\xd0\xa2\xd0\xac\xd0\x91\xd0\xae"},
+							 // The Ukrainian keypad: the thirty-three letters in
+							 // alphabetical order, with ґ, є, і and ї on the keys
+							 // of г, е and и, the way a Ukrainian phone shares
+							 // them out.
+							 {".,?!\'",
+							  "\xd0\xb0\xd0\xb1\xd0\xb2\xd0\xb3\xd2\x91", "\xd0\xb4\xd0\xb5\xd1\x94\xd0\xb6\xd0\xb7",
+							  "\xd0\xb8\xd1\x96\xd1\x97\xd0\xb9", "\xd0\xba\xd0\xbb\xd0\xbc\xd0\xbd",
+							  "\xd0\xbe\xd0\xbf\xd1\x80\xd1\x81", "\xd1\x82\xd1\x83\xd1\x84\xd1\x85",
+							  "\xd1\x86\xd1\x87\xd1\x88\xd1\x89", "\xd1\x8c\xd1\x8e\xd1\x8f"},
+							 {".,?!\'",
+							  "\xd0\x90\xd0\x91\xd0\x92\xd0\x93\xd2\x90", "\xd0\x94\xd0\x95\xd0\x84\xd0\x96\xd0\x97",
+							  "\xd0\x98\xd0\x86\xd0\x87\xd0\x99", "\xd0\x9a\xd0\x9b\xd0\x9c\xd0\x9d",
+							  "\xd0\x9e\xd0\x9f\xd0\xa0\xd0\xa1", "\xd0\xa2\xd0\xa3\xd0\xa4\xd0\xa5",
+							  "\xd0\xa6\xd0\xa7\xd0\xa8\xd0\xa9", "\xd0\xac\xd0\xae\xd0\xaf"},
+							 "Ukrainian"},
 	[KB_LAYOUT_DUTCH] = {"Nederlands",
 						 {"qwertyuiop", "asdfghjkl", "zxcvbnm"},
 						 {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"},
@@ -189,11 +219,13 @@ static const struct {
 	{"Z", "\xc5\xbd\xc5\xb9\xc5\xbb"},												   // Ž Ź Ż
 	{"\xd0\xb5", "\xd1\x91"},														   // е: ё
 	{"\xd0\x95", "\xd0\x81"},														   // Е: Ё
+	{"\xd0\xb3", "\xd2\x91"},														   // г: ґ
+	{"\xd0\x93", "\xd2\x90"},														   // Г: Ґ
 };
 
 // The config file keeps names, not indices.
 static const char *const layout_keys[KB_LAYOUT_COUNT] = {"english", "italian", "german", "spanish",	 "french", "russian",
-														 "dutch",   "polish",  "portuguese", "czech", "japanese"};
+														 "ukrainian", "dutch",   "polish",  "portuguese", "czech", "japanese"};
 
 static uint8_t in_use[KB_LAYOUT_COUNT];
 static uint8_t in_use_n;

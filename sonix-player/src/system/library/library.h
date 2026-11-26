@@ -398,6 +398,10 @@ typedef enum {
 // guess: no badge is better than a wrong one.
 library_quality_t library_track_quality(const char *path, int *rate_out, int *bits_out);
 
+// The length of one indexed track in seconds, by path, as the scan stored it.
+// -1 when it is not indexed or the scan could not read it.
+long library_track_duration(const char *path);
+
 // --- Favourites ---
 //
 // A small table of starred tracks, in its own right rather than a view over

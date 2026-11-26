@@ -242,9 +242,9 @@ typedef bool (*mseb_preset_cb_t)(const char *name, void *user);
 int mseb_preset_for_each(mseb_preset_cb_t cb, void *user);
 
 // ---------------------------------------------------------------------------
-// Soundfield -- the stock player's "Sound Field" module (Campo sonoro in its
-// Italian strings), rebuilt from the original's own DSP loop (decompile
-// FUN_00631a4c). It is a mid/side width control:
+// Soundfield -- the stock player's "Sound Field" module, rebuilt from the
+// original's own DSP loop (decompile FUN_00631a4c). It is a mid/side width
+// control:
 //
 //     mid  = (L + R) / 2          side = (R - L) / 2
 //     L'   = mid - width * side   R'   = mid + width * side

@@ -75,6 +75,7 @@ static script_face_t scripts[] = {
 	{"Korean", FACE_FILES("korean"), FACE_FILES("korean-bold"), 0, NULL, NULL, false},
 	{"Thai", FACE_FILES("thai"), FACE_FILES("thai-bold"), 0, NULL, NULL, false},
 	{"Arabic", FACE_FILES("arabic"), FACE_FILES("arabic-bold"), ARABIC_RAISE, NULL, NULL, false},
+	{"Hebrew", FACE_FILES("hebrew"), FACE_FILES("hebrew-bold"), 0, NULL, NULL, false},
 };
 
 #define SCRIPT_COUNT (sizeof(scripts) / sizeof(scripts[0]))

@@ -45,6 +45,7 @@ bool podcast_configured(void) { return streamkeys_podcast_key() && streamkeys_po
 
 static const char *api_base(void) { return config_get("podcast", "api_base", PODCAST_API_DEFAULT); }
 
+// TODO: move language ISO code definitions into the language .ini files, so that it isn't hard-coded in here (keep it organized)
 // The ISO code of the interface language, so a user running the player in
 // Italian does not get an all-English chart. The directory takes a
 // comma-separated list: the regional tags many Brazilian and Chinese feeds
@@ -67,6 +68,7 @@ static const char *interface_language_code(void) {
 		{"Nederlands", "nl"},
 		{"Polski", "pl"},
 		{"Russian", "ru"},
+		{"Ukrainian", "uk"},
 		{"Chinese", "zh,zh-cn"},
 		{"Portugu\xC3\xAAs BR", "pt,pt-br"},
 		{"\xC4\x8C"

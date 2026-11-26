@@ -53,6 +53,10 @@ typedef struct decoder decoder_t;
 // Determine which decoder (if any) handles this file, based on its extension.
 decode_format_t decode_detect_format(const char *filepath);
 
+// The length of the file in whole seconds, or -1 when it cannot be had
+// cheaply (unknown format, or a decoder that will not open it).
+long decode_file_seconds(const char *filepath);
+
 // Opens a decoder for the given file/format. Returns NULL on failure.
 decoder_t *decoder_open(const char *filepath, decode_format_t format);
 
