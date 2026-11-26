@@ -275,30 +275,6 @@ bool playlists_create(const char *name) {
 	return library_playlist_create(name);
 }
 
-// The seconds an #EXTINF line wants. -1 (the M3U "unknown") whenever the
-// length cannot be had cheaply -- a WAV, or a file whose decoder will not
-// open. Every player, the stock one included, accepts -1.
-static long track_seconds(const char *track_path) {
-	decode_format_t format = decode_detect_format(track_path);
-	if (format == DECODE_FORMAT_UNKNOWN) {
-		return -1;
-	}
-
-	decoder_t *dec = decoder_open_info(track_path, format);
-	if (!dec) {
-		return -1;
-	}
-
-	uint64_t frames = decoder_total_pcm_frames(dec);
-	int rate = decoder_sample_rate(dec);
-	decoder_close(dec);
-
-	if (frames == 0 || rate <= 0) {
-		return -1;
-	}
-	return (long)((frames + (uint64_t)rate / 2) / (uint64_t)rate);
-}
-
 void playlists_track_names(const char *track_path, char *title, size_t title_size, char *artist,
 						   size_t artist_size) {
 	title[0] = '\0';
@@ -334,7 +310,10 @@ bool playlists_add_track(const char *name, const char *track_path) {
 	library_playlist_row_t row = {{0}, {0}, {0}, -1, true};
 	copy_capped(row.path, sizeof(row.path), track_path);
 	playlists_track_names(track_path, row.title, sizeof(row.title), row.artist, sizeof(row.artist));
-	row.seconds = track_seconds(track_path);
+
+	// -1 when the length is unknown, which is also what M3U's #EXTINF
+	// takes for "unknown"; every player, the stock one included, accepts it.
+	row.seconds = decode_file_seconds(track_path);
 
 	return library_playlist_append(name, &row);
 }

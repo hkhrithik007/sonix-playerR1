@@ -792,6 +792,19 @@ static bool card_attached = true; // the card is mounted before this thread star
 
 bool storage_card_attached(void) { return card_attached; }
 
+bool storage_sd_ready(void) {
+	if (!sd_root[0] || !card_attached || usb_storage_active()) {
+		return false;
+	}
+#ifndef HOST_BUILD
+	// The host's "card" is often a plain directory on the developer's disk.
+	if (!is_mounted(sd_root)) {
+		return false;
+	}
+#endif
+	return true;
+}
+
 static void card_databases_detach(void) {
 	if (!card_attached) {
 		return;

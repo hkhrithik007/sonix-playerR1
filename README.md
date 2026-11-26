@@ -231,6 +231,35 @@ script execs it, and it runs the player as its child and does `sleep 1; reboot`
 when the player exits - what the rest of the script would do, without a shell
 sitting in memory for the whole session.
 
+### Persistent dev build from microSD
+
+The purpose is for speeding up development, by avoiding the need to constantly
+repack and reinstall firmwares in order to test each change (while allowing
+the change to persist past reboots).
+
+With the switch on, every boot mounts the card, copies that file to
+`/tmp/sonix_player`, unmounts the card, and runs the copy through
+`sonix_launch` instead of the firmware binary. A patched build stays in place
+across reboots, and a completely custom one can be tried without flashing.
+
+#### To enable it:
+Unlock Developer options first (in About, tap **Build number** five times).
+Then switch on **Run dev build from microSD** in Settings > Developer options.
+The switch creates the flag file `/usr/data/copy-from-sd0`; switching it off
+removes the file. Copy a binary to the root of a FAT32 microSD card named
+`sonix_player` and reboot.
+
+With the switch off, the card is not mounted at all. With no `sonix_player`
+file on the card, the firmware binary runs as usual. Switching the setting off
+reverts back to the installed `sonix_player`; turning Developer options off
+disarms the override as well, even if the flag file is still present. Youg can
+also remove or rename the file to revert - no reflash and no recovery mode
+needed.
+
+Any binary named `sonix_player` at the root of the SD card is accepted; nothing
+inspects its size or format. If one fails to run, remove the file from the card
+and the device boots normally again. Works on both the R1 and the R3 Pro II.
+
 
 ## Creating the firmware image
 
@@ -275,7 +304,7 @@ assets/R3PII/                           (and assets/R1/, the same shape)
 │           │   ├── streaming-keys.bin   Tidal / Qobuz / Podcast Index keys, sealed - see "Streaming keys" below.
 │           │   ├── system-info.json     required: names the player, and the packer writes to it
 │           │   └── GB*-Database.dat     the Game Boy ROM databases
-│           ├── fonts/               default.otf, bold.otf, then japanese, korean, thai and arabic .otf, each with a -bold;
+│           ├── fonts/               default.otf, bold.otf, then japanese, korean, thai, arabic and hebrew .otf, each with a -bold;
 │           │                        ebook/ holds Bookerly for the EPUB reader
 │           └── gui/                 some of the .png assets the UI loads at runtime (Flappy Bird, the remap pictures,
 │                                    the donation QR codes) - the rest are inside the binary.
@@ -330,9 +359,23 @@ stock `sa_sound_hbc3000.ko` (see step 5).
 
 ### Build
 
+
+First, to set up, you'll want to copy over the `sonix_player` and
+`sonix_launcher` binaries from the `sonix-player/` directory into the 
+`sonix-packer/` directory. That means the packer script will see them and
+package them into the firmware it will build.
+
+To build the Sonix firmware, make sure you're in the `sonix-packer/` directory.
+
 ```bash
 ./sonix_firmware_packer.sh
 ```
+- `--strip-debug-tools` also takes out the stock debugging tools nothing in the
+image uses (strace, the Bluetooth test tools, the D-Bus, GLib and ALSA command
+line tools, the flash and UBI maintenance tools and the libraries only they
+link): about 4.5 MB on each model, at the cost of those tools over adb. The
+list, and what is kept and why, is `STOCK_DEBUG_TOOLS` in the script. Off by
+default.
 
 It runs through without asking anything, once for each model:
 
@@ -496,7 +539,7 @@ sonix-player/
 ├── sonix-player/                    
 │   ├── assets/                      
 │   │   ├── gui/                     some of the .png assets the UI loads at runtime - the rest are inside the binary.
-│   │   ├── fonts/                   the faces: default, bold, Japanese, Korean (Hangul from Pretendard, OFL), Thai, Arabic
+│   │   ├── fonts/                   the faces: default, bold, Japanese, etc.
 │   │   └── icons/                   237 SVGs and PNGs, baked into src/gui/shell/icons.c
 │   │   
 │   │

@@ -36,6 +36,7 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Tapping an artist, a genre or a year** can open its albums instead of its tracks.
 - **Show artist** under the title in the lists you choose.
 - **Quality badge** under the title: lossy, CD, Hi-Res or DSD.
+- **Track length** beside every track in the lists. A library scanned by an older version shows it after the next full scan.
 - **Go to current track** - the lists open on what is playing.
 - **Favourites** and **Most played** - the player counts how many times you listen to every track.
 - **Selection** - long press a track, album or artist to select more, then add them all to the queue, to the favourites or to a playlist, or remove them from a playlist.
@@ -61,7 +62,7 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Three layouts** - Standard, Waveform (the progress bar becomes the waveform of the track) and Alternative.
 - **Cover colour** - the buttons and the bar take the main colour of the cover.
 - **Cover Flow** - swipe up from the bottom edge of the Music page to flip through your albums.
-- **Queue**, **Details** (format, bitrate, size, ReplayGain and more) and **Show album** from the menu.
+- **Queue**, **Details** (format, bitrate, length, size, ReplayGain and more) and **Show album** from the menu.
 - **Chapters** and **speed** when an audiobook or a podcast is playing.
 
 ## Lyrics
@@ -208,7 +209,7 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 ## System
 
 - **Date and time** - automatic over Wi-Fi (the time zone is found by itself) or set by hand, with 24-hour or AM/PM clock and daylight saving time.
-- **Languages** - English, Italiano, Deutsch, Español, Français, Nederlands, Polski, Português BR, Čeština, Russian, Chinese and Japanese. Titles in Korean, Thai and Arabic are shown too.
+- **Languages** - English, Italiano, Deutsch, Español, Français, Nederlands, Norsk, Polski, Português BR, Čeština, Russian, Українська, Chinese and Japanese. Titles in Korean, Thai and Arabic are shown too.
 - **Firmware update** - over the internet with the full list of changes, or from a `.upt` file on the card.
 - **About** - device, serial number, card space and version.
 - **Factory reset** - settings, Wi-Fi networks and Bluetooth devices are erased. The music on the card is not touched.

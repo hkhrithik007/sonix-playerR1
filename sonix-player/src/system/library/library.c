@@ -23,6 +23,7 @@
 #include "src/system/library/cue.h"
 #include "src/system/decode/mp4.h"
 #include "src/system/decode/apedec.h"
+#include "src/system/decode/decode.h"
 #include "src/system/library/metadata.h"
 #include "src/system/core/utils.h"
 
@@ -57,7 +58,7 @@ static const char *const SCHEMA[] = {
 	"has_child_file INT,begin_time INT,end_time INT,cue_id INT,character TEXT COLLATE NOCASE,size INT,"
 	"sample_rate INT,bit_rate INT,bit INT,channel INT,format INT,quality TEXT COLLATE NOCASE,"
 	"album_pic_path TEXT COLLATE NOCASE,lrc_path TEXT COLLATE NOCASE,track_gain REAL,track_peak REAL,"
-	"album_artist TEXT COLLATE NOCASE,ctime INT,mtime INT,sortkey TEXT,disc INT,PRIMARY KEY(id, path, cue_id))",
+	"album_artist TEXT COLLATE NOCASE,ctime INT,mtime INT,sortkey TEXT,disc INT,duration INT,PRIMARY KEY(id, path, cue_id))",
 
 	"CREATE TABLE IF NOT EXISTS ALBUM_TABLE(id INT, album TEXT COLLATE NOCASE,character TEXT COLLATE NOCASE,"
 	" cn INT, sortkey TEXT, PRIMARY KEY(album))",
@@ -188,6 +189,7 @@ static const char *const SCHEMA_COLUMNS[] = {
 	// it), written down with the track. Every query that tells albums apart
 	// reads this column, and so does the SonixLink app on the phone.
 	"ALTER TABLE MEDIA_TABLE ADD COLUMN album_key TEXT",
+	"ALTER TABLE MEDIA_TABLE ADD COLUMN duration INT",
 	"ALTER TABLE ALBUM_TABLE ADD COLUMN sortkey TEXT",
 	"ALTER TABLE ARTIST_TABLE ADD COLUMN sortkey TEXT",
 	"ALTER TABLE ALBUM_ARTIST_TABLE ADD COLUMN sortkey TEXT",
@@ -1977,6 +1979,29 @@ library_quality_t library_track_quality(const char *path, int *rate_out, int *bi
 		return LIBRARY_QUALITY_NONE;
 	}
 	return (bits <= 16 && rate <= 44100) ? LIBRARY_QUALITY_CD : LIBRARY_QUALITY_HIFI;
+}
+
+long library_track_duration(const char *path) {
+	if (!path || !path[0]) {
+		return -1;
+	}
+
+	long seconds = -1;
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, "SELECT duration FROM MEDIA_TABLE WHERE path=? LIMIT 1", -1,
+								 &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+				seconds = (long)sqlite3_column_int64(stmt, 0);
+			}
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+
+	return seconds;
 }
 
 // One name and the slot it came from, for the batch below.
@@ -4132,8 +4157,8 @@ static bool prepare_statements(void) {
 						   "INSERT OR REPLACE INTO MEDIA_TABLE"
 						   "(id,path,name,album,artist,genre,year,dis_id,ck_id,has_child_file,begin_time,end_time,"
 						   "cue_id,character,size,sample_rate,bit_rate,bit,channel,format,quality,album_pic_path,"
-						   "lrc_path,track_gain,track_peak,album_artist,ctime,mtime,sortkey,disc,album_key)"
-						   " VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,?,0,?,0,?,\'\',NULL,NULL,0,0,?,?,?,?,?,?)",
+						   "lrc_path,track_gain,track_peak,album_artist,ctime,mtime,sortkey,disc,album_key,duration)"
+						   " VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,?,0,?,0,?,\'\',NULL,NULL,0,0,?,?,?,?,?,?,?)",
 						   -1, &stmt_track, NULL) != SQLITE_OK) {
 		fprintf(stderr, "library: prepare failed: %s\n", sqlite3_errmsg(db));
 		return false;
@@ -4259,6 +4284,14 @@ static void insert_track(const char *path, const char *filename, const song_meta
 	char track_album_key[ALBUM_KEY_MAX];
 	album_key(album_artist, path, track_album_key, sizeof(track_album_key));
 	sqlite3_bind_text(stmt_track, column++, track_album_key, -1, SQLITE_TRANSIENT); // album_key
+
+	long seconds = decode_file_seconds(path);
+	// NULL when the length cannot be had (decode_file_seconds() gives -1):
+	// the list then shows no duration rather than a wrong one.
+	if (seconds > 0) {
+		sqlite3_bind_int64(stmt_track, column, seconds); // duration
+	}
+	column++;
 
 	int step_rc = sqlite3_step(stmt_track);
 	if (step_rc != SQLITE_DONE) {

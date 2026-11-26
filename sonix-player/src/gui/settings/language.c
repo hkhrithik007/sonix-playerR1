@@ -18,9 +18,6 @@
 
 lv_obj_t *language_screen;
 
-// However many .ini files the folder holds, up to the 16 lang_list() reads.
-#define MAX_LANGUAGES 16
-
 // The same green the settings rows use to mark a page whose feature is on.
 #define CHECK_GREEN lv_color_make(46, 194, 126)
 
@@ -28,8 +25,8 @@ lv_obj_t *language_screen;
 // panel. Both lists exist from startup, so both have to be repainted when the
 // choice changes.
 typedef struct {
-	char name[64];	// the file name, which is what lang_set() wants
-	char label[64]; // the same, made readable: see lang_display_name()
+	char name[LANG_NAME_MAX_BYTES];	// the file name, which is what lang_set() wants
+	char label[LANG_NAME_MAX_BYTES]; // the same, made readable: see lang_display_name()
 	lv_obj_t *page_check;
 	lv_obj_t *panel_check;
 } entry_t;
@@ -257,8 +254,10 @@ void language_init(gui_config_t *cfg) {
 	// The list comes from the folder, not from a table in here: dropping
 	// another .ini next to the shipped ones is all it takes to add a language.
 	const char *names[MAX_LANGUAGES];
-	int found = lang_list(names, MAX_LANGUAGES);
-	for (int i = 0; i < found && i < MAX_LANGUAGES; i++) {
+	int found = lang_list(names);
+
+	// TODO: it'd probably be a good idea to sort the languages. i think each update might change the order they display in, and it isn't alphabetical (probably do this in lang.c idk)
+	for (int i = 0; i < found; i++) {
 		snprintf(entries[i].name, sizeof(entries[0].name), "%s", names[i]);
 		// The files the stock firmware ships are named like
 		// `Fran#U00e7ais.ini`: the file name stays as it is, what the page
