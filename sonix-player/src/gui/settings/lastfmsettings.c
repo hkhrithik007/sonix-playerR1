@@ -11,15 +11,9 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
-#include "src/system/audio/audio.h"
 #include "src/system/core/lang.h"
 #include "src/system/lastfm/lastfm.h"
-#include "src/system/library/playcount.h"
 #include "src/system/net/wifi.h"
-#include "src/system/playback/audiobook.h"
-#include "src/system/playback/device_state.h"
-#include "src/system/streaming/podcastcache.h"
-#include "src/system/streaming/radio.h"
 
 #define TICK_MS 1000
 
@@ -305,43 +299,12 @@ static void login_finished(const lastfm_status_t *st) {
 }
 
 // ---------------------------------------------------------------------------
-// the timer: what is playing, and the page while it is on screen
+// the timer: the sign-in result, and the page while it is on screen. What is
+// playing is followed by src/system/library/playcount.c, not here.
 // ---------------------------------------------------------------------------
 
 static void tick_cb(lv_timer_t *t) {
 	(void)t;
-	char file[512];
-	audio_get_current_file(file, sizeof(file));
-	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
-	double position = 0.0, duration = 0.0;
-	audio_get_progress(&position, &duration);
-	bool skip = radio_is_active() || audiobook_is_playing() || podcastcache_is_episode(file);
-
-	// The player's own count of plays, by the same rule, whether Last.fm is in
-	// use or not.
-	playcount_playback_t counted = {
-		.playing = playing, .file = file, .position = position, .duration = duration, .skip = skip};
-	playcount_note_playback(&counted);
-
-	if (lastfm_active()) {
-		lastfm_playback_t now = {0};
-		now.file = file;
-		now.playing = playing;
-		now.position = position;
-		now.duration = duration;
-
-		// Tags only once device_state has read them for this very file.
-		const char *tags_file = NULL;
-		const song_metadata_t *m = device_state_loaded_metadata(&tags_file);
-		bool tags = file[0] && tags_file && strcmp(tags_file, file) == 0;
-		now.artist = tags ? (m->artist[0] ? m->artist : m->album_artist) : "";
-		now.title = tags ? m->title : "";
-		now.album = tags ? m->album : "";
-
-		now.skip = skip;
-		lastfm_note_playback(&now);
-	}
-
 	lastfm_status_t st;
 	lastfm_get_status(&st);
 	if (st.login_serial != seen_login_serial) {

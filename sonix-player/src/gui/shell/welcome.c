@@ -22,6 +22,7 @@
 // shown under the word on screen.
 // ---------------------------------------------------------------------------
 
+// TODO: switch this to actually use the translation system, rolling through the languages
 // English first: it is the language the player starts in on first boot (see
 // LANG_FIRST_BOOT) and the first word shown. After that the cycle picks at
 // random, never the same word twice running.

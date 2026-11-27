@@ -3,12 +3,14 @@
 
 #include <stdbool.h>
 
+#include "src/system/library/playcount.h"
+
 // Scrobbling to Last.fm.
 //
-// The GUI thread reports what is playing once a second with
-// lastfm_note_playback(), and this module decides what counts as a play and
-// when it has been listened to long enough to be a scrobble: half its length
-// or four minutes, whichever comes first, for a track of at least 30 seconds.
+// playcount.c follows what is played and hands the play under way to
+// lastfm_note_play() once a second while this is active; it decides when a
+// play counts. This module only announces each play and queues it as a
+// scrobble once it counts.
 //
 // A worker thread does the network and the files. "Now playing" goes out when
 // there is Wi-Fi at the start of a track. Scrobbles go into a queue in .local
@@ -70,26 +72,8 @@ void lastfm_logout(void);
 
 void lastfm_get_status(lastfm_status_t *out);
 
-typedef struct {
-	bool playing;
-	const char *file; // the loaded file, "" for none
-	double position;  // seconds
-	double duration;  // seconds, 0 when unknown
-	const char *artist;
-	const char *title;
-	const char *album;
-	bool skip; // radio, audiobooks and podcasts are never scrobbled
-} lastfm_playback_t;
-
-// GUI thread, about once a second. Tags may arrive empty on the first calls
-// for a new file and be filled in later.
-void lastfm_note_playback(const lastfm_playback_t *now);
-
-// Last.fm's rule for a play that counts: a track of at least 30 seconds,
-// listened to for half its length or for four minutes, whichever comes first.
-// `listened` is time actually played, in seconds. The player's own play counts
-// (playcount.h) go by the same rule, whether Last.fm is in use or not.
-bool lastfm_play_counts(double length, double listened);
+// From playcount.c, GUI thread, about once a second while lastfm_active().
+void lastfm_note_play(const playcount_play_t *now);
 
 // True while a request is on the wire, so the Wi-Fi is not parked under it.
 bool lastfm_network_wanted(void);

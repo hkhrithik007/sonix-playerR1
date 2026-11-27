@@ -22,6 +22,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/nowplaying/trackmenu.h"
 #include "src/system/core/config.h"
+#include "src/system/core/utils.h"
 #include "src/system/playback/device_state.h"
 #include "src/system/core/lang.h"
 #include "src/system/playback/playlist.h"
@@ -190,6 +191,7 @@ typedef struct {
 	lv_obj_t *detail;	// the line under the title: the badge and the artist
 	lv_obj_t *quality;	// ...the badge, on track rows; NULL elsewhere
 	lv_obj_t *artist;	// ...and the artist, where "Show artist" asks for it
+	lv_obj_t *duration; // the track's length, before the menu; NULL on name rows
 	lv_obj_t *menu_btn; // the ellipsis on track rows; NULL on name lists
 	lv_obj_t *chevron;	// the chevron on name rows; NULL on track rows
 	lv_obj_t *check;	// the tick on a chosen row in selection mode
@@ -1081,6 +1083,23 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 	lv_obj_set_hidden(row->quality, false);
 }
 
+// The track's length beside the menu, as the scan stored it. Hidden when the
+// scan could not read it: no length is better than a wrong "0:00".
+static void row_update_duration(row_t *row, const char *path) {
+	if (!row->duration) {
+		return;
+	}
+	long seconds = library_track_duration(path);
+	if (seconds <= 0) {
+		lv_obj_set_hidden(row->duration, true);
+		return;
+	}
+	char text[16];
+	formatDoubleSeconds((double)seconds, text, sizeof(text));
+	lv_label_set_text(row->duration, text);
+	lv_obj_set_hidden(row->duration, false);
+}
+
 // Whether this list is one "Show artist" is on for: all the tracks, the albums
 // and the tracks inside one, a year's or a genre's albums and tracks, the
 // favourites, or a playlist. Not an artist's own lists, where the name is the page's title
@@ -1112,6 +1131,7 @@ static bool panel_shows_artist(const panel_t *p) {
 // neither, the line itself goes, so the title sits in the middle of the row.
 static void row_update_detail(panel_t *p, row_t *row, int index, const char *path) {
 	row_update_quality(p, row, path);
+	row_update_duration(row, path);
 
 	const char *artist = panel_shows_artist(p) ? row_artist_at(p, index) : NULL;
 	// Inside an album, only a track by someone other than the album's artist.
@@ -3925,6 +3945,19 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_clickable(row->playmark, false);
 		lv_obj_set_hidden(row->playmark, true);
 
+		// Only a track has a length; an album row would need the sum, and that
+		// is a different question (#13). Created after the text, which grows,
+		// so it sits against the menu and the title is cut before it.
+		row->duration = NULL;
+		if (is_tracks) {
+			row->duration = lv_label_create(row->button);
+			lv_label_set_text(row->duration, "");
+			lv_obj_add_style(row->duration, &theme_style_text_dim, 0);
+			lv_obj_set_style_text_font(row->duration, &font_ui_20, 0);
+			lv_obj_set_clickable(row->duration, false);
+			lv_obj_set_hidden(row->duration, true);
+		}
+
 		row->menu_btn = NULL;
 		row->chevron = NULL;
 		if (!is_tracks) {
@@ -4224,6 +4257,7 @@ static void page_paint(panel_t *p) {
 		local_color(row->button, LV_STYLE_BG_COLOR, LV_STATE_PRESSED, t, p->tint_pressed);
 		local_color(row->label, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
 		local_color(row->artist, LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
+		local_color(row->duration, LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
 		local_color(row->playmark, LV_STYLE_BG_COLOR, 0, t, p->tint_ink);
 		if (row->menu_btn) {
 			local_color(lv_obj_get_child(row->menu_btn, 0), LV_STYLE_IMAGE_RECOLOR, 0, t, p->tint_ink);

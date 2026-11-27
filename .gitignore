@@ -1,3 +1,5 @@
+.claude
+
 .DS_Store
 
 sonix-player/sonix_player
@@ -39,3 +41,5 @@ sonix-packer/sonix_player
 sonix-packer/r3proii_original.upt
 sonix-packer/r1_original.upt
 sonix-packer/sonix_launch
+
+sonix-player/tmp/

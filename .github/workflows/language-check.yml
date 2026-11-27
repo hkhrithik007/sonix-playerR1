@@ -1,0 +1,30 @@
+name: Language file check
+
+# Every language file must define exactly the keys English.ini does, so a
+# translation never shows a raw key on screen. See scripts/check_languages.py.
+
+on:
+  pull_request:
+    paths:
+      - 'sonix-packer/assets/*/usr/resource/sonix/language/**'
+      - 'sonix-player/src/**'
+      - 'scripts/check_languages.py'
+  push:
+    branches: [main]
+    paths:
+      - 'sonix-packer/assets/*/usr/resource/sonix/language/**'
+      - 'sonix-player/src/**'
+      - 'scripts/check_languages.py'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: python3 scripts/check_languages.py

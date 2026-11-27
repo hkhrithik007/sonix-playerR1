@@ -195,10 +195,13 @@ bool sysinfo_sd_usage(sysinfo_storage_t *out) {
 	}
 	memset(out, 0, sizeof(*out));
 
-	const char *root = storage_sd_root();
-	if (!root) {
+	// storage_sd_root() outlives the mount: while the card is shared with a
+	// computer, or after it was pulled, statvfs() on the bare directory would
+	// report the internal storage instead.
+	if (!storage_sd_ready()) {
 		return false;
 	}
+	const char *root = storage_sd_root();
 
 	struct statvfs st;
 	if (statvfs(root, &st) != 0) {

@@ -12,7 +12,7 @@ body:
         >
         > A **feature request** is for something Sonix Player **does not do yet**, or for a **change** to how an existing feature works.
         >
-        > If a feature that is in the **[feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md)** does not work as it should, that is a **bug**: open a **Bug report** instead.
+        > If a feature that is in the **[feature list](https://github.com/Tartarus6/sonix-player/blob/main/FEATURES.md)** does not work as it should, that is a **bug**: open a **Bug report** instead.
         >
         > Please keep in mind:
         >
@@ -28,9 +28,9 @@ body:
       label: Before you open this request
       description: All boxes must be ticked.
       options:
-        - label: I checked the [feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md), and what I am asking for is **not** already there.
+        - label: I checked the [feature list](https://github.com/Tartarus6/sonix-player/blob/main/FEATURES.md), and what I am asking for is **not** already there.
           required: true
-        - label: I searched the [open and closed issues](https://github.com/Jepl4r/sonix-player/issues?q=is%3Aissue), and nobody has asked for this yet.
+        - label: I searched the [open and closed issues](https://github.com/Tartarus6/sonix-player/issues?q=is%3Aissue), and nobody has asked for this yet.
           required: true
         - label: I understand that a request is not a promise, and that it may be turned down.
           required: true

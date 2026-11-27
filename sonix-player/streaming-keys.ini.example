@@ -1,15 +1,16 @@
 [qobuz]
-app_id = 
-app_secret = 
+app_id =
+app_secret =
 
 [tidal]
-client_id = 
-client_secret = 
+client_id =
+client_secret =
 
 [podcast]
-api_key = 
-api_secret = 
+api_key =
+api_secret =
 
+; only used if Last.fm is enabled in musicsettings.c - see README "Streaming keys".
 [lastfm]
-api_key = 
-api_secret = 
+api_key =
+api_secret =

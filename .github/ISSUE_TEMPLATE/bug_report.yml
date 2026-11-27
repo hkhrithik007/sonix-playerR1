@@ -16,7 +16,7 @@ body:
         > Open a **Feature request** instead.
         > This is true even if the stock HiBy firmware does it.
         >
-        > Everything Sonix Player can do is in the **[feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md)**.
+        > Everything Sonix Player can do is in the **[feature list](https://github.com/Tartarus6/sonix-player/blob/main/FEATURES.md)**.
         > If what you expected is not in that list, **do not open a bug report**.
         >
         > Bug reports about missing features will be closed. Without the log, a problem cannot be looked into.
@@ -40,11 +40,11 @@ body:
       label: Before you open this report
       description: All boxes must be ticked.
       options:
-        - label: I checked the [feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md). What I am reporting is **in the list**, and it does **not** work as described there.
+        - label: I checked the [feature list](https://github.com/Tartarus6/sonix-player/blob/main/FEATURES.md). What I am reporting is **in the list**, and it does **not** work as described there.
           required: true
         - label: I am using the **latest** version of Sonix Player, and the problem is still there.
           required: true
-        - label: I searched the [open and closed issues](https://github.com/Jepl4r/sonix-player/issues?q=is%3Aissue), and this problem has not been reported yet.
+        - label: I searched the [open and closed issues](https://github.com/Tartarus6/sonix-player/issues?q=is%3Aissue), and this problem has not been reported yet.
           required: true
         - label: I will attach the log file below. I understand that without it the problem cannot be looked into.
           required: true

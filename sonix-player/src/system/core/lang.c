@@ -45,7 +45,7 @@ typedef struct {
 } table_t;
 
 static table_t live;
-static char current[64] = "Italiano";
+static char current[LANG_NAME_MAX_BYTES] = LANG_FIRST_BOOT;
 static char dir_path[256] = LANG_DIR;
 
 // ---------------------------------------------------------------------------
@@ -100,12 +100,20 @@ static bool arena_put(table_t *t, const char *s, uint32_t *out) {
 
 static void table_add(table_t *t, const char *key, const char *value) {
 	// An empty translation means "not done yet", not "show nothing".
-	if (t->count >= MAX_ENTRIES || !key[0] || !value[0]) {
+	if (t->count >= MAX_ENTRIES) {
+		fprintf(stderr, "lang: Number of translation entries above limit (%d), skipping...\n", MAX_ENTRIES);
+		return;
+	}
+
+	if (!key[0] || !value[0]) {
+		fprintf(stderr, "lang: failed to add translation entry because either key or value was empty\n");
+		fprintf(stderr, "lang: skipping (\"%s\": \"%s\"), empty %s\n", key, value, key[0] ? "value" : "key");
 		return;
 	}
 
 	uint32_t k, v;
 	if (!arena_put(t, key, &k) || !arena_put(t, value, &v)) {
+		fprintf(stderr, "lang: failed to add translation entry (\"%s\": \"%s\")\n", key, value);
 		return;
 	}
 
@@ -378,19 +386,16 @@ void lang_init(const char *dir) {
 	if (load_file(&live, path)) {
 		printf("lang: %s, %d texts from %s\n", current, live.count, path);
 	} else {
-		// Since the move to tags the source holds no Italian: it holds tags
-		// ("podcast_search_for_a_podcast"), and every language, Italian included, is a
-		// file to load. Without its file the interface shows bare tags --
+		// Without the language file, the interface shows bare tags --
 		// deliberately ugly, because that is the unmistakable sign the .ini
-		// files were not installed, not a case to paper over. Italian is still
-		// tried as a fallback, being the file most likely to be present.
+		// files were not installed
 		fprintf(stderr, "lang: no %s.ini in %s: THE TAGS WILL SHOW. Install the language files.\n", current,
 				dir_path);
-		if (strcmp(current, "Italiano") != 0) {
-			path_for(path, sizeof(path), "Italiano");
+		if (strcmp(current, LANG_FIRST_BOOT) != 0) {
+			path_for(path, sizeof(path), LANG_FIRST_BOOT);
 			if (load_file(&live, path)) {
-				snprintf(current, sizeof(current), "Italiano");
-				printf("lang: falling back to Italiano, %d texts\n", live.count);
+				snprintf(current, sizeof(current), LANG_FIRST_BOOT);
+				printf("lang: falling back to %s, %d texts\n", LANG_FIRST_BOOT, live.count);
 			}
 		}
 	}
@@ -408,13 +413,13 @@ const char *lang_current(void) { return current; }
 
 static bool read_declared_name(const char *name, char *out, size_t size);
 
-int lang_list(const char **names, int max) {
+int lang_list(const char **names) {
 	// Whatever .ini files are in the folder, and nothing else. Dropping a new
 	// one in is all it takes to add a language: the list is the directory.
 	// Nothing is offered that has no file behind it -- the keys in the source
 	// are tags, so a language with no file would show those tags rather than
 	// any readable text.
-	static char found[16][64];
+	static char found[MAX_LANGUAGES][LANG_NAME_MAX_BYTES];
 	int count = 0;
 
 	DIR *d = opendir(dir_path);
@@ -422,7 +427,7 @@ int lang_list(const char **names, int max) {
 		return count;
 	}
 	struct dirent *e;
-	while ((e = readdir(d)) != NULL && count < max && count < 16) {
+	while ((e = readdir(d)) != NULL) {
 		const char *dot = strrchr(e->d_name, '.');
 		if (!dot || strcmp(dot, ".ini") != 0) {
 			continue;
@@ -431,21 +436,23 @@ int lang_list(const char **names, int max) {
 		if (len == 0 || len >= sizeof(found[0])) {
 			continue;
 		}
-		char name[64];
+		char name[LANG_NAME_MAX_BYTES];
 		memcpy(name, e->d_name, len);
 		name[len] = '\0';
 
 		// Two files can name the same language -- the shipped set carries both
 		// `Francais.ini` and its `#U00e7` spelling -- and the list must not show
 		// it twice. They are compared by what they declare, not by file name.
-		char label[64];
+		char label[LANG_NAME_MAX_BYTES];
 		if (!read_declared_name(name, label, sizeof(label))) {
 			snprintf(label, sizeof(label), "%s", name);
 		}
 
+		// TODO: This code below is O(n^2) with file reads, which isn't terrible, but at high numbers of languages it could be improved
+		// TODO: just switch this code to store all others' names in an array, so we can loop on that rather than reading files
 		bool already = false;
 		for (int i = 0; i < count; i++) {
-			char other[64];
+			char other[LANG_NAME_MAX_BYTES];
 			if (!read_declared_name(names[i], other, sizeof(other))) {
 				snprintf(other, sizeof(other), "%s", names[i]);
 			}
@@ -457,6 +464,13 @@ int lang_list(const char **names, int max) {
 		if (already) {
 			continue;
 		}
+
+		// log warning and break if there were too many languages
+		if (!(count < MAX_LANGUAGES)) {
+			fprintf(stderr, "lang: found more than the limit (%d) of language files, skipping the rest...\n", MAX_LANGUAGES);
+			break;
+		}
+
 		snprintf(found[count], sizeof(found[0]), "%s", name);
 		names[count] = found[count];
 		count++;
@@ -593,9 +607,8 @@ bool lang_set(const char *name) {
 	char path[512];
 	path_for(path, sizeof(path), name);
 	if (!load_file(&next, path)) {
-		// With tags in the source there is no free language: Italian is a file
-		// too, and an unreadable file is a failure for any language, since an
-		// empty table would show bare tags.
+		// With tags in the source there is no free language: The default is also a
+		// .ini file, so final fallback is to just display the raw keys.
 		table_reset(&next);
 		free(next.arena);
 		fprintf(stderr, "lang: %s not readable\n", path);
@@ -613,4 +626,3 @@ bool lang_set(const char *name) {
 	printf("lang: switched to %s (%d texts)\n", current, live.count);
 	return true;
 }
-

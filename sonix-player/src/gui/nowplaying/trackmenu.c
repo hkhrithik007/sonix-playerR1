@@ -1478,6 +1478,11 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 		details_add_row("trackmenu_disc_number", buffer);
 	}
 
+	if (duration_secs > 0) {
+		formatDoubleSeconds(duration_secs, buffer, sizeof(buffer));
+		details_add_row("trackmenu_duration", buffer);
+	}
+
 	// A lossy file is described by its bitrate, not by bits and kHz: those two
 	// numbers belong to the PCM leaving the decoder and are identical for a
 	// 96 kbps AAC and a 320 kbps one. Lossless files keep the usual pair.
