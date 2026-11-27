@@ -69,8 +69,9 @@ const char *tr(const char *text);
 const char *lang_current(void);
 
 // The languages found in the directory, for the settings page. `names` is
-// filled with pointers that stay valid; returns how many were written.
-int lang_list(const char **names);
+// filled with pointers that stay valid up to `max` entries; returns how many
+// were written.
+int lang_list(const char **names, int max);
 
 // A language's name as it is spelled, rather than as its file is named.
 //

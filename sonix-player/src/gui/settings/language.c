@@ -20,10 +20,6 @@
 
 lv_obj_t *language_screen;
 
-// However many .ini files the folder holds, up to the 16 lang_list() reads.
-#define MAX_LANGUAGES 16
-
-
 // One entry, drawn twice: once in the settings page and once in the first-boot
 // panel. Both lists exist from startup, so both have to be repainted when the
 // choice changes.
