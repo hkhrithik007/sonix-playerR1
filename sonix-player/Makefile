@@ -534,6 +534,7 @@ $(FREETYPE_PREFIX)/lib/libfreetype.a: $(CROSS_CC) $(FREETYPE_FLAGS_STAMP)
 		--with-zlib=no --with-bzip2=no --with-png=no \
 		--with-harfbuzz=no --with-brotli=no \
 		CC=$(CROSS_CC) CFLAGS="$(LIB_CFLAGS)" \
+		CC_BUILD=gcc \
 		AR=$(ROCKBOX_TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-ar \
 		RANLIB=$(ROCKBOX_TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-ranlib
 	PATH="$(ROCKBOX_TOOLCHAIN_DIR)/bin:$$PATH" $(MAKE) -C $(FREETYPE_SRC)
