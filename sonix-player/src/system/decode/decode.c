@@ -740,6 +740,27 @@ decode_format_t decode_detect_format(const char *filepath) {
 	return found;
 }
 
+long decode_file_seconds(const char *filepath) {
+	decode_format_t format = decode_detect_format(filepath);
+	if (format == DECODE_FORMAT_UNKNOWN) {
+		return -1;
+	}
+
+	decoder_t *dec = decoder_open_info(filepath, format);
+	if (!dec) {
+		return -1;
+	}
+
+	uint64_t frames = decoder_total_pcm_frames(dec);
+	int rate = decoder_sample_rate(dec);
+	decoder_close(dec);
+
+	if (frames == 0 || rate <= 0) {
+		return -1;
+	}
+	return (long)((frames + (uint64_t)rate / 2) / (uint64_t)rate);
+}
+
 // Feeds bytes to the decoder until a frame of PCM comes out.
 static bool adts_fill(decoder_t *dec) {
 	adts_state_t *s = dec->impl.adts;

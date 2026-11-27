@@ -14,6 +14,10 @@
 #   kernel/xImage-R3PII        a kernel to install instead of the stock one
 #   kernel/xImage-R1           (optional, per model: without it the stock
 #                              kernel stays, untouched)
+#   kernel/modules.builtin-R3PII  the drivers that kernel has built in, one
+#   kernel/modules.builtin-R1     name per line: their .ko and loader scripts
+#                              are taken out of module_driver/ (optional,
+#                              read only with the xImage beside it)
 #   assets/
 #       R3PII/
 #       R1/
@@ -37,8 +41,24 @@
 # that is deliberate; the once it is not, it says so.
 #
 # No questions asked: run it and it does the lot.
+#
+#   ./sonix_firmware_packer.sh                       the images
+#   ./sonix_firmware_packer.sh --strip-debug-tools   the same, without the stock
+#                                                    debugging tools (see
+#                                                    STOCK_DEBUG_TOOLS below)
 
 set -euo pipefail
+
+# --- options ---
+STRIP_DEBUG_TOOLS=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--strip-debug-tools) STRIP_DEBUG_TOOLS=1 ;;
+	-h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+	*) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
+	esac
+	shift
+done
 export COLUMNS=1
 
 # --- terminal colours ---
@@ -67,6 +87,10 @@ LAUNCH_BIN="$SCRIPT_DIR/sonix_launch"
 # Kernels to install, one per model folder name: kernel/xImage-R3PII and so on.
 # Not under assets/, which is copied into the rootfs.
 KERNEL_DIR="$SCRIPT_DIR/kernel"
+
+# The size of the partitions the two images are written to
+KERNEL_MAX=$((0x500000))
+ROOTFS_MAX=$((0x2d00000))
 
 # The models, one line each: the assets folder, the stock firmware to start
 # from, the image to write, and the device-name the player will read out of
@@ -98,6 +122,112 @@ SYSTEM_INFO="usr/resource/sonix/components/system-info.json"
 # folder lands. The stock fonts and strings live one level above it and go;
 # ours stay.
 STOCK_UI_DIRS=(usr/resource/litegui usr/resource/layout usr/resource/str usr/resource/fonts)
+
+# Other parts of the stock firmware nothing uses once the stock player is gone:
+# checked against both models' images, with nothing left that starts, links,
+# loads (dlopen) or names them. Paths in the rootfs; shell patterns are
+# allowed, and a library goes with its symlinks. A path the assets bring is
+# never removed here.
+#
+#   etc/logo1.jpeg, logo2.jpeg   unused; etc/logo.jpeg stays, the boot logo's
+#                                fallback (S11jpeg_display_shell, bootlogo.c)
+#   usr/share/zoneinfo           the player sets TZ from its own rules
+#                                (src/system/device/tzrules.c)
+#   usr/resource/unicode         the stock player's codepage tables
+#   usr/resource/...             the stock player's settings and lists; the
+#                                player reads bt_name and hostname, which stay,
+#                                and radio.txt from the card, not from here
+#   bsa_server, bt_enable_bsa.sh Broadcom's BSA Bluetooth stack; the player
+#                                uses bluetoothd and bluealsa
+#   usr/lib/...                  the stock player's codecs and libraries,
+#                                linked by nothing that is left (libpcrecpp,
+#                                PCRE's C++ wrapper, needs libstdc++ and goes
+#                                with it)
+#
+# The debugging tools (strace, btmon, the bt-* and dbus-* tools...), obexd
+# and ntpd, and the R1's AIC8800 Wi-Fi files are unused too, but are kept on
+# purpose -- and so is libical, which obexd links. --strip-debug-tools takes
+# out the debugging tools (STOCK_DEBUG_TOOLS, below).
+STOCK_UNUSED=(
+	etc/logo1.jpeg etc/logo2.jpeg
+	usr/share/zoneinfo
+	usr/resource/unicode
+	usr/resource/hl_json usr/resource/eula usr/resource/tzlookup.xml
+	usr/resource/radio.txt usr/resource/coordinate usr/resource/region
+	usr/resource/ot_devices.json usr/resource/r1pro_ot_devices.json
+	usr/resource/song_genre.ini usr/resource/set_functions.json
+	usr/resource/midi_set_functions.json usr/resource/midi_config.json
+	usr/resource/r1pro_config.json usr/resource/r1pro_bt_name
+	usr/resource/province.txt usr/resource/eq.ini usr/resource/diff_layout.txt
+	usr/resource/config.json usr/resource/audio_back.conf
+	usr/resource/dac_out_more_than_384k_fail usr/resource/bt_more_than_192k_fail
+	usr/bin/bsa_server usr/bin/bt_enable_bsa.sh
+	'usr/lib/libstdc++.so*' 'usr/lib/libcurl.so*'
+	usr/lib/libwma.so usr/lib/libaac.so usr/lib/libmp3.so usr/lib/libopus.so
+	usr/lib/libvorbis.so usr/lib/libdsd2pcm.so usr/lib/libqrencode.so
+	'usr/lib/libjson-glib-1.0.so*' 'usr/lib/libevent*.so*'
+	'usr/lib/libpcrecpp.so*'
+)
+
+# The stock debugging tools, removed only with --strip-debug-tools: about
+# 4.5 MB on each model. Checked against both models' images: nothing that
+# stays starts or links any of them -- not the init scripts, not the scripts
+# sys_server runs, not sys_server itself, not Sonix Player. A tool missing on
+# one model is skipped there. Without them, debugging over adb has no strace
+# and no UBI or flash maintenance tools.
+#
+# Kept, although they look like debugging tools, because something uses them:
+#   btmon                        Sonix Player's Bluetooth log (btlog.c)
+#   hciconfig, hciattach,        the bt_* scripts sys_server runs (and the
+#   sdptool, bt_test, bt-media,  stock bt_init, which Sonix Player still
+#   rfkill, aic_radio.sh         copes with)
+#   bt-adapter, bt-device,       run by the R3 Pro II's sys_server
+#   bt-agent, bluealsa-cli,
+#   dbus-send
+#   dbus-uuidgen                 S30dbus and Sonix Player
+#   nanddump, nandwrite,         the boot logo marker (bootlogo.c) and the
+#   flash_erase, mtdinfo         OTA scripts
+#   ubiattach, ubidetach,        mount_ubifs.sh
+#   ubimkvol
+#
+#   strace                       system call tracing
+#   hcidump ... sbcinfo          Bluetooth tests and extras; hcitool goes
+#                                with dut.sh, its only user
+#   dbus-*, gdbus, gio ...       D-Bus and GLib command line tools
+#   alsamixer ... arecord        ALSA command line tools
+#   pcregrep ... cmd_gpio        tests
+#   mtd_debug ... ubiupdatevol   flash and UBI maintenance
+#   usr/lib/...                  linked only by the tools above: the ncurses
+#                                form, menu and panel libraries (alsamixer),
+#                                libbsd (hcitop), libpcreposix (pcregrep,
+#                                pcretest), libiperf (iperf3)
+STOCK_DEBUG_TOOLS=(
+	usr/bin/strace usr/bin/strace-log-merge
+	usr/bin/hcidump usr/bin/hcitop usr/bin/bccmd usr/bin/bluemoon
+	usr/bin/ciptool usr/bin/l2ping usr/bin/l2test usr/bin/rctest
+	usr/bin/gatttool usr/bin/btattach usr/bin/hex2hcd
+	usr/bin/hcitool usr/bin/dut.sh
+	usr/bin/bt-network usr/bin/bt-obex usr/bin/bt-connect
+	usr/bin/bluealsa-aplay usr/bin/bluealsa-rfcomm usr/bin/mpris-proxy
+	usr/bin/sbcdec usr/bin/sbcenc usr/bin/sbcinfo
+	usr/bin/dbus-monitor usr/bin/dbus-test-tool usr/bin/dbus-binding-tool
+	usr/bin/dbus-launch usr/bin/dbus-run-session usr/bin/dbus-cleanup-sockets
+	usr/bin/dbus-update-activation-environment
+	usr/bin/gdbus usr/bin/gio usr/bin/gio-launch-desktop
+	usr/bin/gio-querymodules usr/bin/gresource usr/bin/gsettings
+	usr/bin/gapplication
+	usr/bin/alsamixer usr/bin/amixer usr/bin/aplay usr/bin/arecord
+	usr/bin/pcregrep usr/bin/pcretest usr/bin/xmlwf usr/bin/memtester
+	usr/bin/iperf3 usr/bin/tree usr/bin/getevent usr/bin/cmd_fb
+	usr/bin/cmd_gpio
+	usr/sbin/mtd_debug usr/sbin/nandtest usr/sbin/flashcp
+	usr/sbin/flash_lock usr/sbin/flash_unlock
+	usr/sbin/ubiblock usr/sbin/ubicrc32 usr/sbin/ubiformat usr/sbin/ubinfo
+	usr/sbin/ubinize usr/sbin/ubirename usr/sbin/ubirmvol usr/sbin/ubirsvol
+	usr/sbin/ubiupdatevol
+	'usr/lib/libform.so*' 'usr/lib/libmenu.so*' 'usr/lib/libpanel.so*'
+	'usr/lib/libbsd.so*' 'usr/lib/libpcreposix.so*' 'usr/lib/libiperf.so*'
+)
 
 # The working folders always go, whether the run succeeded or not.
 cleanup() { rm -rf "$WORK_DIR" "$SQUASH_DIR" "$MERGED_SQUASHFS" 2>/dev/null || true; }
@@ -290,6 +420,124 @@ else
 	warn "sonix_launch is not next to this script: the launcher keeps its shell for the whole session."
 fi
 say ""
+
+# ==========================================================================
+# Modules the kernel has built in
+# ==========================================================================
+# drop_builtin_modules LIST: for every name in LIST (module names, one per
+# line) that has a module_driver/<name>.ko in the image, removes the .ko, the
+# module_driver/*.sh whose only job is to insmod it, and the `sh <script>`
+# line that runs that script from driver_default_init_script.sh. A script that
+# does anything else as well is kept and named, to be edited by hand.
+#
+# The parameters a removed script passed are printed: a built-in driver gets
+# none and runs on its defaults, so one that was there on purpose has to
+# become the driver's default in the kernel.
+drop_builtin_modules() {
+	local list="$1" md="$SQUASH_DIR/module_driver"
+	local drv_list="$md/driver_default_init_script.sh"
+	local name ko kore sh shre other args left removed=0
+	[ -d "$md" ] || return 0
+	step "[$MODEL_NAME] removing the modules kernel/xImage-$MODEL_DIR has built in"
+	while IFS= read -r name; do
+		# module names treat - and _ as the same character
+		name="${name%%#*}"; name="$(echo "$name" | tr -d ' \t\r' | tr - _)"
+		[ -n "$name" ] || continue
+		ko=""
+		for f in "$md"/*.ko; do
+			[ -e "$f" ] || continue
+			if [ "$(basename "$f" .ko | tr - _)" = "$name" ]; then ko="$f"; break; fi
+		done
+		[ -n "$ko" ] || continue
+		kore="$(basename "$ko" | sed 's/\./\\./g')"
+		rm -f "$ko"
+		removed=$((removed + 1))
+		say "    module_driver/$(basename "$ko") removed: built into the kernel"
+		# the scripts that load it
+		for sh in "$md"/*.sh; do
+			[ -e "$sh" ] || continue
+			[ "$sh" != "$drv_list" ] || continue
+			grep -qE "insmod[[:space:]]+(\./)?$kore([[:space:]]|\\\\|$)" "$sh" || continue
+			# anything besides comments, blank lines and that one insmod
+			# (with its continuation lines)?
+			other="$(awk '
+				/^[[:space:]]*(#|$)/ { next }
+				cont { cont = /\\[[:space:]]*$/; next }
+				/^[[:space:]]*insmod[[:space:]]/ && !seen { seen = 1; cont = /\\[[:space:]]*$/; next }
+				{ print }' "$sh")"
+			if [ -n "$other" ]; then
+				warn "module_driver/$(basename "$sh") loads $(basename "$ko") but does more than that: kept, edit it by hand"
+				continue
+			fi
+			args="$(awk '
+				/^[[:space:]]*#/ { next }
+				/^[[:space:]]*insmod[[:space:]]/ || cont { line = line " " $0; cont = /\\[[:space:]]*$/ }
+				END { print line }' "$sh" | tr -d '\\' | tr -s ' \t' ' ' |
+				sed -E 's/^ *insmod +[^ ]+ *//; s/ *$//')"
+			rm -f "$sh"
+			say "    module_driver/$(basename "$sh") removed"
+			if [ -n "$args" ]; then
+				say "      it passed: $args"
+				say "      (a built-in driver runs on its defaults instead)"
+			fi
+			if [ -f "$drv_list" ]; then
+				shre="$(basename "$sh" | sed 's/\./\\./g')"
+				sed -i.bak -E "/^[[:space:]]*(sh|\.)[[:space:]]+(\.\/)?$shre[[:space:]]*$/d" "$drv_list"
+				rm -f "$drv_list.bak"
+			fi
+		done
+		# anything else that still names the .ko
+		left="$(grep -rlE "$kore" "$md" "$SQUASH_DIR/etc/init.d" 2>/dev/null | sed "s|^$SQUASH_DIR/||" | tr '\n' ' ' || true)"
+		[ -z "$left" ] || warn "$(basename "$ko") is still named in: $left"
+	done < "$list"
+	say "    $removed modules removed"
+	say ""
+}
+
+# Removes paths of the rootfs, given as patterns (see STOCK_UNUSED), and says
+# what went and how much it was. A path the assets bring is kept; a symlink
+# left pointing into something that went is reported. Runs inside
+# build_one(), whose SQUASH_DIR and MODEL_DIR it uses.
+remove_stock_paths() {
+	local pattern path rel freed=0 count=0 kb dangling removed_paths=""
+	for pattern in "$@"; do
+		# the pattern expands inside the rootfs; no match leaves it as it is
+		for path in "$SQUASH_DIR"/$pattern; do
+			[ -e "$path" ] || [ -L "$path" ] || continue
+			rel="${path#"$SQUASH_DIR"/}"
+			if [ -e "$ASSETS_DIR/$MODEL_DIR/$rel" ] || [ -L "$ASSETS_DIR/$MODEL_DIR/$rel" ]; then
+				warn "$rel is in the assets: kept"
+				continue
+			fi
+			kb=""
+			[ -L "$path" ] || kb="$(du -sk "$path" | cut -f1)"
+			rm -rf "$path"
+			[ ! -e "$path" ] && [ ! -L "$path" ] || die "could not remove $rel."
+			freed=$((freed + ${kb:-0}))
+			count=$((count + 1))
+			removed_paths="$removed_paths/$rel"$'\n'
+			say "    $rel removed${kb:+ (${kb} KiB)}"
+		done
+	done
+	# A symlink left pointing into something that went. Only those: the stock
+	# tree has links to files that exist only at runtime (/etc/resolv.conf in
+	# /tmp, /etc/localtime on userdata), which are fine.
+	dangling="$(cd "$SQUASH_DIR" && find . -type l 2>/dev/null |
+		while IFS= read -r l; do
+			t="$(readlink "$l")"
+			case "$t" in
+			/*) ;;
+			*) t="/$(cd "$(dirname "$l")" && pwd -P | sed "s|^$(cd "$SQUASH_DIR" && pwd -P)||")/$t" ;;
+			esac
+			t="$(echo "$t" | sed -E ':a; s|/[^/]+/\.\./|/|; ta; s|/\./|/|g; s|//+|/|g')"
+			while IFS= read -r r; do
+				[ -n "$r" ] || continue
+				case "$t" in "$r"|"$r"/*) echo "${l#./}"; break ;; esac
+			done <<< "$removed_paths"
+		done)"
+	[ -z "$dangling" ] || warn "symlinks left pointing at removed files: $(echo "$dangling" | tr '\n' ' ')"
+	say "    $count removed, $freed KiB"
+}
 
 # ==========================================================================
 # One image, start to finish
@@ -558,6 +806,26 @@ build_one() {
 	say ""
 
 	# ==========================================================================
+	# 5b'. Modules the new kernel has built in
+	# ==========================================================================
+	#
+	# kernel/modules.builtin-<model> lists them by name, one per line
+	# (hiby-custom-kernel's build writes it next to the xImage). A .ko of the
+	# same name -- stock or from the assets -- would only be refused at boot,
+	# so it goes, with the script that loads it and that script's line in the
+	# module list. Only with our own kernel: the stock one has none of them
+	# built in. After 5b, which walks the overlay's file list and would trip
+	# over a file taken out before it.
+	BUILTIN_LIST="$KERNEL_DIR/modules.builtin-$MODEL_DIR"
+	if [ -f "$KERNEL_DIR/xImage-$MODEL_DIR" ] && [ -f "$BUILTIN_LIST" ]; then
+		drop_builtin_modules "$BUILTIN_LIST"
+	elif [ -f "$BUILTIN_LIST" ]; then
+		warn "kernel/modules.builtin-$MODEL_DIR is here but kernel/xImage-$MODEL_DIR is not: the stock kernel stays, so no module is removed"
+	elif [ -f "$KERNEL_DIR/xImage-$MODEL_DIR" ]; then
+		warn "no kernel/modules.builtin-$MODEL_DIR: every module in module_driver/ is kept, built into kernel/xImage-$MODEL_DIR or not"
+	fi
+
+	# ==========================================================================
 	# 5c. sonix_launch
 	# ==========================================================================
 	#
@@ -608,6 +876,23 @@ build_one() {
 		fi
 	done
 	say ""
+
+	# ==========================================================================
+	# 6b. The rest of the stock firmware nothing uses
+	# ==========================================================================
+	step "[$MODEL_NAME] removing the stock files nothing uses"
+
+	remove_stock_paths "${STOCK_UNUSED[@]}"
+	say ""
+
+	# ==========================================================================
+	# 6c. The debugging tools, with --strip-debug-tools
+	# ==========================================================================
+	if [ "$STRIP_DEBUG_TOOLS" = 1 ]; then
+		step "[$MODEL_NAME] removing the debugging tools (--strip-debug-tools)"
+		remove_stock_paths "${STOCK_DEBUG_TOOLS[@]}"
+		say ""
+	fi
 
 	# ==========================================================================
 	# 7. The build stamp
@@ -667,20 +952,19 @@ build_one() {
 
 	ORIGINAL_SUM="$(get_md5 "$ROOTFS_NEW")"
 	SIZE="$(get_size "$ROOTFS_NEW")"
-	say "    rootfs.squashfs: $SIZE bytes, md5 $ORIGINAL_SUM"
+	say "    rootfs.squashfs: $SIZE bytes, md5 $ORIGINAL_SUM (max $ROOTFS_MAX)"
+	[ "$SIZE" -le "$ROOTFS_MAX" ] ||
+		die "rootfs.squashfs is $SIZE bytes, $((SIZE - ROOTFS_MAX)) more than the $ROOTFS_MAX-byte rootfs partition."
 
 	step "[$MODEL_NAME] updating ota_update.in"
 	if [ -f "$KERNEL_NEW" ]; then
 		# A kernel of our own: it replaces the stock one, chunks and md5 chain
-		# alike. It may not be bigger than the stock one -- that is all the
-		# room the kernel partition is known to have.
-		STOCK_X_SIZE="$(grep -A 3 'img_name=xImage' "$OTA_DIR/ota_update.in" | grep 'img_size' | cut -d= -f2 | tr -d '\r ')"
+		# alike. It has to fit in the kernel partition.
 		X_SIZE="$(get_size "$KERNEL_NEW")"
 		X_MD5="$(get_md5 "$KERNEL_NEW")"
-		[ -n "$STOCK_X_SIZE" ] || die "cannot read the kernel entry from ota_update.in."
-		[ "$X_SIZE" -le "$STOCK_X_SIZE" ] ||
-			die "kernel/xImage-$MODEL_DIR is $X_SIZE bytes, the stock kernel $STOCK_X_SIZE: it may not fit."
-		say "    xImage: kernel/xImage-$MODEL_DIR, $X_SIZE bytes, md5 $X_MD5 (stock: $STOCK_X_SIZE bytes)"
+		[ "$X_SIZE" -le "$KERNEL_MAX" ] ||
+			die "kernel/xImage-$MODEL_DIR is $X_SIZE bytes, $((X_SIZE - KERNEL_MAX)) more than the $KERNEL_MAX-byte kernel partition."
+		say "    xImage: kernel/xImage-$MODEL_DIR, $X_SIZE bytes, md5 $X_MD5 (max: $KERNEL_MAX bytes)"
 	else
 		# The stock kernel stays, so its two lines are carried over exactly as
 		# they were: recomputing them from a file this script never writes

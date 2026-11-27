@@ -12,7 +12,7 @@
 
 The packer's `assets/R3PII/module_driver/` now holds the open-source
 `gt9xx_touch.ko` from
-[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), not
+[hiby-custom-kernel](https://github.com/Tartarus6/hiby-custom-kernel), not
 HiBy's module, and that one has neither of the two problems below:
 
 * a frame with more contacts than `gtp_max_touch_number` reports the first
@@ -179,7 +179,7 @@ either way.
 
 The packer's `assets/R1/module_driver/` now holds the open-source
 `cst8xx_touch.ko` from
-[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), not
+[hiby-custom-kernel](https://github.com/Tartarus6/hiby-custom-kernel), not
 HiBy's module, and that one has neither of the two problems below:
 
 * it reads `cst_max_touch_number`, kept between 1 and 2, and sizes the I2C read,

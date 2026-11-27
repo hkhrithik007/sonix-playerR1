@@ -63,7 +63,7 @@ int aacdec_frame_size(const aacdec_t *d); // PCM frames per access unit
 // the new position.
 void aacdec_flush(aacdec_t *d);
 
-// Why the last open failed, in Italian, for the interface to show.
+// Why the last open failed, for the interface to show.
 const char *aacdec_last_error(void);
 
 #endif /* AACDEC_H */

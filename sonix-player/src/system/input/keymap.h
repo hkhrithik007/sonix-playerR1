@@ -79,8 +79,7 @@ void keymap_set_double(keymap_button_t button, keymap_action_t action);
 // Whether the double click is on: a button and an action other than none.
 bool keymap_double_enabled(void);
 
-// The action's name, in the source's Italian like every other string here; it
-// passes through tr() where it is drawn.
+// The action's name passes through tr() where it is drawn.
 const char *keymap_action_name(keymap_action_t action);
 
 #endif /* KEYMAP_H */

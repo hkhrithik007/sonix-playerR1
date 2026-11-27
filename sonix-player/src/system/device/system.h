@@ -86,6 +86,13 @@ const char *storage_sd_device(void);
 // outlives the card that was pulled out.
 bool storage_card_attached(void);
 
+// Whether the card is mounted on storage_sd_root() right now and this player
+// may use it: attached, not exported to a computer over USB, and actually
+// mounted. storage_sd_root() alone is not enough -- the path outlives the
+// mount, and statvfs() or a write on the bare directory lands on the internal
+// storage instead of the card.
+bool storage_sd_ready(void);
+
 // Reopens whichever of the card's databases -- music, audiobooks, radio,
 // podcasts, thumbnails -- was deleted or replaced since it was opened. Called
 // after something on the device may have removed files: the file manager, the

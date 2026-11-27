@@ -1,5 +1,9 @@
 #include "devoptions.h"
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
@@ -21,6 +25,7 @@
 lv_obj_t *devoptions_screen;
 
 static lv_obj_t *adb_switch;
+static lv_obj_t *sd_devboot_switch;
 static lv_obj_t *log_switch;
 static lv_obj_t *db_log_switch;
 static lv_obj_t *log_name_label; // rises to make room for the path when logging
@@ -45,6 +50,69 @@ static lv_timer_t *adb_poll_timer;
 static bool adb_pending;	// a tap is still being carried out
 static bool adb_wanted;		// what that tap asked for
 static uint32_t adb_asked_at;
+
+// The boot helper chooses the binary before this process starts, so the switch
+// cannot live in the config the player reads afterwards. It lives in a file on
+// the writable partition instead; the launcher checks for that file at boot.
+#define SD_DEVBOOT_FLAG "/usr/data/copy-from-sd0"
+
+static const char *sd_devboot_flag_path(void) {
+#ifdef HOST_BUILD
+	// The simulator has no /usr/data; keep the flag in its run directory so
+	// the switch can be exercised there exactly as it is on the device.
+	const char *override = getenv("SONIX_DEVBOOT_FLAG");
+	if (override && *override) {
+		return override;
+	}
+#endif
+	return SD_DEVBOOT_FLAG;
+}
+
+// function checks if the devboot flag exists
+//
+// returns `true` if it exists, `false` otherwise
+static bool sd_devboot_enabled(void) {
+	FILE *f = fopen(sd_devboot_flag_path(), "r");
+	if (!f) {
+		return false;
+	}
+
+	fclose(f);
+	return true;
+}
+
+// sets the devboot flag
+//
+// either creates the flag file (to enable), or deletes it (to disable)
+static void sd_devboot_set(bool on) {
+	const char *path = sd_devboot_flag_path();
+	if (on) {
+		// create the flag file (its presence is the flag. its content does not matter)
+		FILE *f = fopen(path, "w");
+		if (f) {
+			fclose(f);
+		} else {
+			fprintf(stderr, "devoptions: cannot write %s\n", path);
+		}
+	} else {
+		// delete the flag file
+		if (remove(path) != 0 && errno != ENOENT) {
+			fprintf(stderr, "devoptions: cannot remove %s\n", path);
+		}
+	}
+}
+
+// updates the UI toggle for devboot
+static void update_sd_devboot_row(void) {
+	if (!sd_devboot_switch) {
+		return;
+	}
+	if (sd_devboot_enabled()) {
+		lv_obj_add_state(sd_devboot_switch, LV_STATE_CHECKED);
+	} else {
+		lv_obj_remove_state(sd_devboot_switch, LV_STATE_CHECKED);
+	}
+}
 
 static void update_adb_row(void) {
 	if (!adb_switch) {
@@ -137,6 +205,11 @@ static void adb_toggled_cb(lv_event_t *e) {
 	adb_set_enabled(adb_wanted);
 }
 
+static void sd_devboot_toggled_cb(lv_event_t *e) {
+	(void)e;
+	sd_devboot_set(lv_obj_has_state(sd_devboot_switch, LV_STATE_CHECKED));
+}
+
 static void log_toggled_cb(lv_event_t *e) {
 	(void)e;
 	logging_set_to_sd(lv_obj_has_state(log_switch, LV_STATE_CHECKED));
@@ -162,6 +235,7 @@ static void adb_poll_cb(lv_timer_t *timer) {
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
 	update_adb_row();
+	update_sd_devboot_row(); // deal with potential desync (maybe the flag was changed through ADB)
 	update_log_row();
 	update_bt_log_row(); // the card may have come or gone since
 	lv_timer_resume(adb_poll_timer);
@@ -178,6 +252,14 @@ void devoptions_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(devoptions_screen, cfg, "developer_options");
 
 	settingsrow_toggle(container, "devoptions_adb", &adb_switch, adb_toggled_cb);
+
+	// Setting that arms the boot script: a sonix_player binary on the card is
+	// copied to /tmp and run instead of the firmware one. This file is the only
+	// thing the launcher needs to check; turning the switch off removes it, so
+	// a bad binary can never leave the device stuck on the card build.
+	settingsrow_toggle(container, "devoptions_sd_devboot", &sd_devboot_switch, sd_devboot_toggled_cb);
+	add_note(container, "devoptions_sd_devboot_note");
+	update_sd_devboot_row();
 
 	lv_obj_t *log_card = settingsrow_toggle(container, "devoptions_log_to_microsd", &log_switch, log_toggled_cb);
 	log_name_label = lv_obj_get_child(log_card, 0);
