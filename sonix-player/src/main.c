@@ -67,6 +67,7 @@
 #include "src/system/gearboy/gbdb.h"
 #include "src/system/gearboy/gearboy.h"
 #include "src/system/library/library.h"
+#include "src/system/library/playcount.h"
 #include "src/system/library/playlists.h"
 #include "src/system/net/tls.h"
 #include "src/system/net/webcgi.h"
@@ -80,7 +81,6 @@
 #include "src/system/streaming/provider.h"
 #include "src/system/streaming/radio.h"
 #include "src/system/streaming/streamkeys.h"
-#include "src/system/playback/playbackobserver.h"
 #include "src/system/streaming/tidalcache.h"
 
 static volatile sig_atomic_t running = 1;
@@ -2177,7 +2177,6 @@ int main(int argc, char **argv) {
 	listenbrainz_init();
 
 	lv_init();
-	playbackobserver_init();
 
 	// lv_init() seeds its generator with a literal (0x1234ABCD), so without
 	// this the sequence is the same on every boot -- and lv_rand() picks the
@@ -2418,6 +2417,7 @@ int main(int argc, char **argv) {
 	// its track put back first.
 	bool nowplaying_first = device_state_remember_enabled() && config_get_bool("music", "nowplaying_at_boot", false);
 	bool rest_pending = gui_init(&gui_cfg, !nowplaying_first);
+	playcount_init();
 
 	// "Rotate screen", as it was left. After gui_init so there are screens to
 	// redraw, and before the first frame the user sees.

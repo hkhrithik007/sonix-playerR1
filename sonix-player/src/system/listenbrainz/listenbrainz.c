@@ -2,56 +2,115 @@
 
 #include "listenbrainz.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "src/system/core/config.h"
-#include "src/system/core/md5.h"
+#include "src/system/device/sysinfo.h"
+#include "src/system/device/system.h"
+#include "src/system/device/usb.h"
 #include "src/system/net/http.h"
 #include "src/system/net/wifi.h"
 #include "src/system/streaming/streamkeys.h"
 
-#define LB_URL "https://api.listenbrainz.org/1/submit-listens"
-#define LB_VALIDATE_URL "https://api.listenbrainz.org/1/validate-token"
-// Keep a few weeks of offline listens while keeping the fixed RAM queue small
-// (roughly 200 KiB for 256 entries); the same queue is persisted beside config.
-#define LB_QUEUE_MAX 256
-#define LB_FIELD_MAX 256
-#define LB_BODY_MAX 2048
-#define LB_RETRY_MAX 600
+#define API_URL "https://api.listenbrainz.org/1/submit-listens"
+#define VALIDATE_URL "https://api.listenbrainz.org/1/validate-token"
+#define CLIENT_NAME "Sonix Player"
+#define API_TIMEOUT_SECS 15
+#define BODY_LIMIT (64 * 1024)
+
+#define BATCH_MAX 50
+#define QUEUE_MAX 5000
+#define PENDING_MAX 256
+#define FIELD_MAX 256
+
+#define CLOCK_VALID_AFTER 1577836800LL
+
+#define RETRY_FIRST_SECS 30.0
+#define RETRY_MAX_SECS 600.0
+#define WAIT_POLL_SECS 10
+
+#define SESSION_REFUSALS_MAX 3
 
 typedef struct {
-	long long listened_at;
+	long long when;
+	double boot_start;
 	int duration;
-	char account[MD5_HEX_LEN];
-	char artist[LB_FIELD_MAX];
-	char title[LB_FIELD_MAX];
-	char album[LB_FIELD_MAX];
-} listen_t;
+	char artist[FIELD_MAX];
+	char title[FIELD_MAX];
+	char album[FIELD_MAX];
+} play_t;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake;
-static bool started, enabled, token_checking, token_valid, logout_requested;
-static bool token_request_pending, refused, now_playing_waiting;
-static bool queue_dirty;
-static char token[256], new_token[256], user[128], detail[160];
-static unsigned serial;
-static unsigned validation_generation;
-static listen_t queue[LB_QUEUE_MAX];
-static listen_t now_playing;
-static int queue_count;
-static int requests_in_flight;
-static char token_path[512], queue_path[512], queue_tmp[520];
+static bool started;
 
-static double monotonic_seconds(void) {
+static bool enabled;
+static char token[512];
+static char user[128];
+static bool session_expired;
+static int session_refusals;
+static bool refused;
+static char detail[160];
+
+static bool login_requested;
+static bool logout_requested;
+static bool logging_in;
+static char login_token[512];
+static unsigned login_serial;  // increments each login attempt, tells GUI thread that a new login attempt has happened
+static listenbrainz_login_result_t login_result;
+
+static play_t pending[PENDING_MAX];
+static int pending_count;
+static int file_count;
+
+static bool now_playing_waiting;
+static play_t now_playing;
+static unsigned now_playing_generation;
+static unsigned current_generation;
+static bool current_playing;
+
+static int requests_in_flight;
+
+static char session_path[512];
+static char legacy_token_path[512];
+
+static bool card_ready;
+static char queue_path[600];
+static char queue_tmp_path[610];
+static char bundled_token[512];
+static bool login_from_bundle;
+
+static double boot_seconds(void) {
 	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+#ifdef CLOCK_BOOTTIME
+	if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+#endif
+		clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static bool clock_valid(void) { return (long long)time(NULL) >= CLOCK_VALID_AFTER; }
+
+static void wipe(void *p, size_t n) {
+	volatile unsigned char *b = p;
+	while (n--) {
+		*b++ = 0;
+	}
+}
+
+static void copy_field(char *dst, const char *src) { snprintf(dst, FIELD_MAX, "%s", src ? src : ""); }
+
+static bool counting_locked(void) {
+	return enabled && (user[0] || bundled_token[0]) && (token[0] || session_expired || bundled_token[0]);
 }
 
 static bool online(void) {
@@ -60,534 +119,1056 @@ static bool online(void) {
 	return st.state == WIFI_STATE_CONNECTED && st.ip[0];
 }
 
-static void paths_init(void) {
+static void build_paths(void) {
 	char dir[400] = "/tmp";
 	char config_file[512];
 	const char *cfg = config_path_copy(config_file, sizeof(config_file));
 	if (cfg && cfg[0]) {
 		const char *slash = strrchr(cfg, '/');
-		if (slash == cfg) snprintf(dir, sizeof(dir), "/");
-		else if (slash) snprintf(dir, sizeof(dir), "%.*s", (int)(slash - cfg), cfg);
-		else snprintf(dir, sizeof(dir), ".");
+		if (slash == cfg) {
+			snprintf(dir, sizeof(dir), "/");
+		} else if (slash) {
+			snprintf(dir, sizeof(dir), "%.*s", (int)(slash - cfg), cfg);
+		} else {
+			snprintf(dir, sizeof(dir), ".");
+		}
 	}
-	snprintf(token_path, sizeof(token_path), "%s/listenbrainz.token", dir);
-	snprintf(queue_path, sizeof(queue_path), "%s/listenbrainz.queue", dir);
-	snprintf(queue_tmp, sizeof(queue_tmp), "%s.tmp", queue_path);
+	snprintf(session_path, sizeof(session_path), "%s/listenbrainz.session", dir);
+	snprintf(legacy_token_path, sizeof(legacy_token_path), "%s/listenbrainz.token", dir);
 }
 
-static void json_string(char *out, size_t cap, const char *s) {
-	size_t n = 0;
-	if (!cap) return;
-	out[n++] = '"';
-	for (; s && *s && n + 8 < cap; s++) {
-		unsigned char c = (unsigned char)*s;
-		if (c == '"' || c == '\\') { out[n++] = '\\'; out[n++] = (char)c; }
-		else if (c == '\n') { out[n++] = '\\'; out[n++] = 'n'; }
-		else if (c == '\r') { out[n++] = '\\'; out[n++] = 'r'; }
-		else if (c == '\t') { out[n++] = '\\'; out[n++] = 't'; }
-		else if (c >= 0x20) out[n++] = (char)c;
+static void load_session(void) {
+	FILE *f = fopen(session_path, "r");
+	if (!f) {
+		return;
 	}
-	out[n++] = '"';
-	out[n] = '\0';
+	char line[512];
+	if (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		snprintf(token, sizeof(token), "%.*s", (int)sizeof(token) - 1, line);
+	}
+	if (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		snprintf(user, sizeof(user), "%.*s", (int)sizeof(user) - 1, line);
+	}
+	fclose(f);
+	wipe(line, sizeof(line));
 }
 
-static void field_copy(char *to, size_t cap, const char *from) {
-	if (!cap) return;
-	snprintf(to, cap, "%s", from ? from : "");
-	for (size_t i = 0; to[i]; i++) {
-		if (to[i] == '\n' || to[i] == '\r' || to[i] == '\t') to[i] = ' ';
+static void save_session(const char *key, const char *name) {
+	if (!key[0] && !name[0]) {
+		unlink(session_path);
+		return;
+	}
+	char tmp[530];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", session_path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		fprintf(stderr, "listenbrainz: cannot write %s: %s\n", tmp, strerror(errno));
+		return;
+	}
+	chmod(tmp, 0600);
+	fprintf(f, "%s\n%s\n", key, name);
+	bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+	ok = fclose(f) == 0 && ok;
+	if (!ok || rename(tmp, session_path) != 0) {
+		fprintf(stderr, "listenbrainz: cannot write %s\n", session_path);
+		unlink(tmp);
 	}
 }
 
-// Queue fields are hex encoded so delimiters, newlines and non-ASCII tags are
-// preserved in this small, atomically replaced file.
-static void hex_write(FILE *f, const char *s) {
-	static const char hex[] = "0123456789abcdef";
+#define QUEUE_HEADER "#listenbrainz\t"
+
+static bool card_writable(void) { return storage_sd_root() && storage_sd_device() && storage_card_attached() && storage_sd_writable() && !usb_storage_active(); }
+
+static void queue_escape(FILE *f, const char *s) {
 	for (; *s; s++) {
-		unsigned char c = (unsigned char)*s;
-		fputc(hex[c >> 4], f); fputc(hex[c & 15], f);
+		if (*s == '%' || *s == '\t' || *s == '\r' || *s == '\n') {
+			fprintf(f, "%%%02X", (unsigned char)*s);
+		} else {
+			fputc(*s, f);
+		}
 	}
 }
 
-static int hex_value(int c) {
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+static int hex_digit(char c) {
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
 	return -1;
 }
 
-static bool hex_read(char **p, char *out, size_t cap) {
+static void queue_unescape(const char *from, const char *to, char *out) {
 	size_t n = 0;
-	while (**p && **p != '\t' && **p != '\n' && **p != '\r') {
-		int hi = hex_value((*p)[0]), lo = hex_value((*p)[1]);
-		if (hi < 0 || lo < 0 || !(*p)[1] || n + 1 >= cap) return false;
-		out[n++] = (char)((hi << 4) | lo);
-		*p += 2;
+	while (from < to && n + 1 < FIELD_MAX) {
+		int hi, lo;
+		if (*from == '%' && to - from >= 3 && (hi = hex_digit(from[1])) >= 0 && (lo = hex_digit(from[2])) >= 0) {
+			out[n++] = (char)(hi * 16 + lo);
+			from += 3;
+		} else {
+			out[n++] = *from++;
+		}
 	}
 	out[n] = '\0';
-	if (**p == '\t') (*p)++;
-	return true;
 }
 
-static bool queue_save_locked(void) {
-	FILE *f = fopen(queue_tmp, "w");
-	if (!f) return false;
-	for (int i = 0; i < queue_count; i++) {
-		listen_t *x = &queue[i];
-		fprintf(f, "%lld\t%d\t%s\t", x->listened_at, x->duration, x->account);
-		hex_write(f, x->artist); fputc('\t', f);
-		hex_write(f, x->title); fputc('\t', f);
-		hex_write(f, x->album); fputc('\n', f);
+static bool queue_parse(const char *line, play_t *out) {
+	const char *field[5];
+	const char *end[5];
+	const char *p = line;
+	for (int i = 0; i < 5; i++) {
+		field[i] = p;
+		const char *stop = i < 4 ? strchr(p, '\t') : p + strcspn(p, "\r\n");
+		if (!stop)
+			return false;
+		end[i] = stop;
+		p = stop + 1;
 	}
-	bool ok = !ferror(f) && fflush(f) == 0 && fsync(fileno(f)) == 0;
-	if (fclose(f) != 0) ok = false;
-	if (ok && chmod(queue_tmp, 0600) != 0) ok = false;
-	if (ok && rename(queue_tmp, queue_path) != 0) ok = false;
-	if (!ok) unlink(queue_tmp);
-	return ok;
+
+	memset(out, 0, sizeof(*out));
+	char *num_end = NULL;
+	out->when = strtoll(field[0], &num_end, 10);
+	if (num_end != end[0] || out->when < CLOCK_VALID_AFTER)
+		return false;
+	out->duration = (int)strtol(field[1], &num_end, 10);
+	if (num_end != end[1] || out->duration < 0)
+		out->duration = 0;
+	queue_unescape(field[2], end[2], out->artist);
+	queue_unescape(field[3], end[3], out->title);
+	queue_unescape(field[4], end[4], out->album);
+	return out->artist[0] && out->title[0];
 }
 
-static void queue_load(void) {
+static bool queue_header_is(const char *line, const char *name) {
+	size_t len = strlen(QUEUE_HEADER);
+	if (strncmp(line, QUEUE_HEADER, len) != 0)
+		return false;
+	const char *who = line + len;
+	size_t who_len = strcspn(who, "\r\n");
+	return who_len == strlen(name) && strncasecmp(who, name, who_len) == 0;
+}
+
+static bool queue_attach(const char *name) {
+	if (!card_writable())
+		return false;
+	char dir[520];
+	snprintf(dir, sizeof(dir), "%s/.local", storage_sd_root());
+	mkdir(dir, 0755);
+	snprintf(queue_path, sizeof(queue_path), "%s/listenbrainz.queue", dir);
+	snprintf(queue_tmp_path, sizeof(queue_tmp_path), "%s.tmp", queue_path);
+
+	int plays = 0;
 	FILE *f = fopen(queue_path, "r");
-	if (!f) return;
-	chmod(queue_path, 0600);
-	char line[LB_FIELD_MAX * 6 + 256];
-	while (queue_count < LB_QUEUE_MAX && fgets(line, sizeof(line), f)) {
-		listen_t x = {0};
-		char *p = line, *end;
-		x.listened_at = strtoll(p, &end, 10);
-		if (end == p || *end != '\t') continue;
-		p = end + 1;
-		long duration = strtol(p, &end, 10);
-		if (end == p || *end != '\t' || duration < 1 || duration > 2073600) continue;
-		x.duration = (int)duration; p = end + 1;
-		char *tab = strchr(p, '\t');
-		if (!tab || (size_t)(tab - p) != 32) continue;
-		memcpy(x.account, p, 32); x.account[32] = 0; p = tab + 1;
-		if (!hex_read(&p, x.artist, sizeof(x.artist)) || !hex_read(&p, x.title, sizeof(x.title)) ||
-			!hex_read(&p, x.album, sizeof(x.album)) || !x.listened_at || !x.artist[0] || !x.title[0]) continue;
-		queue[queue_count++] = x;
+	if (f) {
+		char *line = NULL;
+		size_t cap = 0;
+		bool mine = getline(&line, &cap, f) >= 0 && queue_header_is(line, name);
+		while (mine && getline(&line, &cap, f) >= 0)
+			plays++;
+		free(line);
+		fclose(f);
+		if (!mine) {
+			printf("listenbrainz: %s is not %s's; discarding it\n", queue_path, name);
+			unlink(queue_path);
+			plays = 0;
+		}
 	}
-	fclose(f);
-}
-
-static bool token_save(const char *value) {
-	char tmp[520];
-	snprintf(tmp, sizeof(tmp), "%s.tmp", token_path);
-	FILE *f = fopen(tmp, "w");
-	if (!f) return false;
-	bool ok = fprintf(f, "%s\n", value) > 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
-	if (fclose(f) != 0) ok = false;
-	if (ok && (chmod(tmp, 0600) != 0 || rename(tmp, token_path) != 0)) ok = false;
-	if (!ok) unlink(tmp);
-	return ok;
-}
-
-static bool token_shape_ok(const char *value) {
-	size_t len = value ? strlen(value) : 0;
-	if (len < 10 || len > 200) return false;
-	for (size_t i = 0; i < len; i++) {
-		unsigned char c = (unsigned char)value[i];
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '.' || c == '_' || c == '~')) return false;
-	}
+	pthread_mutex_lock(&lock);
+	file_count = plays;
+	pthread_mutex_unlock(&lock);
 	return true;
 }
 
-static void token_load(void) {
-	FILE *f = fopen(token_path, "r");
-	if (f) {
-		if (fgets(token, sizeof(token), f)) {
-			token[strcspn(token, "\r\n")] = 0;
-			if (!token_shape_ok(token)) token[0] = 0;
-		}
-		fclose(f);
-		chmod(token_path, 0600);
+static bool queue_append(const play_t *plays, int count, const char *name) {
+	FILE *f = fopen(queue_path, "a");
+	if (!f) {
+		fprintf(stderr, "listenbrainz: cannot open %s: %s\n", queue_path, strerror(errno));
+		return false;
 	}
-	if (!token[0] && !config_get_bool("listenbrainz", "ignore_bundled_token", false)) {
-		const char *bundled = streamkeys_listenbrainz_key();
-		if (token_shape_ok(bundled)) {
-			snprintf(token, sizeof(token), "%s", bundled);
-		}
+	if (ftell(f) == 0)
+		fprintf(f, QUEUE_HEADER "%s\n", name);
+	for (int i = 0; i < count; i++) {
+		fprintf(f, "%lld\t%d\t", plays[i].when, plays[i].duration);
+		queue_escape(f, plays[i].artist);
+		fputc('\t', f);
+		queue_escape(f, plays[i].title);
+		fputc('\t', f);
+		queue_escape(f, plays[i].album);
+		fputc('\n', f);
 	}
+	bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+	ok = fclose(f) == 0 && ok;
+	return ok;
 }
 
-static bool validate_token(const char *value, char *user_out, size_t user_cap) {
-	char auth[320];
-	snprintf(auth, sizeof(auth), "Authorization: Token %s\r\n", value);
+static int queue_read_head(play_t *out, int max, int *lines_used) {
+	*lines_used = 0;
+	FILE *f = fopen(queue_path, "r");
+	if (!f)
+		return 0;
+	char *line = NULL;
+	size_t cap = 0;
+	int count = 0;
+	if (getline(&line, &cap, f) >= 0) {
+		while (count < max && getline(&line, &cap, f) >= 0) {
+			(*lines_used)++;
+			if (queue_parse(line, &out[count]))
+				count++;
+		}
+	}
+	free(line);
+	fclose(f);
+	return count;
+}
+
+static void queue_drop_head(int lines) {
+	FILE *in = fopen(queue_path, "r");
+	if (!in)
+		return;
+	FILE *out = fopen(queue_tmp_path, "w");
+	if (!out) {
+		fclose(in);
+		return;
+	}
+	char *line = NULL;
+	size_t cap = 0;
+	int n = -1;
+	bool any = false;
+	while (getline(&line, &cap, in) >= 0) {
+		if (n < 0)
+			fputs(line, out);
+		else if (n >= lines) {
+			fputs(line, out);
+			any = true;
+		}
+		n++;
+	}
+	free(line);
+	fclose(in);
+	bool ok = fflush(out) == 0 && fsync(fileno(out)) == 0;
+	ok = fclose(out) == 0 && ok;
+	if (!ok || !any) {
+		unlink(queue_tmp_path);
+		if (ok)
+			unlink(queue_path);
+		return;
+	}
+	if (rename(queue_tmp_path, queue_path) != 0)
+		unlink(queue_tmp_path);
+}
+
+typedef struct {
+	char *buf;
+	size_t len;
+	size_t cap;
+	bool failed;
+} text_t;
+
+static void text_add(text_t *t, const char *s, size_t n) {
+	if (t->failed)
+		return;
+	if (t->len + n + 1 > t->cap) {
+		size_t cap = t->cap ? t->cap : 1024;
+		while (cap < t->len + n + 1)
+			cap *= 2;
+		char *grown = realloc(t->buf, cap);
+		if (!grown) {
+			t->failed = true;
+			return;
+		}
+		t->buf = grown;
+		t->cap = cap;
+	}
+	memcpy(t->buf + t->len, s, n);
+	t->len += n;
+	t->buf[t->len] = '\0';
+}
+
+static void text_str(text_t *t, const char *s) { text_add(t, s, strlen(s)); }
+
+static void text_json(text_t *t, const char *s) {
+	text_str(t, "\"");
+	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+		if (*p == '"' || *p == '\\') {
+			char esc[3] = {'\\', (char)*p, 0};
+			text_str(t, esc);
+		} else if (*p == '\b')
+			text_str(t, "\\b");
+		else if (*p == '\f')
+			text_str(t, "\\f");
+		else if (*p == '\n')
+			text_str(t, "\\n");
+		else if (*p == '\r')
+			text_str(t, "\\r");
+		else if (*p == '\t')
+			text_str(t, "\\t");
+		else if (*p < 0x20) {
+			char esc[7];
+			snprintf(esc, sizeof(esc), "\\u%04x", *p);
+			text_str(t, esc);
+		} else {
+			char c[2] = {(char)*p, 0};
+			text_str(t, c);
+		}
+	}
+	text_str(t, "\"");
+}
+
+typedef enum {
+	RESULT_OK,
+	RESULT_RETRY,
+	RESULT_SESSION,
+	RESULT_BAD_REQUEST,
+	RESULT_REFUSED,
+} result_t;
+
+// minimal JSON string field extractor: finds "key":"value" or "key": "value"
+static bool json_string(const char *json, const char *key, char *out, size_t size) {
+	char needle[64];
+	snprintf(needle, sizeof(needle), "\"%s\"", key);
+	const char *p = strstr(json, needle);
+	if (!p)
+		return false;
+	p += strlen(needle);
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') {
+		if (*p == ':') {
+			p++;
+			break;
+		}
+		p++;
+	}
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+		p++;
+	if (*p != '"')
+		return false;
+	p++;
+	size_t n = 0;
+	while (*p && *p != '"' && n + 1 < size) {
+		if (*p == '\\' && p[1]) {
+			p++;
+			if (*p == 'n')
+				out[n++] = '\n';
+			else if (*p == 'r')
+				out[n++] = '\r';
+			else if (*p == 't')
+				out[n++] = '\t';
+			else
+				out[n++] = *p;
+		} else {
+			out[n++] = *p;
+		}
+		p++;
+	}
+	out[n] = '\0';
+	return true;
+}
+
+static bool json_bool_true(const char *json, const char *key) {
+	char needle[64];
+	snprintf(needle, sizeof(needle), "\"%s\"", key);
+	const char *p = strstr(json, needle);
+	if (!p)
+		return false;
+	p += strlen(needle);
+	while (*p && *p != ':')
+		p++;
+	if (*p == ':')
+		p++;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+		p++;
+	return strncmp(p, "true", 4) == 0;
+}
+
+static result_t http_json(const char *url, const char *tok, const char *method, const char *payload, char *why, size_t why_size, char **body_out) {
+	why[0] = '\0';
+	char auth[600];
+	snprintf(auth, sizeof(auth), "Authorization: Token %s\r\n", tok);
+
+	http_req_t req = {
+		.method = method,
+		.extra_headers = auth,
+		.body = payload,
+		.body_len = payload ? strlen(payload) : 0,
+		.content_type = payload ? "application/json" : NULL,
+		.want_error_body = true,
+		.allow_empty_body = true,
+	};
+
+	pthread_mutex_lock(&lock);
+	requests_in_flight++;
+	pthread_mutex_unlock(&lock);
+
 	char *body = NULL;
+	size_t body_len = 0;
 	int status = 0;
-	bool ok = http_get_ex(LB_VALIDATE_URL, auth, true, &body, NULL, 8192, 15, &status);
-	bool valid = ok && status >= 200 && status < 300 && body &&
-		(strstr(body, "\"valid\": true") || strstr(body, "\"valid\":true"));
-	if (valid && user_out && user_cap) {
-		char *p = strstr(body, "\"user_name\"");
-		if (p && (p = strchr(p, ':'))) {
-			p = strchr(p, '"');
-			if (p) {
-				p++;
-				size_t n = 0;
-				while (*p && *p != '"' && n + 1 < user_cap) {
-					if (*p == '\\' && p[1]) p++;
-					user_out[n++] = *p++;
-				}
-				user_out[n] = 0;
-			}
-		}
-	}
-	free(body);
-	return valid;
-}
+	http_request(url, &req, &body, &body_len, BODY_LIMIT, API_TIMEOUT_SECS, &status);
 
-static bool submit_listen(const listen_t *x, const char *auth_token, bool playing_now, int *status_out) {
-	char artist[LB_FIELD_MAX * 2 + 4], title[LB_FIELD_MAX * 2 + 4], album[LB_FIELD_MAX * 2 + 4];
-	char body[LB_BODY_MAX];
-	json_string(artist, sizeof(artist), x->artist);
-	json_string(title, sizeof(title), x->title);
-	json_string(album, sizeof(album), x->album);
-	int n;
-	if (playing_now) {
-		n = snprintf(body, sizeof(body),
-			"{\"listen_type\":\"playing_now\",\"payload\":[{\"track_metadata\":{" 
-			"\"artist_name\":%s,\"track_name\":%s,\"release_name\":%s,\"additional_info\":{" 
-			"\"duration_ms\":%d,\"submission_client\":\"Rage-os\",\"submission_client_version\":\"1.0\"}}}]}",
-			artist, title, album, x->duration * 1000);
+	pthread_mutex_lock(&lock);
+	requests_in_flight--;
+	pthread_mutex_unlock(&lock);
+
+	result_t result;
+	if (!body) {
+		const char *err = http_last_error();
+		snprintf(why, why_size, "%s", (err && err[0]) ? err : "no reply");
+		return RESULT_RETRY;
+	}
+	if (status >= 200 && status < 300) {
+		result = RESULT_OK;
+	} else if (status == 401) {
+		json_string(body, "error", why, why_size);
+		if (!why[0])
+			snprintf(why, why_size, "invalid token");
+		result = RESULT_SESSION;
+	} else if (status == 400) {
+		json_string(body, "error", why, why_size);
+		if (!why[0])
+			snprintf(why, why_size, "bad request");
+		result = RESULT_BAD_REQUEST;
+	} else if (status == 429 || status >= 500) {
+		json_string(body, "error", why, why_size);
+		if (!why[0])
+			snprintf(why, why_size, "HTTP %d", status);
+		result = RESULT_RETRY;
 	} else {
-		n = snprintf(body, sizeof(body),
-			"{\"listen_type\":\"single\",\"payload\":[{\"listened_at\":%lld,\"track_metadata\":{" 
-			"\"artist_name\":%s,\"track_name\":%s,\"release_name\":%s,\"additional_info\":{" 
-			"\"duration_ms\":%d,\"submission_client\":\"Rage-os\",\"submission_client_version\":\"1.0\"}}}]}",
-			x->listened_at, artist, title, album, x->duration * 1000);
+		json_string(body, "error", why, why_size);
+		if (!why[0])
+			snprintf(why, why_size, "HTTP %d", status);
+		result = RESULT_REFUSED;
 	}
-	if (n < 0 || (size_t)n >= sizeof(body)) return false;
-	char headers[384];
-	snprintf(headers, sizeof(headers), "Authorization: Token %s\r\n", auth_token);
-	http_req_t req = {.method = "POST", .extra_headers = headers, .body = body,
-		.content_type = "application/json", .want_error_body = true, .allow_empty_body = true};
-	char *response = NULL;
-	int status = 0;
-	bool ok = http_request(LB_URL, &req, &response, NULL, 16384, 20, &status);
-	free(response);
-	if (status_out) *status_out = status;
-	return ok && status >= 200 && status < 300;
+
+	if (result == RESULT_OK && body_out) {
+		*body_out = body;
+	} else {
+		free(body);
+	}
+	return result;
 }
 
-static void *worker(void *unused) {
-	(void)unused;
-	unsigned failures = 0;
+static void do_login(char *tok) {
+	char why[160];
+	char *body = NULL;
+	result_t req_result = http_json(VALIDATE_URL, tok, "GET", NULL, why, sizeof(why), &body);
+
+	char name_out[128] = "";
+	listenbrainz_login_result_t outcome;
+	if (req_result == RESULT_OK) {
+		if (!json_bool_true(body, "valid") || !json_string(body, "user_name", name_out, sizeof(name_out))) {
+			// handle 200 response that says token is invalid
+			snprintf(why, sizeof(why), "invalid token");
+			outcome = LISTENBRAINZ_LOGIN_WRONG_CREDENTIALS;
+		} else {
+			// handle 200 response that says token is valid
+			outcome = LISTENBRAINZ_LOGIN_OK;
+		}
+	} else if (req_result == RESULT_RETRY) {
+		outcome = LISTENBRAINZ_LOGIN_NO_REPLY;
+	} else if (req_result == RESULT_SESSION) {
+		outcome = LISTENBRAINZ_LOGIN_WRONG_CREDENTIALS;
+	} else {
+		outcome = LISTENBRAINZ_LOGIN_REFUSED;
+	}
+
+	// save new session, if login was successful
+	if (outcome == LISTENBRAINZ_LOGIN_OK) {
+		save_session(tok, name_out);
+		printf("listenbrainz: signed in as %s\n", name_out);
+	} else {
+		fprintf(stderr, "listenbrainz: token validation failed: %s\n", why);
+	}
+
+	free(body);  // clean up `body` pointer
+
+	pthread_mutex_lock(&lock);
+	logging_in = false;
+	login_result = outcome;  // update global login_result variable
+
+	login_serial++;
+	if (outcome == LISTENBRAINZ_LOGIN_OK) {
+		// update global state variables
+		snprintf(token, sizeof(token), "%s", tok);
+		snprintf(user, sizeof(user), "%s", name_out);
+		session_expired = false;
+		session_refusals = 0;
+		refused = false;
+		detail[0] = '\0';
+	} else {
+		snprintf(detail, sizeof(detail), "%s", why);
+	}
+
+	pthread_mutex_unlock(&lock);
+	wipe(tok, strlen(tok));
+}
+
+static void do_logout(void) {
+	save_session("", "");
+	unlink(legacy_token_path);
+	if (card_ready)
+		unlink(queue_path);
+	card_ready = false;
+	pthread_mutex_lock(&lock);
+	token[0] = '\0';
+	user[0] = '\0';
+	session_expired = false;
+	refused = false;
+	detail[0] = '\0';
+	file_count = 0;
+	pending_count = 0;
+	now_playing_waiting = false;
+	pthread_mutex_unlock(&lock);
+	printf("listenbrainz: signed out\n");
+}
+
+static void session_lost(const char *why) {
+	fprintf(stderr, "listenbrainz: token refused (%s); add it again\n", why);
+	pthread_mutex_lock(&lock);
+	token[0] = '\0';
+	session_expired = true;
+	session_refusals = 0;
+	char name[128];
+	snprintf(name, sizeof(name), "%s", user);
+	pthread_mutex_unlock(&lock);
+	save_session("", name);
+}
+
+static bool session_refused(const char *why) {
+	pthread_mutex_lock(&lock);
+	int count = ++session_refusals;
+	pthread_mutex_unlock(&lock);
+	if (count >= SESSION_REFUSALS_MAX) {
+		session_lost(why);
+		return true;
+	}
+	fprintf(stderr, "listenbrainz: token refused (%s), %d of %d; keeping it for now\n", why, count, SESSION_REFUSALS_MAX);
+	return false;
+}
+
+static void session_accepted(void) {
+	pthread_mutex_lock(&lock);
+	session_refusals = 0;
+	pthread_mutex_unlock(&lock);
+}
+
+static void flush_pending(const char *name) {
+	bool valid = clock_valid();
+	long long now_real = (long long)time(NULL);
+	double now_boot = boot_seconds();
+
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < pending_count; i++) {
+		if (!pending[i].when && valid)
+			pending[i].when = now_real - (long long)(now_boot - pending[i].boot_start);
+	}
+	pthread_mutex_unlock(&lock);
+	if (!card_ready)
+		return;
+
+	play_t *ready = malloc(sizeof(play_t) * PENDING_MAX);
+	if (!ready)
+		return;
+	pthread_mutex_lock(&lock);
+	int ready_count = 0;
+	for (int i = 0; i < pending_count; i++)
+		if (pending[i].when)
+			ready[ready_count++] = pending[i];
+	int room = QUEUE_MAX - file_count;
+	pthread_mutex_unlock(&lock);
+	if (!ready_count) {
+		free(ready);
+		return;
+	}
+
+	if (room < 0)
+		room = 0;
+	int kept = ready_count > room ? room : ready_count;
+	if (kept < ready_count)
+		fprintf(stderr, "listenbrainz: the queue is full; %d plays not kept\n", ready_count - kept);
+	bool written = kept == 0 || queue_append(ready, kept, name);
+	free(ready);
+	if (!written)
+		return;
+
+	pthread_mutex_lock(&lock);
+	file_count += kept;
+	int keep = 0;
+	for (int i = 0; i < pending_count; i++)
+		if (!pending[i].when)
+			pending[keep++] = pending[i];
+	pending_count = keep;
+	pthread_mutex_unlock(&lock);
+}
+
+// One listen. `listened_at` is left out for "playing_now", which must not
+// carry it.
+static void build_listen_json(text_t *t, const play_t *track, bool listened_at) {
+	text_str(t, "{");
+	if (listened_at) {
+		char ts[32];
+		snprintf(ts, sizeof(ts), "%lld", track->when);
+		text_str(t, "\"listened_at\":");
+		text_str(t, ts);
+		text_str(t, ",");
+	}
+	text_str(t, "\"track_metadata\":{\"artist_name\":");
+	text_json(t, track->artist);
+	text_str(t, ",\"track_name\":");
+	text_json(t, track->title);
+	if (track->album[0]) {
+		text_str(t, ",\"release_name\":");
+		text_json(t, track->album);
+	}
+	text_str(t, ",\"additional_info\":{\"media_player\":\"" CLIENT_NAME "\",\"submission_client\":\"" CLIENT_NAME "\"");
+	const char *version = sysinfo_os_version();
+	if (version && version[0]) {
+		text_str(t, ",\"submission_client_version\":");
+		text_json(t, version);
+	}
+	if (track->duration > 0) {
+		char num[32];
+		snprintf(num, sizeof(num), "%d", track->duration);
+		text_str(t, ",\"duration\":");
+		text_str(t, num);
+	}
+	text_str(t, "}}}");
+}
+
+static void send_now_playing(const play_t *track, const char *tok) {
+	text_t body = {0};
+	text_str(&body, "{\"listen_type\":\"playing_now\",\"payload\":[");
+	build_listen_json(&body, track, false);
+	text_str(&body, "]}");
+	char why[160];
+	if (body.failed) {
+		free(body.buf);
+		fprintf(stderr, "listenbrainz: now playing not sent: out of memory\n");
+		return;
+	}
+	result_t result = http_json(API_URL, tok, "POST", body.buf, why, sizeof(why), NULL);
+	free(body.buf);
+	if (result == RESULT_OK) {
+		session_accepted();
+		return;
+	}
+	fprintf(stderr, "listenbrainz: now playing not sent: %s\n", why);
+	// A revoked token shows up here as well as on the queue: count it the same.
+	if (result == RESULT_SESSION)
+		session_refused(why);
+}
+
+static result_t send_batch(int max, const char *tok, char *why, size_t why_size, int *lines) {
+	*lines = 0;
+	why[0] = '\0';
+	play_t *plays = malloc(sizeof(play_t) * (size_t)max);
+	if (!plays) {
+		snprintf(why, why_size, "out of memory");
+		return RESULT_RETRY;
+	}
+
+	int count = queue_read_head(plays, max, lines);
+	result_t result = RESULT_OK;
+	if (count > 0) {
+		text_t body = {0};
+		text_str(&body, "{\"listen_type\":\"import\",\"payload\":[");
+		for (int i = 0; i < count; i++) {
+			if (i)
+				text_str(&body, ",");
+			build_listen_json(&body, &plays[i], true);
+		}
+		text_str(&body, "]}");
+		if (body.failed) {
+			snprintf(why, why_size, "out of memory");
+			result = RESULT_RETRY;
+		} else {
+			result = http_json(API_URL, tok, "POST", body.buf, why, why_size, NULL);
+			if (result == RESULT_OK)
+				printf("listenbrainz: %d listens sent\n", count);
+		}
+		free(body.buf);
+	}
+
+	free(plays);
+	return result;
+}
+
+typedef struct {
+	int batch;
+	// After a batch is refused as a bad request, its lines are sent one at a
+	// time to find the bad one; this many are left before full batches again.
+	int single_left;
+	double backoff;
+	double retry_at;
+	bool was_online;
+} sender_t;
+
+static void send_queue(sender_t *s, const char *tok) {
+	char why[160];
+	int lines = 0;
+	result_t result = send_batch(s->batch, tok, why, sizeof(why), &lines);
+	bool drop = false;
+
+	switch (result) {
+	case RESULT_OK:
+		drop = true;
+		session_accepted();
+		s->backoff = RETRY_FIRST_SECS;
+		pthread_mutex_lock(&lock);
+		refused = false;
+		detail[0] = '\0';
+		pthread_mutex_unlock(&lock);
+		break;
+	case RESULT_BAD_REQUEST:
+		if (s->batch > 1) {
+			s->batch = 1;
+			s->single_left = lines;
+		} else {
+			fprintf(stderr, "listenbrainz: a queued listen was refused (%s); dropping it\n", why);
+			drop = true;
+		}
+		break;
+	case RESULT_SESSION:
+		if (!session_refused(why)) {
+			s->retry_at = boot_seconds() + s->backoff;
+			s->backoff = s->backoff * 2 > RETRY_MAX_SECS ? RETRY_MAX_SECS : s->backoff * 2;
+		}
+		break;
+	case RESULT_REFUSED:
+		fprintf(stderr, "listenbrainz: listens refused: %s\n", why);
+		pthread_mutex_lock(&lock);
+		refused = true;
+		snprintf(detail, sizeof(detail), "%s", why);
+		pthread_mutex_unlock(&lock);
+		s->retry_at = boot_seconds() + RETRY_MAX_SECS;
+		break;
+	case RESULT_RETRY:
+		fprintf(stderr, "listenbrainz: listens not sent (%s); again in %.0f s\n", why, s->backoff);
+		s->retry_at = boot_seconds() + s->backoff;
+		s->backoff = s->backoff * 2 > RETRY_MAX_SECS ? RETRY_MAX_SECS : s->backoff * 2;
+		break;
+	}
+
+	pthread_mutex_lock(&lock);
+	if (lines == 0)
+		file_count = 0;
+	else if (drop)
+		file_count = file_count > lines ? file_count - lines : 0;
+	if (drop && s->batch == 1 && lines > 0) {
+		s->single_left -= lines;
+		if (s->single_left <= 0)
+			s->batch = BATCH_MAX;
+	}
+	if (file_count == 0) {
+		s->batch = BATCH_MAX;
+		s->single_left = 0;
+	}
+	pthread_mutex_unlock(&lock);
+	if (drop && lines > 0)
+		queue_drop_head(lines);
+}
+
+static void *worker_main(void *arg) {
+	(void)arg;
+	sender_t sender = {.batch = BATCH_MAX, .backoff = RETRY_FIRST_SECS};
+
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		bool check = token_request_pending;
-		unsigned check_generation = validation_generation;
-		char candidate[256];
-		candidate[0] = 0;
-		if (check) {
-			snprintf(candidate, sizeof(candidate), "%s", new_token);
-			token_request_pending = false;
-			token_checking = true;
+		bool out = logout_requested;
+		bool in = login_requested;
+		bool bundled_login = login_from_bundle;
+		char tok[512] = "";
+		if (in) {
+			snprintf(tok, sizeof(tok), "%s", login_token);
+			wipe(login_token, sizeof(login_token));
 		}
-		bool logout = logout_requested;
 		logout_requested = false;
-		if (logout) {
-			validation_generation++;
-			char old_hash[MD5_HEX_LEN]; md5_hex(token, strlen(token), old_hash);
-			token[0] = user[0] = detail[0] = 0;
-			token_valid = enabled = refused = false;
-			token_checking = token_request_pending = false;
-			now_playing_waiting = false;
-			unlink(token_path);
-			for (int i = queue_count - 1; i >= 0; i--) {
-				if (!strcmp(queue[i].account, old_hash)) queue[i] = queue[--queue_count];
-			}
-			queue_dirty = !queue_save_locked();
-		}
-		if (queue_dirty && queue_save_locked()) queue_dirty = false;
-		bool active = enabled && token_valid && token[0] && online();
-		listen_t item = {0};
-		bool have_item = false;
-		listen_t now_item = {0};
-		bool send_now = false;
-		char token_copy[256];
-		snprintf(token_copy, sizeof(token_copy), "%s", token);
-		char account[MD5_HEX_LEN] = "";
-		if (active) {
-			md5_hex(token_copy, strlen(token_copy), account);
-			if (now_playing_waiting && !strcmp(now_playing.account, account)) {
-				now_item = now_playing;
-				now_playing_waiting = false;
-				send_now = true;
-			}
-			for (int i = 0; i < queue_count; i++) {
-				if (!strcmp(queue[i].account, account)) { item = queue[i]; have_item = true; break; }
-			}
-		}
+		login_requested = false;
+		login_from_bundle = false;
 		pthread_mutex_unlock(&lock);
 
-		if (check) {
-			char checked_user[128] = "";
-			bool has_network = online();
-			bool valid = false;
-			if (has_network) {
-				pthread_mutex_lock(&lock); requests_in_flight++; pthread_mutex_unlock(&lock);
-				valid = validate_token(candidate, checked_user, sizeof(checked_user));
-				pthread_mutex_lock(&lock); requests_in_flight--; pthread_mutex_unlock(&lock);
-			}
-			pthread_mutex_lock(&lock);
-			if (!has_network && check_generation == validation_generation) {
-				token_request_pending = true;
-				token_checking = true;
-			} else if (check_generation == validation_generation) {
-				if (valid && token_save(candidate)) {
-					snprintf(token, sizeof(token), "%s", candidate);
-					snprintf(user, sizeof(user), "%s", checked_user);
-					token_valid = true; refused = false; detail[0] = 0;
-				} else {
-					token_valid = false; refused = true;
-					snprintf(detail, sizeof(detail), "ListenBrainz rejected the token");
-				}
-				token_checking = false;
-				serial++;
-			}
-			bool retry = !has_network && check_generation == validation_generation;
-			pthread_mutex_unlock(&lock);
-			if (retry) {
-				struct timespec retry_at;
-				clock_gettime(CLOCK_REALTIME, &retry_at);
-				retry_at.tv_sec += 10;
+		if (out)
+			do_logout();
+		if (in) {
+			if (bundled_login && !online()) {
 				pthread_mutex_lock(&lock);
-				pthread_cond_timedwait(&wake, &lock, &retry_at);
+				snprintf(login_token, sizeof(login_token), "%s", tok);
+				login_requested = login_from_bundle = true;
 				pthread_mutex_unlock(&lock);
-				continue;
-			}
-		}
-		if (have_item) {
-			pthread_mutex_lock(&lock); requests_in_flight++; pthread_mutex_unlock(&lock);
-			int status = 0;
-			bool sent = submit_listen(&item, token_copy, false, &status);
-			pthread_mutex_lock(&lock);
-			requests_in_flight--;
-			if (sent) {
-				for (int i = 0; i < queue_count; i++) {
-					if (!strcmp(queue[i].account, account) && queue[i].listened_at == item.listened_at &&
-						!strcmp(queue[i].title, item.title) && !strcmp(queue[i].artist, item.artist)) {
-						queue[i] = queue[--queue_count];
-						queue_dirty = true;
-						if (queue_save_locked()) queue_dirty = false;
-						else if (queue_count < LB_QUEUE_MAX) queue[queue_count++] = item;
-						break;
-					}
-				}
-				failures = 0; refused = false; detail[0] = 0;
+				wipe(tok, sizeof(tok));
 			} else {
-				failures++;
-				if (status == 401) {
-					token_valid = false; refused = true;
-					snprintf(detail, sizeof(detail), "ListenBrainz token expired; set it again");
-				} else if (failures >= 3) {
-					refused = true; snprintf(detail, sizeof(detail), "ListenBrainz submission failed; queued listens are retained");
-				}
+				do_login(tok);
+				wipe(tok, sizeof(tok));
+				card_ready = false;
+				sender.retry_at = 0;
+				sender.backoff = RETRY_FIRST_SECS;
 			}
-			pthread_mutex_unlock(&lock);
-		}
-		if (send_now) {
-			pthread_mutex_lock(&lock); requests_in_flight++; pthread_mutex_unlock(&lock);
-			int status = 0;
-			submit_listen(&now_item, token_copy, true, &status);
-			pthread_mutex_lock(&lock);
-			requests_in_flight--;
-			if (status == 401) {
-				token_valid = false; refused = true;
-				snprintf(detail, sizeof(detail), "ListenBrainz token expired; set it again");
-			}
-			pthread_mutex_unlock(&lock);
 		}
 
 		pthread_mutex_lock(&lock);
-		if (token_request_pending || logout_requested) {
-			pthread_mutex_unlock(&lock);
-			continue;
+		bool active = enabled && token[0];
+		bool counting = counting_locked();
+		char tk[512];
+		char account[128];
+		snprintf(tk, sizeof(tk), "%s", token);
+		snprintf(account, sizeof(account), "%s", user);
+		pthread_mutex_unlock(&lock);
+
+		bool up = false;
+		if (counting && account[0]) {
+			if (!card_writable()) {
+				if (card_ready) {
+					card_ready = false;
+					pthread_mutex_lock(&lock);
+					file_count = 0;
+					pthread_mutex_unlock(&lock);
+				}
+			} else if (!card_ready) {
+				card_ready = queue_attach(account);
+			}
+			flush_pending(account);
 		}
-		struct timespec ts;
-		clock_gettime(CLOCK_REALTIME, &ts);
-		ts.tv_sec += (have_item && failures == 0) ? 1 : (failures ? (failures > 5 ? LB_RETRY_MAX : 15 << (failures - 1)) : 10);
-		pthread_cond_timedwait(&wake, &lock, &ts);
+		if (active) {
+			up = online();
+			if (up && !sender.was_online) {
+				sender.retry_at = 0;
+				sender.backoff = RETRY_FIRST_SECS;
+			}
+			sender.was_online = up;
+
+			if (up && boot_seconds() >= sender.retry_at) {
+				pthread_mutex_lock(&lock);
+				bool announce = false;
+				play_t track;
+				if (now_playing_waiting && (now_playing_generation != current_generation || !current_playing)) {
+					now_playing_waiting = false;
+				} else if (now_playing_waiting) {
+					now_playing_waiting = false;
+					announce = true;
+					track = now_playing;
+				}
+				bool queued = file_count > 0;
+				pthread_mutex_unlock(&lock);
+
+				if (announce)
+					send_now_playing(&track, tk);
+				if (queued)
+					send_queue(&sender, tk);
+			}
+		}
+
+		pthread_mutex_lock(&lock);
+		active = enabled && token[0];
+		counting = counting_locked();
+		bool more_now = active && up && file_count > 0 && boot_seconds() >= sender.retry_at;
+		bool waiting = (counting && (!card_ready || pending_count > 0)) || (active && (file_count > 0 || now_playing_waiting));
+		if (!logout_requested && !login_requested && !more_now) {
+			if (waiting) {
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				ts.tv_sec += WAIT_POLL_SECS;
+				pthread_cond_timedwait(&wake, &lock, &ts);
+			} else {
+				pthread_cond_wait(&wake, &lock);
+			}
+		}
 		pthread_mutex_unlock(&lock);
 	}
 	return NULL;
 }
 
-static bool play_enabled(void) {
-	bool on;
-	pthread_mutex_lock(&lock); on = started && enabled && token_valid; pthread_mutex_unlock(&lock);
-	return on;
-}
-
 void listenbrainz_init(void) {
-	if (started) return;
-	paths_init(); token_load(); queue_load();
+	if (started)
+		return;
+	build_paths();
+
+	pthread_condattr_t attr;
+	pthread_condattr_init(&attr);
+	pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+	pthread_cond_init(&wake, &attr);
+	pthread_condattr_destroy(&attr);
+
+	pthread_mutex_lock(&lock);
 	enabled = config_get_bool("listenbrainz", "enabled", false);
-	if (token[0]) {
-		// Validate in the worker before enabling submissions, without blocking startup.
-		snprintf(new_token, sizeof(new_token), "%s", token);
-		token_request_pending = true;
-		token_checking = true;
-		validation_generation++;
+	load_session();
+	session_expired = !token[0] && user[0];
+	if (!token[0] && !user[0] && !config_get_bool("listenbrainz", "ignore_bundled_token", false)) {
+		FILE *legacy = fopen(legacy_token_path, "r");
+		if (legacy) {
+			if (fgets(bundled_token, sizeof(bundled_token), legacy))
+				bundled_token[strcspn(bundled_token, "\r\n")] = '\0';
+			fclose(legacy);
+		}
+		if (!bundled_token[0]) {
+			const char *bundled = streamkeys_listenbrainz_key();
+			if (bundled)
+				snprintf(bundled_token, sizeof(bundled_token), "%s", bundled);
+		}
 	}
-	pthread_cond_init(&wake, NULL);
+	if (enabled && bundled_token[0]) {
+		snprintf(login_token, sizeof(login_token), "%s", bundled_token);
+		login_requested = login_from_bundle = logging_in = true;
+	}
+	pthread_mutex_unlock(&lock);
+
 	pthread_t thread;
-	if (pthread_create(&thread, NULL, worker, NULL) != 0) {
-		token_checking = token_request_pending = false;
-		refused = true;
-		snprintf(detail, sizeof(detail), "ListenBrainz worker could not start");
+	if (pthread_create(&thread, NULL, worker_main, NULL) != 0) {
+		fprintf(stderr, "listenbrainz: cannot start the worker\n");
 		return;
 	}
-	pthread_detach(thread); started = true;
+	pthread_detach(thread);
+	started = true;
+	printf("listenbrainz: %s, %s\n", enabled ? "on" : "off", token[0] ? "signed in" : "signed out");
 }
+
+bool listenbrainz_available(void) { return started; }
 
 void listenbrainz_set_enabled(bool on) {
-	config_set_bool("listenbrainz", "enabled", on); config_save();
-	pthread_mutex_lock(&lock); enabled = on; pthread_cond_signal(&wake); pthread_mutex_unlock(&lock);
+	config_set_bool("listenbrainz", "enabled", on);
+	config_save();
+	pthread_mutex_lock(&lock);
+	enabled = on;
+	if (on && !token[0] && !user[0] && bundled_token[0] && !logging_in) {
+		snprintf(login_token, sizeof(login_token), "%s", bundled_token);
+		login_requested = login_from_bundle = logging_in = true;
+	}
+	pthread_cond_signal(&wake);
+	pthread_mutex_unlock(&lock);
 }
 
-void listenbrainz_set_token(const char *value) {
-	if (!token_shape_ok(value)) return;
+bool listenbrainz_active(void) {
+	if (!started)
+		return false;
+	pthread_mutex_lock(&lock);
+	bool counting = counting_locked();
+	pthread_mutex_unlock(&lock);
+	return counting;
+}
+
+bool listenbrainz_login(const char *tok) {
+	if (!started || !tok)
+		return false;
+	// Typed by hand on the device: a stray space must not make it "invalid".
+	while (isspace((unsigned char)*tok))
+		tok++;
+	size_t len = strlen(tok);
+	while (len && isspace((unsigned char)tok[len - 1]))
+		len--;
+	if (!len || len >= sizeof(login_token))
+		return false;
 	config_set_bool("listenbrainz", "ignore_bundled_token", false);
 	config_save();
 	pthread_mutex_lock(&lock);
-	snprintf(new_token, sizeof(new_token), "%s", value);
-	token_valid = false;
-	now_playing_waiting = false;
-	validation_generation++;
-	token_request_pending = true; token_checking = true; refused = false; detail[0] = 0;
-	pthread_cond_signal(&wake); pthread_mutex_unlock(&lock);
+	if (!logging_in) {
+		snprintf(login_token, sizeof(login_token), "%.*s", (int)len, tok);
+		logging_in = true;
+		login_from_bundle = false;
+		login_requested = true;
+		pthread_cond_signal(&wake);
+	}
+	pthread_mutex_unlock(&lock);
+	return true;
 }
 
 void listenbrainz_logout(void) {
+	if (!started)
+		return;
 	config_set_bool("listenbrainz", "ignore_bundled_token", true);
 	config_save();
-	pthread_mutex_lock(&lock); logout_requested = true; pthread_cond_signal(&wake); pthread_mutex_unlock(&lock);
+	pthread_mutex_lock(&lock);
+	logout_requested = true;
+	token[0] = '\0';
+	bundled_token[0] = '\0';
+	session_expired = false;
+	pthread_cond_signal(&wake);
+	pthread_mutex_unlock(&lock);
 }
 
 void listenbrainz_get_status(listenbrainz_status_t *out) {
-	if (!out) return;
 	memset(out, 0, sizeof(*out));
 	pthread_mutex_lock(&lock);
-	out->enabled = enabled; out->queued = queue_count; out->serial = serial;
-	out->last_token_valid = token_valid;
-	snprintf(out->user, sizeof(out->user), "%s", user);
+	out->enabled = enabled;
+	snprintf(out->user, sizeof(out->user), "%s", token[0] ? user : "");
 	snprintf(out->detail, sizeof(out->detail), "%s", detail);
-	if (token_checking) out->state = LISTENBRAINZ_CHECKING;
-	else if (refused) out->state = LISTENBRAINZ_REFUSED;
-	else if (!enabled) out->state = LISTENBRAINZ_OFF;
-	else out->state = token_valid ? LISTENBRAINZ_CONNECTED : LISTENBRAINZ_TOKEN_REQUIRED;
+	out->queued = file_count + pending_count;
+	out->login_serial = login_serial;
+	out->login_result = login_result;
+	if (!started)
+		out->state = LISTENBRAINZ_STATE_UNAVAILABLE;
+	else if (logging_in)
+		out->state = LISTENBRAINZ_STATE_SIGNING_IN;
+	else if (!enabled)
+		out->state = LISTENBRAINZ_STATE_OFF;
+	else if (session_expired)
+		out->state = LISTENBRAINZ_STATE_SESSION_EXPIRED;
+	else if (!token[0])
+		out->state = LISTENBRAINZ_STATE_SIGNED_OUT;
+	else if (refused)
+		out->state = LISTENBRAINZ_STATE_REFUSED;
+	else
+		out->state = LISTENBRAINZ_STATE_CONNECTED;
 	pthread_mutex_unlock(&lock);
 }
 
 bool listenbrainz_network_wanted(void) {
-	bool wanted;
 	pthread_mutex_lock(&lock);
-	wanted = requests_in_flight > 0;
-	if (!wanted && enabled && token_valid && token[0]) {
-		char account[MD5_HEX_LEN];
-		md5_hex(token, strlen(token), account);
-		wanted = now_playing_waiting && !strcmp(now_playing.account, account);
-		for (int i = 0; !wanted && i < queue_count; i++) {
-			wanted = !strcmp(queue[i].account, account);
-		}
-	}
+	bool wanted = requests_in_flight > 0;
 	pthread_mutex_unlock(&lock);
 	return wanted;
 }
 
+// ---------------------------------------------------------------------------
+// plays, as playcount.c follows them -- GUI thread only
+// ---------------------------------------------------------------------------
+
 static struct {
-	char file[512];
-	char artist[LB_FIELD_MAX], title[LB_FIELD_MAX], album[LB_FIELD_MAX];
-	int duration;
-	double listened, last_tick;
-	double last_position;
-	long long started_at;
-	bool was_playing, skip, submitted, now_sent;
+	unsigned generation;
+	bool scrobbled;
+	play_t track;
 } play;
 
-static void qualify(void) {
-	if (play.submitted || play.skip || !play.artist[0] || !play.title[0] || play.duration < 30) return;
-	double enough = play.duration / 2.0;
-	if (enough > 240) enough = 240;
-	if (play.listened < enough || play.started_at <= 0) return;
-	listen_t x = {.listened_at = play.started_at, .duration = play.duration};
-	field_copy(x.artist, sizeof(x.artist), play.artist);
-	field_copy(x.title, sizeof(x.title), play.title);
-	field_copy(x.album, sizeof(x.album), play.album);
-	pthread_mutex_lock(&lock);
-	if (enabled && token_valid && queue_count < LB_QUEUE_MAX) {
-		md5_hex(token, strlen(token), x.account);
-		queue[queue_count++] = x;
-		queue_dirty = true;
-		pthread_cond_signal(&wake);
-		play.submitted = true;
-	} else if (enabled && token_valid) {
-		play.submitted = true;
-		refused = true;
-		snprintf(detail, sizeof(detail), "ListenBrainz queue is full; new listens are skipped");
-	}
-	pthread_mutex_unlock(&lock);
+static void take_tags(const playcount_play_t *now) {
+	copy_field(play.track.artist, now->artist);
+	copy_field(play.track.title, now->title);
+	copy_field(play.track.album, now->album);
 }
 
-static void announce_now_playing(void) {
-	if (play.now_sent || play.skip || !play.artist[0] || !play.title[0] || play.duration < 30) return;
+void listenbrainz_note_play(const playcount_play_t *now) {
+	bool announce = false;
+	if (now->generation != play.generation) {
+		play.generation = now->generation;
+		play.scrobbled = false;
+		memset(&play.track, 0, sizeof(play.track));
+		take_tags(now);
+		announce = true;
+	} else if (!play.track.title[0] && now->title[0]) {
+		// The tags came in after the file started.
+		take_tags(now);
+		announce = true;
+	}
+	play.track.when = now->real_start;
+	play.track.boot_start = now->boot_start;
+	if (now->duration > 0) {
+		play.track.duration = now->duration;
+	}
+	bool named = !now->skip && play.track.artist[0] && play.track.title[0];
+	bool scrobble = named && now->counts && !play.scrobbled;
+	if (scrobble) {
+		play.scrobbled = true;
+	}
+
 	pthread_mutex_lock(&lock);
-	if (enabled && token_valid && token[0]) {
-		now_playing = (listen_t){.duration = play.duration};
-		field_copy(now_playing.artist, sizeof(now_playing.artist), play.artist);
-		field_copy(now_playing.title, sizeof(now_playing.title), play.title);
-		field_copy(now_playing.album, sizeof(now_playing.album), play.album);
-		md5_hex(token, strlen(token), now_playing.account);
+	current_generation = now->generation;
+	current_playing = now->playing;
+	if (announce && token[0] && named) {
+		now_playing = play.track;
+		now_playing_generation = now->generation;
 		now_playing_waiting = true;
-		play.now_sent = true;
+		pthread_cond_signal(&wake);
+	}
+	if (scrobble && pending_count < PENDING_MAX) {
+		pending[pending_count++] = play.track;
 		pthread_cond_signal(&wake);
 	}
 	pthread_mutex_unlock(&lock);
-}
-
-void listenbrainz_note_playback(const listenbrainz_playback_t *now) {
-	if (!now || !play_enabled()) { play.file[0] = 0; return; }
-	double t = monotonic_seconds();
-	const char *file = now->file ? now->file : "";
-	bool same = play.file[0] && strcmp(play.file, file) == 0;
-	bool again = same && play.last_position > now->position + 10 && now->position < 5;
-	if (now->playing && file[0] && (!same || again)) {
-		if (play.file[0]) {
-			if (play.was_playing) {
-				double elapsed = t - play.last_tick;
-				if (elapsed > 0 && elapsed < 5) play.listened += elapsed;
-			}
-			qualify();
-		}
-		bool skip = now->skip;
-		memset(&play, 0, sizeof(play));
-		snprintf(play.file, sizeof(play.file), "%s", file);
-		play.started_at = time(NULL);
-		field_copy(play.artist, sizeof(play.artist), now->artist);
-		field_copy(play.title, sizeof(play.title), now->title);
-		field_copy(play.album, sizeof(play.album), now->album);
-		play.duration = (int)(now->duration + .5);
-		play.skip = skip;
-	} else if (!same) {
-		play.file[0] = 0; return;
-	} else {
-		if (!play.title[0] && now->title) field_copy(play.title, sizeof(play.title), now->title);
-		if (!play.artist[0] && now->artist) field_copy(play.artist, sizeof(play.artist), now->artist);
-		if (!play.album[0] && now->album) field_copy(play.album, sizeof(play.album), now->album);
-		if (now->duration > 0) play.duration = (int)(now->duration + .5);
-		play.skip = now->skip;
-	}
-	announce_now_playing();
-	if (now->playing && play.was_playing) {
-		double elapsed = t - play.last_tick;
-		if (elapsed > 0 && elapsed < 5) play.listened += elapsed;
-	}
-	play.was_playing = now->playing;
-	play.last_tick = t;
-	play.last_position = now->position;
-	qualify();
 }
