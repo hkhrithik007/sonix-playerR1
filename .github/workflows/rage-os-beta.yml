@@ -172,11 +172,11 @@ jobs:
           path: |
             sonix-player/freetype-target
             sonix-player/audio-target
-            sonix-player/freetype-2.13.3.tar.xz
-            sonix-player/libogg-1.3.5.tar.gz
-            sonix-player/opus-1.4.tar.gz
+            sonix-player/freetype-2.14.3.tar.xz
+            sonix-player/libogg-1.3.6.tar.gz
+            sonix-player/opus-1.6.1.tar.gz
             sonix-player/opusfile-0.12.tar.gz
-            sonix-player/wavpack-5.6.0.tar.bz2
+            sonix-player/wavpack-5.9.0.tar.bz2
           key: hiby-r1-libs-v1-${{ runner.os }}-${{ hashFiles('sonix-player/Makefile') }}
 
       # ============================================================
@@ -476,11 +476,11 @@ jobs:
           path: |
             sonix-player/freetype-target
             sonix-player/audio-target
-            sonix-player/freetype-2.13.3.tar.xz
-            sonix-player/libogg-1.3.5.tar.gz
-            sonix-player/opus-1.4.tar.gz
+            sonix-player/freetype-2.14.3.tar.xz
+            sonix-player/libogg-1.3.6.tar.gz
+            sonix-player/opus-1.6.1.tar.gz
             sonix-player/opusfile-0.12.tar.gz
-            sonix-player/wavpack-5.6.0.tar.bz2
+            sonix-player/wavpack-5.9.0.tar.bz2
           key: ${{ steps.libraries-cache.outputs.cache-primary-key }}
 
       # ============================================================

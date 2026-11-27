@@ -502,7 +502,7 @@ $(CROSS_CC):
 # are built once: `make libs-clean` removes them, with their extracted sources,
 # so the next `make target` builds them again.
 LIB_CFLAGS = -O2 -march=mips32r2 -mplt
-OPUS_CONFIGURE = --enable-fixed-point --disable-doc --disable-extra-programs --disable-deep-plc --disable-dred --disable-osce
+OPUS_CONFIGURE = --enable-fixed-point --disable-doc --disable-extra-programs
 WAVPACK_CONFIGURE = --disable-apps --disable-man --disable-asm --disable-threads --enable-dsd --enable-legacy --without-libiconv-prefix
 # The MIPS headers in Opus define helpers unused by the 24-bit path. Keep
 # warnings enabled for the player; scope this upstream-only warning here.
