@@ -22,7 +22,7 @@ env:
   RBDEV_HOST_PREFIX: ${{ github.workspace }}/sonix-player/rockbox-toolchain
   RBDEV_DOWNLOAD: ${{ github.workspace }}/sonix-player/.cache/rbdev-dl
   RBDEV_BUILD: ${{ github.workspace }}/sonix-player/.cache/rbdev-build
-  MAKEFLAGS: -j2
+  MAKEFLAGS: -j4
 
   # Rolling Rage-os release
   RAGE_OS_RELEASE_TAG: rage-os-release
@@ -423,7 +423,8 @@ jobs:
           echo "BUILDING SONIX PLAYER FOR HIBY R1"
           echo "============================================"
 
-          make -j2 BOARD=r1 target
+          export MAKEFLAGS="-j$(nproc)"
+          make -j"$(nproc)" BOARD=r1 target
           STATUS=$?
 
           if [ "$STATUS" -ne 0 ]; then

@@ -753,6 +753,38 @@ build_one() {
 	say ""
 
 	# ==========================================================================
+	# 5a. Boot logo
+	# ==========================================================================
+	#
+	# The player shows /etc/logo.jpeg during charge-screen boot
+	# (chargescreen.c: show_boot_logo). The stock HiBy logo is at that path;
+	# the assets ship per-theme alternatives in etc/boot-logo/ but nothing
+	# ever copies one of them to etc/logo.jpeg. Do it here: prefer dark-theme
+	# as the firmware-wide default (matches the out-of-box dark theme), falling
+	# back to whichever theme variant is present, then leaving the stock logo.
+	step "[$MODEL_NAME] installing the boot logo"
+	LOGO_DST="$SQUASH_DIR/etc/logo.jpeg"
+	LOGO_SRC=""
+	for candidate in \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-blue.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-green.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-purple.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-orange.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-pink.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/dark-theme-yellow.jpeg" \
+		"$SQUASH_DIR/etc/boot-logo/"*.jpeg
+	do
+		[ -f "$candidate" ] && { LOGO_SRC="$candidate"; break; }
+	done
+	if [ -n "$LOGO_SRC" ]; then
+		cp -f "$LOGO_SRC" "$LOGO_DST"
+		say "    etc/logo.jpeg <- $(basename "$LOGO_SRC")"
+	else
+		warn "no boot-logo found in etc/boot-logo/: the stock HiBy logo stays"
+	fi
+	say ""
+
+	# ==========================================================================
 	# 5b. The modes that decide whether any of this runs
 	# ==========================================================================
 	#
